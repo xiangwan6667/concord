@@ -9,7 +9,7 @@ use concord_common::BoxStream;
 use rustls_pki_types::{CertificateDer, ServerName};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::cert::{hmac_matches, parse_ed25519_cert};
+use super::cert::{hmac_matches, parse_ed25519_cert, verify_mldsa};
 use super::hello::{HelloParams, SESSION_ID_LEN, SESSION_ID_OFFSET, build_client_hello};
 use super::schedule::{
     CT_ALERT, CT_HANDSHAKE, Hash, RecordKey, Suite, application_secrets, expand, extract,
@@ -475,6 +475,11 @@ impl RealityClient {
 
         let mut transcript = hello;
         transcript.extend_from_slice(&server_hello_raw);
+        let mldsa = self
+            .options
+            .as_ref()
+            .and_then(|options| options.mldsa65_verify.as_deref())
+            .map(|key| (key, transcript.clone()));
         let secrets = handshake_secrets(hash, &shared, &transcript);
         let mut server_key = RecordKey::new(suite, &secrets.server)?;
         let mut client_key = RecordKey::new(suite, &secrets.client)?;
@@ -506,6 +511,9 @@ impl RealityClient {
                 signature::UnparsedPublicKey::new(&ED25519, &cert.public_key)
                     .verify(&certificate_verify_message(&cv_hash), &flight.signature)
                     .map_err(|_| invalid_data("REALITY: CertificateVerify signature mismatch"))?;
+                if let Some((key, hellos)) = &mldsa {
+                    verify_mldsa(auth_key.as_deref().unwrap_or_default(), &cert, key, hellos)?;
+                }
                 true
             }
             _ => {
@@ -690,7 +698,10 @@ fn seal_reality(
 
     let [_, _, _, _, t4, t5, t6, t7] = unix.to_be_bytes();
     let [s0, s1, s2, s3, s4, s5, s6, s7] = options.short_id;
-    let mut sealed = [1, 8, 2, 0, t4, t5, t6, t7, s0, s1, s2, s3, s4, s5, s6, s7];
+    let [v0, v1, v2] = options.client_version;
+    let mut sealed = [
+        v0, v1, v2, 0, t4, t5, t6, t7, s0, s1, s2, s3, s4, s5, s6, s7,
+    ];
     let aead = LessSafeKey::new(
         UnboundKey::new(&AES_256_GCM, &auth_key)
             .map_err(|_| invalid_data("REALITY: auth key rejected"))?,

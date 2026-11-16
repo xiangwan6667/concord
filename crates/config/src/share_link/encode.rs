@@ -317,6 +317,7 @@ fn v_share_query(f: Fields<'_>) -> Query {
             set(&mut query, "security", "reality");
             set(&mut query, "pbk", &public_key);
             set_if(&mut query, "sid", reality.str("short-id"));
+            set_if(&mut query, "pqv", reality.str("mldsa65-verify"));
             set_if(
                 &mut query,
                 "support-x25519mlkem768",

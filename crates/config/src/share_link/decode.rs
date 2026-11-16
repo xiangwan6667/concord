@@ -475,7 +475,12 @@ fn v_share_link(
                 }
             }
         }
+        if !link.get("pqv").is_empty() {
+            reality.insert("mldsa65-verify".into(), text(link.get("pqv")));
+        }
         proxy.insert("reality-opts".into(), Value::Object(reality));
+    } else if !link.get("pqv").is_empty() {
+        return Err(ConfigError::new("REALITY pqv requires pbk"));
     }
     match link.get("packetEncoding") {
         "none" => {}

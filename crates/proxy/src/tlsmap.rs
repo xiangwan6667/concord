@@ -121,11 +121,14 @@ pub(crate) fn tls_options(
                     "REALITY is based on uTLS, please set a client-fingerprint",
                 ));
             }
-            Some(RealityOptions::parse(
+            let mut options = RealityOptions::parse(
                 &reality.public_key,
                 &reality.short_id,
                 reality.support_x25519_mlkem768,
-            )?)
+            )?;
+            options.client_version = reality.client_version.unwrap_or([1, 8, 2]);
+            options.mldsa65_verify.clone_from(&reality.mldsa65_verify);
+            Some(options)
         }
         _ => None,
     };
@@ -250,6 +253,7 @@ mod tests {
                 public_key: "A".repeat(43),
                 short_id: "ab".into(),
                 support_x25519_mlkem768: false,
+                ..RealityOpts::default()
             }),
             ..TlsOpts::default()
         };
@@ -264,6 +268,7 @@ mod tests {
             public_key: "A".repeat(43),
             short_id: "ab".into(),
             support_x25519_mlkem768: false,
+            ..RealityOpts::default()
         };
         let mut tls = TlsOpts {
             reality: Some(reality),

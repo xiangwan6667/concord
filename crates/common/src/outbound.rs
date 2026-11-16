@@ -36,6 +36,7 @@ pub enum OutboundKind {
     Ssh,
     Mieru,
     AnyTls,
+    Miu,
     ShadowQuic,
 }
 
@@ -63,6 +64,7 @@ impl OutboundKind {
             OutboundKind::Ssh => "Ssh",
             OutboundKind::Mieru => "Mieru",
             OutboundKind::AnyTls => "AnyTLS",
+            OutboundKind::Miu => "Miu",
             OutboundKind::ShadowQuic => "ShadowQuic",
         }
     }

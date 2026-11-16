@@ -1,5 +1,5 @@
 mod frame;
-mod padding;
+pub(crate) mod padding;
 mod pool;
 mod session;
 mod stream;

@@ -27,6 +27,7 @@ pub const T1_PROXY_TYPES: &[&str] = &[
     "ssr",
     "snell",
     "mieru",
+    "miu",
     "ssh",
     "shadowquic",
 ];
@@ -172,6 +173,7 @@ fn parse_typed(
         "hysteria2" => ProxyKind::Hysteria2(Box::new(parse_hysteria2(f, caps)?)),
         "tuic" => ProxyKind::Tuic(Box::new(parse_tuic(f, caps)?)),
         "anytls" => ProxyKind::AnyTls(Box::new(parse_anytls(f, caps)?)),
+        "miu" => ProxyKind::Miu(Box::new(parse_miu(f, caps)?)),
         "socks5" => ProxyKind::Socks5(parse_socks5(f, caps)?),
         "http" => ProxyKind::Http(parse_http(f, caps)?),
         "wireguard" => ProxyKind::WireGuard(Box::new(parse_wireguard(f)?)),
@@ -260,12 +262,48 @@ fn reality_opts(f: &mut Fields<'_>) -> R<Option<RealityOpts>> {
     let Some(mut r) = f.sub("reality-opts")? else {
         return Ok(None);
     };
+    let version = r.string("client-version")?;
+    let client_version = if version.is_empty() {
+        None
+    } else {
+        let parts = version
+            .split('.')
+            .map(str::parse::<u8>)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()
+            .and_then(|parts| <[u8; 3]>::try_from(parts).ok())
+            .ok_or_else(|| Fail::Hard(ConfigError::new("invalid REALITY client version")))?;
+        Some(parts)
+    };
+    let verify = r.string("mldsa65-verify")?;
+    let mldsa65_verify = if verify.is_empty() {
+        None
+    } else {
+        let key = URL_SAFE_NO_PAD
+            .decode(verify)
+            .ok()
+            .filter(|key| key.len() == 1952)
+            .ok_or_else(|| {
+                Fail::Hard(ConfigError::new(
+                    "invalid REALITY ML-DSA-65 verification key",
+                ))
+            })?;
+        Some(key)
+    };
     let out = RealityOpts {
         public_key: r.req_string("public-key")?,
         short_id: r.string("short-id")?,
-        support_x25519_mlkem768: r.boolean("support-x25519mlkem768")?,
+        support_x25519_mlkem768: !r.has("support-x25519mlkem768")
+            || r.boolean("support-x25519mlkem768")?,
+        client_version,
+        mldsa65_verify,
     };
     r.finish()?;
+    if out.public_key.is_empty() && (out.client_version.is_some() || out.mldsa65_verify.is_some()) {
+        return Err(Fail::Hard(ConfigError::new(
+            "REALITY authentication options require a public key",
+        )));
+    }
     if !out.public_key.is_empty() {
         let key = URL_SAFE_NO_PAD.decode(out.public_key.as_bytes());
         if key.map(|k| k.len()) != Ok(32) {
@@ -761,6 +799,35 @@ fn parse_tuic(f: &mut Fields<'_>, caps: &Capabilities) -> R<TuicOpts> {
     Ok(out)
 }
 
+fn parse_miu(f: &mut Fields<'_>, caps: &Capabilities) -> R<MiuOpts> {
+    let (server, port) = server_port(f)?;
+    let psk = f.req_string("psk")?.trim().to_string();
+    if psk.len() < 16 {
+        return Err(ConfigError::new("miu: psk must contain at least 16 bytes").into());
+    }
+    let mut tls = tls_opts(f, "sni", caps)?;
+    if tls.server_name.is_empty() {
+        tls.server_name = f.string("servername")?;
+    } else {
+        f.string("servername")?;
+    }
+    f.boolean("tls")?;
+    tls.enabled = true;
+    let idle = f.i64("idle-session-timeout")?;
+    let min_idle = f.i64("min-idle-session")?;
+    if !(0..=9_223_372_035).contains(&idle) || !(0..=32).contains(&min_idle) {
+        return Err(ConfigError::new("miu: invalid idle session settings").into());
+    }
+    Ok(MiuOpts {
+        server,
+        port,
+        psk,
+        tls,
+        idle_session_timeout: idle as u64,
+        min_idle_session: min_idle as u8,
+    })
+}
+
 fn parse_anytls(f: &mut Fields<'_>, caps: &Capabilities) -> R<AnyTlsOpts> {
     let (server, port) = server_port(f)?;
     let password = f.req_string("password")?;
@@ -1234,6 +1301,28 @@ mod tests {
             )
             .contains("short ID")
         );
+    }
+
+    #[test]
+    fn reality_authentication_options_are_validated_and_retained() {
+        let verify = URL_SAFE_NO_PAD.encode([9; 1952]);
+        let node = json!({"name":"r","type":"vless","server":"x","port":443,"uuid":"u","tls":true,
+            "client-fingerprint":"chrome", "reality-opts":{"public-key":"A".repeat(43),
+            "client-version":"26.3.27", "mldsa65-verify":verify}});
+        let ProxyKind::Vless(vless) = def(node.clone()).kind else {
+            panic!("not vless")
+        };
+        let reality = vless.tls.reality.unwrap();
+        assert_eq!(reality.client_version, Some([26, 3, 27]));
+        assert_eq!(reality.mldsa65_verify, Some(vec![9; 1952]));
+        for version in ["1.2", "1.2.3.4", "256.1.2", "one.2.3"] {
+            let mut invalid = node.clone();
+            invalid["reality-opts"]["client-version"] = version.into();
+            assert!(error(invalid).contains("client version"));
+        }
+        let mut invalid = node;
+        invalid["reality-opts"]["mldsa65-verify"] = "short".into();
+        assert!(error(invalid).contains("ML-DSA-65"));
     }
 
     #[test]

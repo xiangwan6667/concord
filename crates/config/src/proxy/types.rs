@@ -48,6 +48,8 @@ pub struct RealityOpts {
     pub public_key: String,
     pub short_id: String,
     pub support_x25519_mlkem768: bool,
+    pub client_version: Option<[u8; 3]>,
+    pub mldsa65_verify: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -384,6 +386,16 @@ pub struct TuicOpts {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MiuOpts {
+    pub server: String,
+    pub port: u16,
+    pub psk: String,
+    pub tls: TlsOpts,
+    pub idle_session_timeout: u64,
+    pub min_idle_session: u8,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AnyTlsOpts {
     pub server: String,
     pub port: u16,
@@ -574,6 +586,7 @@ pub enum ProxyKind {
     Hysteria2(Box<Hysteria2Opts>),
     Tuic(Box<TuicOpts>),
     AnyTls(Box<AnyTlsOpts>),
+    Miu(Box<MiuOpts>),
     Socks5(Socks5Opts),
     Http(HttpProxyOpts),
     WireGuard(Box<WireGuardOpts>),
@@ -597,6 +610,7 @@ impl ProxyKind {
             ProxyKind::Hysteria2(_) => "hysteria2",
             ProxyKind::Tuic(_) => "tuic",
             ProxyKind::AnyTls(_) => "anytls",
+            ProxyKind::Miu(_) => "miu",
             ProxyKind::Socks5(_) => "socks5",
             ProxyKind::Http(_) => "http",
             ProxyKind::WireGuard(_) => "wireguard",
@@ -619,6 +633,7 @@ impl ProxyKind {
             ProxyKind::Hysteria2(o) => Some((&o.server, o.port)),
             ProxyKind::Tuic(o) => Some((&o.server, o.port)),
             ProxyKind::AnyTls(o) => Some((&o.server, o.port)),
+            ProxyKind::Miu(o) => Some((&o.server, o.port)),
             ProxyKind::Socks5(o) => Some((&o.server, o.port)),
             ProxyKind::Http(o) => Some((&o.server, o.port)),
             ProxyKind::Hysteria(o) => Some((&o.server, o.port)),

@@ -6,7 +6,7 @@ use std::io;
 use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use aws_lc_rs::agreement::{self, UnparsedPublicKey, X25519};
 use aws_lc_rs::kem::{EncapsulationKey, ML_KEM_768};
-use aws_lc_rs::signature::Ed25519KeyPair;
+use aws_lc_rs::signature::{Ed25519KeyPair, ML_DSA_65_SIGNING, PqdsaKeyPair};
 use aws_lc_rs::{hmac, rand::fill};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -36,6 +36,8 @@ pub struct MockReality {
     pub fault: Fault,
     pub alpn: Option<&'static [u8]>,
     pub suite: u16,
+    pub client_version: [u8; 3],
+    pub mldsa: Option<PqdsaKeyPair>,
 }
 
 impl MockReality {
@@ -55,6 +57,8 @@ impl MockReality {
             fault: Fault::None,
             alpn: Some(b"h2"),
             suite: 0x1301,
+            client_version: [1, 8, 2],
+            mldsa: None,
         }
     }
 }
@@ -133,9 +137,31 @@ fn parse_client_hello(msg: &[u8]) -> io::Result<ClientHello> {
 }
 
 impl MockReality {
-    fn reality_cert(&self, auth_key: &[u8], tamper: bool) -> (Vec<u8>, rcgen::KeyPair) {
+    fn reality_cert(
+        &self,
+        auth_key: &[u8],
+        tamper: bool,
+        hellos: &[u8],
+    ) -> (Vec<u8>, rcgen::KeyPair) {
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
-        let params = rcgen::CertificateParams::new(vec!["reality.test".into()]).unwrap();
+        let mut params = rcgen::CertificateParams::default();
+        if let Some(signer) = &self.mldsa {
+            let hmac_key = hmac::Key::new(hmac::HMAC_SHA512, auth_key);
+            let mut context = hmac::Context::with_key(&hmac_key);
+            context.update(key.public_key_raw());
+            context.update(hellos);
+            let mut signature = vec![0; ML_DSA_65_SIGNING.signature_len()];
+            let length = signer
+                .sign(context.sign().as_ref(), &mut signature)
+                .unwrap();
+            signature.truncate(length);
+            params
+                .custom_extensions
+                .push(rcgen::CustomExtension::from_oid_content(
+                    &[1, 2, 3, 4],
+                    signature,
+                ));
+        }
         let mut der = params.self_signed(&key).unwrap().der().to_vec();
         let mut mac = hmac::sign(
             &hmac::Key::new(hmac::HMAC_SHA512, auth_key),
@@ -192,7 +218,7 @@ impl MockReality {
                 &mut sealed,
             )
             .map_err(|_| bad("session id does not open"))?;
-        if plain[..3] != [1, 8, 2] || plain[8..16] != self.short_id {
+        if plain[..3] != self.client_version || plain[8..16] != self.short_id {
             return Err(bad("unknown client"));
         }
 
@@ -277,7 +303,8 @@ impl MockReality {
             ee_body.extend_from_slice(&ext);
         }
         let ee = message(8, &ee_body);
-        let (cert_der, cert_key) = self.reality_cert(&auth_key, self.fault == Fault::BadHmac);
+        let (cert_der, cert_key) =
+            self.reality_cert(&auth_key, self.fault == Fault::BadHmac, &transcript);
         let mut cert_body = vec![0];
         put_u24(&mut cert_body, cert_der.len() + 5);
         put_u24(&mut cert_body, cert_der.len());

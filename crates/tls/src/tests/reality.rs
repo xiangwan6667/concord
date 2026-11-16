@@ -45,6 +45,8 @@ fn connector_with(
                 public_key: server.public_key,
                 short_id,
                 support_x25519mlkem768: mlkem,
+                client_version: [1, 8, 2],
+                mldsa65_verify: None,
             }),
             ..TlsOptions::default()
         },
@@ -64,6 +66,52 @@ async fn dial(server: Arc<MockReality>, connector: &TlsConnector) -> std::io::Re
     )
     .await
     .expect("handshake hung")
+}
+
+#[tokio::test]
+async fn authenticates_mldsa_and_the_configured_client_version() {
+    use aws_lc_rs::signature::{KeyPair, ML_DSA_65_SIGNING, PqdsaKeyPair};
+
+    for (signed, wrong_key) in [(true, false), (true, true), (false, false)] {
+        let mut server = MockReality::new();
+        server.client_version = [26, 3, 27];
+        let signer = PqdsaKeyPair::generate(&ML_DSA_65_SIGNING).unwrap();
+        let mut verification_key = signer.public_key().as_ref().to_vec();
+        if wrong_key {
+            verification_key = PqdsaKeyPair::generate(&ML_DSA_65_SIGNING)
+                .unwrap()
+                .public_key()
+                .as_ref()
+                .to_vec();
+        }
+        if signed {
+            server.mldsa = Some(signer);
+        }
+        let options = TlsOptions {
+            server_name: Some("cover.test".into()),
+            client_fingerprint: Some(ClientFingerprint::Chrome),
+            reality: Some(RealityOptions {
+                public_key: server.public_key,
+                short_id: server.short_id,
+                support_x25519mlkem768: true,
+                client_version: server.client_version,
+                mldsa65_verify: Some(verification_key),
+            }),
+            ..TlsOptions::default()
+        };
+        let connector = TlsConnector::new(options, empty_trust()).unwrap();
+        let result = dial(Arc::new(server), &connector).await;
+        if signed && !wrong_key {
+            let mut connection = result.unwrap();
+            connection.write_all(b"hello").await.unwrap();
+            connection.flush().await.unwrap();
+            let mut echoed = [0; 5];
+            connection.read_exact(&mut echoed).await.unwrap();
+            assert_eq!(&echoed, b"hello");
+        } else {
+            assert!(result.err().unwrap().to_string().contains("ML-DSA-65"));
+        }
+    }
 }
 
 #[tokio::test]
@@ -370,6 +418,8 @@ fn config_errors_do_not_need_a_network() {
             public_key: server.public_key,
             short_id: [0; 8],
             support_x25519mlkem768: false,
+            client_version: [1, 8, 2],
+            mldsa65_verify: None,
         }),
         certificate: Some("x".into()),
         private_key: Some("y".into()),

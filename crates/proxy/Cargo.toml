@@ -39,6 +39,7 @@ md-5 = { workspace = true }
 hmac = { workspace = true }
 blake2 = { workspace = true }
 blake3 = { workspace = true }
+ctr = { workspace = true }
 aes = { workspace = true }
 aes-gcm = { workspace = true }
 x25519-dalek = { workspace = true }

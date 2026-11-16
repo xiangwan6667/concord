@@ -27,6 +27,7 @@ crate's directory, its `[patch.crates-io]` entry and its lines in `UPSTREAM.sha2
 
 | Crate | Change | Upstream | Route |
 |---|---|---|---|
+| blake3 | Byte-string key-derivation contexts | None | Propose the byte-slice counterpart of `hash_derive_key_context` to BLAKE3-team/BLAKE3 |
 | boring | Read-only `SslRef` record-layer accessors | None | None planned: the change stays in the vendored copy |
 | h2 | Ignore DATA and HEADERS on forgotten client streams | None as of 0.4.20 | Issue and PR to hyperium/h2 with the delayed-DATA-after-reset transport test |
 | mio | High-resolution timed waits on Windows | None | PR to tokio-rs/mio, citing Go's default poller path |
@@ -41,6 +42,10 @@ crate's directory, its `[patch.crates-io]` entry and its lines in `UPSTREAM.sha2
 | shadowsocks | AEAD-2022 padding of 1 to 900 bytes under 900-byte payloads | None | PR citing sing-shadowsocks |
 | shadowsocks | `set_clock`; split halves; owned in-place writes | None | Last, as one design discussion: the largest and most Concord-specific |
 | tun-rs | `AsyncDevice::into_sync` keeps the owned device | None | PR to tun-rs |
+
+## blake3 1.8.7
+
+- `src/hazmat.rs`: expose `hash_derive_key_context_bytes` beside its string counterpart. VLESS Encryption derives keys from binary IVs and handshake records, as the Go BLAKE3 API permits. Both APIs share the existing hash implementation.
 
 ## boring 5.4.0
 

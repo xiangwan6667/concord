@@ -4,8 +4,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, ready};
 
+use super::encryption::EncryptionStream;
+use super::vision_io::{VisionRead, VisionWrite};
 use concord_common::{Address, BoxRead, BoxWrite, Stream};
-use concord_tls::{TlsConn, TlsRead, TlsWrite};
+use concord_tls::TlsConn;
 use rand::Rng;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -317,7 +319,7 @@ pub(crate) struct Vision {
 }
 
 struct VisionReader {
-    io: ResponseSkip<TlsRead>,
+    io: ResponseSkip<VisionRead>,
     user: [u8; 16],
     filter: Arc<Mutex<Filter>>,
     read_process: bool,
@@ -333,7 +335,7 @@ struct VisionReader {
 }
 
 struct VisionWriter {
-    io: HeadFirst<TlsWrite>,
+    io: HeadFirst<VisionWrite>,
     filter: Arc<Mutex<Filter>>,
     write_filter: bool,
     write_direct: bool,
@@ -356,8 +358,31 @@ impl Vision {
         let (read, write) = tls
             .into_halves()
             .map_err(|_| io::Error::other("XTLS Vision needs the TLS record layer"))?;
+        Ok(Self::from_halves(
+            VisionRead::Tls(read),
+            VisionWrite::Tls(write),
+            header,
+            user,
+        ))
+    }
+
+    pub(crate) fn new_encrypted(
+        encrypted: EncryptionStream,
+        header: Vec<u8>,
+        user: [u8; 16],
+    ) -> Self {
+        let (read, write) = encrypted.into_halves();
+        Self::from_halves(
+            VisionRead::Encrypted(read),
+            VisionWrite::Encrypted(write),
+            header,
+            user,
+        )
+    }
+
+    fn from_halves(read: VisionRead, write: VisionWrite, header: Vec<u8>, user: [u8; 16]) -> Self {
         let filter = Arc::new(Mutex::new(Filter::new()));
-        Ok(Vision {
+        Vision {
             reader: VisionReader {
                 io: ResponseSkip::new(read),
                 user,
@@ -386,12 +411,12 @@ impl Vision {
                 switch_pending: false,
                 staged: None,
             },
-        })
+        }
     }
 }
 
 impl VisionReader {
-    fn tls(&mut self) -> &mut TlsRead {
+    fn tls(&mut self) -> &mut VisionRead {
         self.io.get_mut()
     }
 

@@ -122,6 +122,33 @@ pub fn apply_extra(extra: &Map, opts: &mut Map) {
                 }
             }
         }
+        if settings.get("security").and_then(Value::as_str) == Some("reality")
+            && let Some(Value::Object(reality)) = settings.get("realitySettings")
+        {
+            download.insert("tls".into(), json!(true));
+            let mut auth = Map::new();
+            if let Some(key) =
+                non_empty(reality, "publicKey").or_else(|| non_empty(reality, "password"))
+            {
+                auth.insert("public-key".into(), json!(key));
+            }
+            for (source, target) in [("shortId", "short-id"), ("mldsa65Verify", "mldsa65-verify")] {
+                if let Some(value) = non_empty(reality, source) {
+                    auth.insert(target.into(), json!(value));
+                }
+            }
+            for (source, target) in [
+                ("serverName", "servername"),
+                ("fingerprint", "client-fingerprint"),
+            ] {
+                if let Some(value) = non_empty(reality, source) {
+                    download.insert(target.into(), json!(value));
+                }
+            }
+            if !auth.is_empty() {
+                download.insert("reality-opts".into(), Value::Object(auth));
+            }
+        }
         if !download.is_empty() {
             opts.insert("download-settings".into(), Value::Object(download));
         }

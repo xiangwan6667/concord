@@ -21,6 +21,7 @@ fn tls_of(kind: &ProxyKind) -> Option<&TlsOpts> {
         ProxyKind::Hysteria2(o) => Some(&o.tls),
         ProxyKind::Tuic(o) => Some(&o.tls),
         ProxyKind::AnyTls(o) => Some(&o.tls),
+        ProxyKind::Miu(o) => Some(&o.tls),
         ProxyKind::Socks5(o) => Some(&o.tls),
         ProxyKind::Http(o) => Some(&o.tls),
         ProxyKind::Hysteria(o) => Some(&o.tls),

@@ -64,7 +64,7 @@ paths, fields, status codes, `Authorization: Bearer` secret and CORS. The differ
 - A provider's `override.override-expr`: the provider gets no proxies and a warning, because its nodes must not run
   without the expressions.
 - The `relay` group type, which mihomo also removed; use `dialer-proxy`.
-- ShadowsocksR `chacha20` and `xchacha20` (obsolete unauthenticated ciphers); VLESS `encryption`; xhttp over HTTP/3;
+- ShadowsocksR `chacha20` and `xchacha20` (obsolete unauthenticated ciphers); xhttp over HTTP/3;
   Hysteria `faketcp`; ShadowQUIC over QUIC v2.
 - sing-mux brutal on the client's own socket, which needs a Linux kernel module. The sing-mux exchange is done, so
   the server still paces its sends.
@@ -73,6 +73,16 @@ paths, fields, status codes, `Authorization: Bearer` secret and CORS. The differ
 - `global-client-fingerprint`, which mihomo also removed.
 
 ## Partial Support
+
+- Miu supports TCP and UDP-over-TCP v2 over TLS 1.3 and REALITY, with PSK-derived padding, first-payload coalescing,
+  sequential lane reuse, cancellation recovery and background prewarming during bursts. The client negotiates
+  `raw=1` and carries inner TLS 1.3 application data as raw segments after the handshake. UDP stays in DATA frames.
+  A dead pooled lane is replaced once while no downstream payload has arrived and at most 64 KiB has been sent.
+  `min-idle-session` defaults to two warm lanes and accepts values up to 32.
+- VLESS Encryption supports `mlkem768x25519plus` with `native`, `xorpub` and `random`, both `1rtt` and `0rtt`,
+  X25519 and ML-KEM-768 relay keys, padding and session tickets. It carries TCP, packet-address UDP and XUDP and
+  works with Vision's direct handoff.
+- **REALITY:** Hybrid X25519/ML-KEM-768 exchange is enabled by default and can be disabled per node. `mldsa65-verify` verifies the server's ML-DSA-65 authentication, including imported `pqv` share-link keys. `client-version` selects the three reported version bytes and defaults to `1.8.2`.
 
 - **mieru:** both transports work against mihomo's mieru listener; the UDP transport with a `dialer-proxy` is
   rejected when the node is built, and padding statistics are approximated.

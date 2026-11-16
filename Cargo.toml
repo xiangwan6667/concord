@@ -30,7 +30,7 @@ members = [
     "tools/bench",
     "xtask",
 ]
-exclude = ["vendor/boring", "vendor/h2", "vendor/mio", "vendor/quinn", "vendor/quinn-proto", "vendor/rustls", "vendor/shadowsocks", "vendor/tun-rs"]
+exclude = ["vendor/blake3", "vendor/boring", "vendor/h2", "vendor/mio", "vendor/quinn", "vendor/quinn-proto", "vendor/rustls", "vendor/shadowsocks", "vendor/tun-rs"]
 
 [workspace.package]
 version = "0.1.0"
@@ -136,6 +136,7 @@ hmac = "0.12"
 hkdf = "0.12"
 blake2 = "0.10"
 blake3 = "1"
+ctr = "0.9"
 aes = "0.8"
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 cfb-mode = "0.8"
@@ -276,6 +277,7 @@ opt-level = 3
 opt-level = 3
 
 [patch.crates-io]
+blake3 = { path = "vendor/blake3" }
 boring = { path = "vendor/boring" }
 h2 = { path = "vendor/h2" }
 tun-rs = { path = "vendor/tun-rs" }

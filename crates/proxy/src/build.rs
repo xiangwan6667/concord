@@ -35,6 +35,7 @@ fn build_kind(def: &ProxyDef, ctx: &BuildCtx) -> Result<Arc<dyn Outbound>, Build
         ProxyKind::Hysteria2(opts) => crate::hysteria2::build(def, opts, ctx),
         ProxyKind::Tuic(opts) => crate::tuic::build(def, opts, ctx),
         ProxyKind::AnyTls(opts) => crate::anytls::build(def, opts, ctx),
+        ProxyKind::Miu(opts) => crate::miu::build(def, opts, ctx),
         ProxyKind::WireGuard(opts) => crate::wireguard::build(def, opts, ctx),
         ProxyKind::Ssr(opts) => crate::ssr::build(def, opts, ctx),
         ProxyKind::Snell(opts) => crate::snell::build(def, opts, ctx),

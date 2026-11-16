@@ -2,8 +2,8 @@
 # A number may go up only with `raised from <old>: <reason>`; see `.agents/rules.md`.
 file-lines crates/api/src/control.rs 1346
 file-lines crates/config/src/profile.rs 915
-file-lines crates/config/src/proxy/parse.rs 1056
-file-lines crates/config/src/share_link/decode.rs 940
+file-lines crates/config/src/proxy/parse.rs 1123 raised from 1056: Miu and REALITY authentication fields join the typed proxy parser; split when protocol parsers leave parse.rs
+file-lines crates/config/src/share_link/decode.rs 945 raised from 940: retain and validate REALITY pqv keys with the existing VLESS share-link fields
 file-lines crates/engine/src/engine.rs 1446 raised from 1442: the route epoch also moves after a stop and a network reset; setup_as starts the fetch of a missing ASN.mmdb, and its fallback to the default moved into a helper to keep it under 120 lines; protect held sockets on VPN TUN start; a network change drops the platform's interface tables, back down when TUN start leaves engine.rs
 file-lines crates/engine/src/resources.rs 1017 raised from 985: IP-ASN rules wait for a missing ASN.mmdb instead of holding the apply, and memory is released once the initial rule-provider loads finish, as mihomo does after loading; the blank line that sets off the test module counts as code; back down when the deferred geo fetch leaves resources.rs
 file-lines crates/group/src/outbounds.rs 1003
@@ -16,7 +16,7 @@ fn-lines crates/config/src/raw.rs::RawConfig::from_document 128
 fn-lines crates/config/src/rule.rs::build_cond 130
 fn-lines crates/config/src/share_link/decode.rs::decode_line 294
 fn-lines crates/config/src/share_link/decode.rs::decode_vmess 172
-fn-lines crates/config/src/share_link/decode.rs::v_share_link 148
+fn-lines crates/config/src/share_link/decode.rs::v_share_link 153 raised from 148: import the optional REALITY pqv verification key with its public key
 fn-lines crates/dns/src/build.rs::Resolver::new 157
 fn-lines crates/group/src/outbounds.rs::Builder::build_group 169
 fn-lines crates/mitm/src/exchange.rs::Session::handle 193
@@ -28,7 +28,7 @@ fn-lines crates/proxy/src/tuic/mod.rs::build 131
 fn-lines crates/rules/src/compile.rs::node_for_cond 162 raised from 158: a missing ASN.mmdb defers an IP-ASN condition instead of failing the compile
 fn-lines crates/rules/src/eval.rs::Ev::eval 151 raised from 132: NOT does not match an IP-ASN check whose database is still loading
 fn-lines crates/rules/src/run.rs::Run::step 130
-fn-lines crates/tls/src/reality/handshake.rs::RealityClient::run 194
+fn-lines crates/tls/src/reality/handshake.rs::RealityClient::run 202 raised from 194: bind optional ML-DSA-65 authentication to both TLS hellos before accepting the server
 fn-lines crates/tls/src/reality/hello.rs::build_client_hello 210
 fn-lines crates/transport/src/gun/frame.rs::Read::poll_read 130
 fn-lines crates/transport/src/ws/frame.rs::poll_step 129

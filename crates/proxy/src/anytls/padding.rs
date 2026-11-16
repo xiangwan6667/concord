@@ -6,15 +6,15 @@ use rand::Rng;
 pub(super) const DEFAULT_SCHEME: &str = "stop=8\n0=30-30\n1=100-400\n2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000\n3=9-9,500-1000\n4=500-1000\n5=500-1000\n6=500-1000\n7=500-1000";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Size {
+pub(crate) enum Size {
     Bytes(usize),
     /// Stops the record plan once the payload is spent.
     Check,
 }
 
-pub(super) struct Padding {
-    pub(super) md5: String,
-    pub(super) stop: u32,
+pub(crate) struct Padding {
+    pub(crate) md5: String,
+    pub(crate) stop: u32,
     rules: HashMap<String, String>,
 }
 
@@ -26,7 +26,7 @@ pub(super) fn parse_map(text: &str) -> HashMap<String, String> {
 }
 
 impl Padding {
-    pub(super) fn parse(raw: &[u8]) -> Option<Padding> {
+    pub(crate) fn parse(raw: &[u8]) -> Option<Padding> {
         let rules = parse_map(&String::from_utf8_lossy(raw));
         if rules.is_empty() {
             return None;
@@ -48,7 +48,7 @@ impl Padding {
     }
 
     /// The record sizes planned for the `packet`-th write.
-    pub(super) fn sizes(&self, packet: u32) -> Vec<Size> {
+    pub(crate) fn sizes(&self, packet: u32) -> Vec<Size> {
         let Some(spec) = self.rules.get(&packet.to_string()) else {
             return Vec::new();
         };

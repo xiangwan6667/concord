@@ -1,4 +1,8 @@
+mod encryption;
 mod stream;
+mod vision_io;
+#[cfg(test)]
+mod xray_tests;
 
 use std::io;
 use std::sync::Arc;
@@ -27,12 +31,25 @@ struct Vless {
     user: [u8; 16],
     vision: bool,
     mode: UdpMode,
+    encryption: Option<Arc<encryption::Client>>,
 }
 
 impl Vless {
     async fn stream(&self, cx: &DialCx<'_>, command: u8, dst: &Address) -> io::Result<BoxStream> {
         let flow = self.vision.then_some(FLOW_VISION);
         let header = request_header(&self.user, flow, command, dst)?;
+        if let Some(encryption) = &self.encryption {
+            let io = self.link.open(cx).await?;
+            let encrypted = encryption.handshake(io).await?;
+            if self.vision {
+                return Ok(Box::new(Vision::new_encrypted(
+                    encrypted, header, self.user,
+                )));
+            }
+            return Ok(Box::new(ResponseSkip::new(HeadFirst::new(
+                encrypted, header,
+            ))));
+        }
         if self.vision {
             if self.link.tls.is_none() || !self.link.stack.is_empty() {
                 return Err(io::Error::other(
@@ -49,6 +66,11 @@ impl Vless {
 
 #[async_trait]
 impl Outbound for Vless {
+    fn reset_sessions(&self) {
+        if let Some(encryption) = &self.encryption {
+            encryption.reset();
+        }
+    }
     fn info(&self) -> &OutboundInfo {
         &self.info
     }
@@ -136,11 +158,8 @@ pub(crate) fn build(
     } else {
         false
     };
-    if !matches!(opts.encryption.as_str(), "" | "none") {
-        return Err(BuildError::unsupported(
-            "vless encryption other than none is not implemented yet",
-        ));
-    }
+    let encryption = encryption::Client::parse(&opts.encryption)
+        .map_err(|error| BuildError::invalid(error.to_string()))?;
     let link = build_link(
         LinkSpec {
             def,
@@ -179,6 +198,7 @@ pub(crate) fn build(
         user: user_id(&opts.uuid),
         vision,
         mode,
+        encryption,
     }))
 }
 

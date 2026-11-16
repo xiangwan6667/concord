@@ -54,6 +54,7 @@ mod tests {
             }),
             "snell" => json!({"psk": "p"}),
             "ssh" => json!({"username": "u", "password": "p"}),
+            "miu" => json!({"psk": "0123456789abcdef"}),
             "mieru" => json!({"transport": "TCP", "username": "u", "password": "p"}),
             _ => json!({}),
         };

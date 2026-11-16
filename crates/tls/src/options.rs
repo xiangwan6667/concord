@@ -12,6 +12,8 @@ pub struct RealityOptions {
     pub public_key: [u8; 32],
     pub short_id: [u8; REALITY_SHORT_ID_LEN],
     pub support_x25519mlkem768: bool,
+    pub client_version: [u8; 3],
+    pub mldsa65_verify: Option<Vec<u8>>,
 }
 
 impl RealityOptions {
@@ -44,6 +46,8 @@ impl RealityOptions {
             public_key,
             short_id,
             support_x25519mlkem768,
+            client_version: [1, 8, 2],
+            mldsa65_verify: None,
         })
     }
 }

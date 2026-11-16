@@ -1,6 +1,6 @@
-use aws_lc_rs::hmac;
+use aws_lc_rs::{hmac, signature};
 
-use super::schedule::hmac_sign;
+use crate::error::invalid_data;
 
 #[derive(Clone, Copy)]
 struct Der<'a> {
@@ -35,6 +35,7 @@ fn read_der<'a>(input: &'a [u8], pos: &mut usize) -> Option<Der<'a>> {
 pub(crate) struct Ed25519Cert {
     pub public_key: [u8; 32],
     pub signature: Vec<u8>,
+    pub extension: Option<Vec<u8>>,
 }
 
 /// The temporary certificate a REALITY server presents: an Ed25519 key whose
@@ -78,17 +79,57 @@ pub(crate) fn parse_ed25519_cert(cert: &[u8]) -> Option<Ed25519Cert> {
     Some(Ed25519Cert {
         public_key: bits.try_into().ok()?,
         signature: signature.value.get(1..)?.to_vec(),
+        extension: children
+            .iter()
+            .find(|child| child.tag == 0xa3)
+            .and_then(|child| first_extension(child.value)),
     })
 }
 
+fn first_extension(input: &[u8]) -> Option<Vec<u8>> {
+    let extensions = read_der(input, &mut 0)?;
+    let first = read_der(extensions.value, &mut 0)?;
+    let mut at = 0;
+    let _oid = read_der(first.value, &mut at)?;
+    let mut value = read_der(first.value, &mut at)?;
+    if value.tag == 0x01 {
+        value = read_der(first.value, &mut at)?;
+    }
+    (value.tag == 0x04).then(|| value.value.to_vec())
+}
+
 pub(crate) fn hmac_matches(auth_key: &[u8], cert: &Ed25519Cert) -> bool {
-    let expected = hmac_sign(hmac::HMAC_SHA512, auth_key, &cert.public_key);
-    expected == cert.signature
+    hmac::verify(
+        &hmac::Key::new(hmac::HMAC_SHA512, auth_key),
+        &cert.public_key,
+        &cert.signature,
+    )
+    .is_ok()
+}
+
+pub(crate) fn verify_mldsa(
+    auth_key: &[u8],
+    cert: &Ed25519Cert,
+    verify_key: &[u8],
+    hellos: &[u8],
+) -> std::io::Result<()> {
+    let signature = cert
+        .extension
+        .as_deref()
+        .ok_or_else(|| invalid_data("REALITY: ML-DSA-65 signature is missing"))?;
+    let key = hmac::Key::new(hmac::HMAC_SHA512, auth_key);
+    let mut context = hmac::Context::with_key(&key);
+    context.update(&cert.public_key);
+    context.update(hellos);
+    signature::UnparsedPublicKey::new(&signature::ML_DSA_65, verify_key)
+        .verify(context.sign().as_ref(), signature)
+        .map_err(|_| invalid_data("REALITY: ML-DSA-65 authentication failed"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reality::schedule::hmac_sign;
 
     fn cert_with(key_pair: &rcgen::KeyPair) -> Vec<u8> {
         let params = rcgen::CertificateParams::new(vec!["reality.test".into()]).unwrap();

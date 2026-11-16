@@ -378,3 +378,32 @@ fn hysteria2_port_hopping_links() {
     assert_eq!(proxies[0]["ports"], "443,20000-30000");
     assert_eq!(proxies[0]["password"], "pw");
 }
+
+#[test]
+fn reality_share_links_preserve_mldsa_verification() {
+    check(
+        json!({"name":"r","type":"vless","server":"a.example","port":443,"uuid":"u",
+            "tls":true,"reality-opts":{"public-key":"public-key","mldsa65-verify":"verification-key"}}),
+        "vless://",
+        &[("reality-opts.mldsa65-verify", "verification-key")],
+    );
+    assert!(decode_link("vless://u@a.example:443?security=reality&pqv=key").is_empty());
+}
+
+#[test]
+fn xhttp_download_reality_keeps_aliases_and_independent_tls_settings() {
+    for (public_key, expected) in [(Some("primary"), "primary"), (None, "alias")] {
+        let extra = object(json!({"downloadSettings":{"security":"reality",
+            "realitySettings":{"publicKey":public_key,"password":"alias","shortId":"abcd",
+            "mldsa65Verify":"verify","serverName":"download.example","fingerprint":"firefox"}}}));
+        let mut options = Map::new();
+        super::xhttp::apply_extra(&extra, &mut options);
+        let download = &options["download-settings"];
+        assert_eq!(download["tls"], true);
+        assert_eq!(download["reality-opts"]["public-key"], expected);
+        assert_eq!(download["reality-opts"]["mldsa65-verify"], "verify");
+        assert_eq!(download["reality-opts"]["short-id"], "abcd");
+        assert_eq!(download["servername"], "download.example");
+        assert_eq!(download["client-fingerprint"], "firefox");
+    }
+}
