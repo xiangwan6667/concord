@@ -15,8 +15,10 @@ mod cases;
 mod control;
 mod core;
 mod env;
+mod gost;
 mod isolate;
 mod load;
+mod masque;
 mod netstat;
 mod origin;
 mod plan;
@@ -55,6 +57,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(hide = true)]
+    MasqueServer {
+        #[arg(long)]
+        listen: std::net::SocketAddr,
+    },
     #[command(about = "Measure a tier.")]
     Run(Box<RunArgs>),
     #[command(about = "Compare two results.json files and fail on a significant regression.")]
@@ -93,7 +100,7 @@ struct RunArgs {
     #[arg(long = "core")]
     cores: Vec<String>,
     #[arg(
-        help = "The mihomo binary that serves every protocol. Upstream builds start their `listeners:`; some forks of Clash.Meta do not."
+        help = "The mihomo binary that serves the protocol cases; xhttp HTTP/3 uses CONCORD_XRAY. Upstream builds start their `listeners:`; some forks of Clash.Meta do not."
     )]
     #[arg(long, env = "MIHOMO")]
     mihomo: Option<PathBuf>,
@@ -219,6 +226,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Run(args) => run(*args),
+        Command::MasqueServer { listen } => masque::serve(listen),
         Command::Compare(args) => compare(args),
         Command::List => {
             list();
@@ -504,10 +512,12 @@ fn run(args: RunArgs) -> Result<bool, String> {
         return Err("hysteria-brutal needs --sing-box with QUIC support".into());
     }
     let needs_server = attached.is_empty()
-        && plan
-            .cases
-            .iter()
-            .any(|c| !matches!(c.name, "direct" | "hysteria-brutal"));
+        && plan.cases.iter().any(|c| {
+            !matches!(
+                c.name,
+                "direct" | "rematch" | "hysteria-brutal" | "masque-l4"
+            )
+        });
     let mihomo = match mihomo {
         Some(m) => m,
         None if !needs_server => cores

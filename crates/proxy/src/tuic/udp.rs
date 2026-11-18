@@ -43,7 +43,7 @@ impl TuicPackets {
         let streams = (!relay.native).then(|| {
             let (queue, mut jobs) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE);
             let conn = live.quic.conn.clone();
-            let task = tokio::spawn(async move {
+            let task = live.quic.tasks.spawn(async move {
                 while let Some(frame) = jobs.recv().await {
                     let Ok(mut stream) = conn.open_uni().await else {
                         break;
@@ -166,15 +166,13 @@ impl TuicPackets {
         }
         let frame = wire::dissociate(self.relay.version, self.id);
         let conn = self.live.quic.conn.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                if let Ok(mut stream) = conn.open_uni().await
-                    && stream.write_all(&frame).await.is_ok()
-                {
-                    let _ = stream.finish();
-                }
-            });
-        }
+        self.live.quic.tasks.spawn_detached(async move {
+            if let Ok(mut stream) = conn.open_uni().await
+                && stream.write_all(&frame).await.is_ok()
+            {
+                let _ = stream.finish();
+            }
+        });
     }
 }
 

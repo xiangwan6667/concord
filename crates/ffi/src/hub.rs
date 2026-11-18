@@ -74,17 +74,15 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct Hub {
     handle: Handle,
     server: Arc<Server<Control>>,
-    control: Arc<Control>,
     sessions: Mutex<HashMap<u64, mpsc::UnboundedSender<Vec<u8>>>>,
     next: AtomicU64,
 }
 
 impl Hub {
-    pub fn new(handle: Handle, server: Arc<Server<Control>>, control: Arc<Control>) -> Arc<Hub> {
+    pub fn new(handle: Handle, server: Arc<Server<Control>>) -> Arc<Hub> {
         Arc::new(Hub {
             handle,
             server,
-            control,
             sessions: Mutex::new(HashMap::new()),
             next: AtomicU64::new(0),
         })
@@ -126,7 +124,7 @@ impl Hub {
     /// A descriptor the host opened for the core, to be named by `tun.start`. Ownership moves to the core.
     #[cfg(unix)]
     pub fn adopt_fd(&self, fd: OwnedFd) -> u64 {
-        self.control.adopted_fds().adopt(fd)
+        self.server.service().adopted_fds().adopt(fd)
     }
 }
 

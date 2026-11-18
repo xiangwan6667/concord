@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use concord_common::Tasks;
 use tokio::task::JoinHandle;
 
 use super::session::Session;
@@ -16,6 +17,7 @@ pub(super) struct Pool {
     disable_reuse: bool,
     min_idle: usize,
     cleaner: Mutex<Option<JoinHandle<()>>>,
+    pub(super) tasks: Tasks,
 }
 
 #[derive(Default)]
@@ -34,13 +36,14 @@ impl Drop for Pool {
 }
 
 impl Pool {
-    pub(super) fn new(disable_reuse: bool, min_idle: usize) -> Arc<Pool> {
+    pub(super) fn new(disable_reuse: bool, min_idle: usize, tasks: Tasks) -> Arc<Pool> {
         Arc::new(Pool {
             idle: Mutex::new(Vec::new()),
             all: Mutex::new(Live::default()),
             disable_reuse,
             min_idle,
             cleaner: Mutex::new(None),
+            tasks,
         })
     }
 
@@ -112,7 +115,7 @@ impl Pool {
             return;
         }
         let pool = Arc::downgrade(self);
-        *cleaner = Some(tokio::spawn(async move {
+        *cleaner = Some(self.tasks.spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
                 let Some(pool) = pool.upgrade() else {

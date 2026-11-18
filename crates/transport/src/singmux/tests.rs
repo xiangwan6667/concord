@@ -219,7 +219,7 @@ async fn a_closed_client_dials_a_new_session_for_the_next_stream() {
         protocol: MuxProtocol::Smux,
         ..SingMuxOptions::default()
     };
-    let client = SingMuxClient::new(options, dial);
+    let client = SingMuxClient::new(options, dial, Default::default());
     let target = Address::new("1.2.3.4", 80);
     client.connect_tcp(&target).await.unwrap();
     client.close().await;

@@ -1,7 +1,7 @@
 use std::io;
 
 use bytes::Bytes;
-use concord_common::BoxStream;
+use concord_common::{BoxStream, Tasks};
 use http::{Method, Request, Uri};
 use rand::Rng;
 
@@ -18,7 +18,11 @@ pub struct H2Options {
 /// Runs one PUT request over the given connection and exposes its bodies as the
 /// byte stream, as mihomo's vmess `h2` network does. The connection must already
 /// have negotiated `h2`; nothing here pools it.
-pub(crate) async fn connect(io: BoxStream, opts: &H2Options) -> io::Result<BoxStream> {
+pub(crate) async fn connect(
+    io: BoxStream,
+    opts: &H2Options,
+    tasks: &Tasks,
+) -> io::Result<BoxStream> {
     if opts.hosts.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -56,7 +60,7 @@ pub(crate) async fn connect(io: BoxStream, opts: &H2Options) -> io::Result<BoxSt
         .await
         .map_err(h2_io_error)?;
     let activity = Activity::new();
-    spawn_connection(conn, None, activity);
+    spawn_connection(tasks, conn, None, activity);
     let mut sender = sender.ready().await.map_err(h2_io_error)?;
     let (response, send) = sender.send_request(request, false).map_err(h2_io_error)?;
     Ok(Box::new(H2Body::new(send, Incoming::Response(response))))
@@ -100,7 +104,9 @@ mod tests {
             hosts: vec!["a.example.com".into()],
             path: "/vm".into(),
         };
-        let mut conn = connect(Box::new(client), &opts).await.unwrap();
+        let mut conn = connect(Box::new(client), &opts, &Default::default())
+            .await
+            .unwrap();
         conn.write_all(b"hello").await.unwrap();
         let mut back = [0u8; 5];
         conn.read_exact(&mut back).await.unwrap();
@@ -116,7 +122,7 @@ mod tests {
     #[tokio::test]
     async fn empty_host_list_is_rejected() {
         let (client, _server) = duplex(64);
-        let err = connect(Box::new(client), &H2Options::default())
+        let err = connect(Box::new(client), &H2Options::default(), &Default::default())
             .await
             .err()
             .unwrap();

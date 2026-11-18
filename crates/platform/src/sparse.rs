@@ -124,7 +124,7 @@ mod tests {
         buf[4096] = 1;
         let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
         let mut inside = false;
-        let (mut rss, mut huge, mut flags) = (None, None, None);
+        let (mut huge, mut flags) = (None, None);
         for line in smaps.lines() {
             let range = line.split_whitespace().next().unwrap_or_default();
             if let Some((lo, hi)) = range.split_once('-')
@@ -139,7 +139,6 @@ mod tests {
                     .and_then(|rest| rest.split_whitespace().next()?.parse::<u64>().ok())
             };
             if inside {
-                rss = rss.or(kib("Rss:"));
                 huge = huge.or(kib("AnonHugePages:"));
                 flags = flags.or(line.strip_prefix("VmFlags:").map(str::to_owned));
             }
@@ -149,6 +148,17 @@ mod tests {
             "no nohugepage flag on the mapping"
         );
         assert_eq!(huge, Some(0));
-        assert!(rss.is_some_and(|kib| kib <= 64), "{rss:?} kB resident");
+
+        // The kernel merges the mapping with a neighbour of the same flags (glibc marks thread
+        // stacks nohugepage too), so smaps' Rss can count the neighbour; read this range alone.
+        // SAFETY: sysconf only reads a system constant.
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+        let mut resident = vec![0u8; buf.len().div_ceil(page)];
+        // SAFETY: the range is the buffer's own mapping, and `resident` has a byte per page of it.
+        let rc =
+            unsafe { libc::mincore(buf.as_mut_ptr().cast(), buf.len(), resident.as_mut_ptr()) };
+        assert_eq!(rc, 0);
+        let kib = resident.iter().filter(|&&flag| flag & 1 != 0).count() * page / 1024;
+        assert!(kib <= 64, "{kib} kB resident");
     }
 }

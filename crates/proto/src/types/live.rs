@@ -78,6 +78,8 @@ dto! {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub destination_asn: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub rematch_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub special_rules: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub special_proxy: Option<String>,

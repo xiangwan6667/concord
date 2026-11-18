@@ -136,7 +136,7 @@ dto! {
         pub url: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub timeout: Option<u64>,
-        /// Tests running at once. Default: every proxy at once, as mihomo tests a group.
+        /// Tests running at once. Default: every proxy at once, as the Clash API tests a group.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub concurrency: Option<u32>,
         /// As in `delay.test`.

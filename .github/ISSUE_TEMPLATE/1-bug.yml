@@ -1,0 +1,107 @@
+name: Bug
+description: Concord fails, crashes or misroutes traffic, reproduced with the standalone CLI on the latest version.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Concord follows mihomo. A report needs the same configuration's behaviour under mihomo; without it a
+        compatibility problem cannot be judged. Incomplete reports are labelled `needs-info` and closed after 7 days.
+  - type: input
+    id: version
+    attributes:
+      label: Concord version
+      description: The release tag (`v1.2.3`) or the full commit hash of the current `main`.
+    validations:
+      required: true
+  - type: dropdown
+    id: run-mode
+    attributes:
+      label: How Concord runs
+      options:
+        - Standalone CLI (concord run)
+        - Embedded in a host application
+        - C ABI (libconcord)
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Android
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS version and architecture
+      placeholder: Ubuntu 26.04, arm64
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Minimal configuration
+      description: The smallest profile that shows the problem.
+      render: yaml
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Debug log
+      description: "The log around the failure, with `log-level: debug` in the profile."
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: mihomo-version
+    attributes:
+      label: mihomo version
+      description: The mihomo release or commit you ran the same configuration with.
+    validations:
+      required: true
+  - type: textarea
+    id: mihomo-behaviour
+    attributes:
+      label: Behaviour under mihomo
+      description: What the same configuration does under that mihomo version.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I reproduced this on the latest release or the current `main`.
+          required: true
+        - label: I removed servers, passwords, UUIDs, keys and subscription URLs from the configuration and log.
+          required: true
+        - label: I reproduced this with the standalone `concord run`, so it is not a problem of a host application.
+          required: true
+        - label: I searched the existing issues, open and closed.
+          required: true
+        - label: This issue reports one problem.
+          required: true

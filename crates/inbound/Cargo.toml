@@ -23,9 +23,6 @@ socket2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
-[target.'cfg(unix)'.dependencies]
-libc = { workspace = true }
-
 [dev-dependencies]
 concord-test-support = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }

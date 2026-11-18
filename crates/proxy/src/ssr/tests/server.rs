@@ -243,7 +243,7 @@ async fn handle(socket: tokio::net::TcpStream, fixture: &Fixture) -> io::Result<
     let cipher = CodecStream::new(
         obfs,
         ServerCipher {
-            inner: fixture.cipher.layer(),
+            inner: fixture.cipher.layer().unwrap(),
             iv_len: fixture.cipher.iv_len(),
             peer_iv: peer_iv.clone(),
             seen: false,
@@ -333,7 +333,7 @@ pub(crate) async fn serve_udp(socket: UdpSocket, fixture: Arc<Fixture>) {
                 reply.extend_from_slice(&mac[..1]);
             }
         }
-        fixture.cipher.seal_packet(&mut reply);
+        fixture.cipher.seal_packet(&mut reply).unwrap();
         let _ = socket.send_to(reply.as_slice(), from).await;
     }
 }

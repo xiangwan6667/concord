@@ -31,6 +31,18 @@ Concord loads the profile, opens the listeners it declares (`mixed-port`, `port`
 
 TUN needs the privileges the platform requires to create a device and change routes.
 
+### Checking A Profile
+
+```sh
+concord -t -c config.yaml
+```
+
+Loads the profile without running it and prints what applying it would warn about as JSON,
+`{"warnings": [{"level", "code", "path", "message"}]}`, or `{"error": "..."}` with exit status 1 when it does not
+load. `--android` checks it as the Android build loads it. While `mitm` is enabled, each of its lines that cannot be
+read is skipped and reported (`mitm_line`, with the line of the profile); jq and cron expressions, scripts and the
+files a line names are checked when the section is applied.
+
 ### Reloading
 
 On macOS and Linux, SIGHUP reads the profile again. A profile that fails validation leaves the running configuration
@@ -49,12 +61,12 @@ The home directory (`-d`, default `~/.config/concord`) holds:
 
 `GEOIP` reads `Country.mmdb` (or `geoip.metadb`), `IP-ASN` reads `ASN.mmdb` and `GEOSITE` reads `GeoSite.dat` from
 the home directory. A file that a rule needs and the directory lacks is downloaded from the profile's `geox-url`,
-which defaults to mihomo's `MetaCubeX/meta-rules-dat` releases. Files placed there beforehand are used as they are.
+which defaults to the `MetaCubeX/meta-rules-dat` releases. Files placed there beforehand are used as they are.
 
 ## Dashboards
 
-The profile's `external-controller` and `secret` serve mihomo's REST API, so dashboards such as metacubexd, zashboard
-and yacd connect as they do to mihomo. [compatibility.md](compatibility.md) lists the endpoints that differ.
+The profile's `external-controller` and `secret` serve the Clash REST API, so dashboards such as metacubexd, zashboard
+and yacd connect as they do to other Clash cores. [compatibility.md](compatibility.md) lists the endpoints that differ.
 
 ## Embedding
 

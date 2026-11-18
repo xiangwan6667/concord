@@ -83,7 +83,11 @@ impl Plan {
             },
             Tier::Full => Plan {
                 tier,
-                cases: cases::ALL.to_vec(),
+                cases: cases::ALL
+                    .iter()
+                    .filter(|case| !matches!(case.name, "ss-gost" | "gost-relay"))
+                    .copied()
+                    .collect(),
                 workloads: Workload::ALL.to_vec(),
                 rounds: 5,
                 warmup: Duration::from_secs(1),

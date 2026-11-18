@@ -260,6 +260,19 @@ mod tests {
     }
 
     #[test]
+    fn the_lists_cover_ipv6_peers() {
+        let ip: IpAddr = "fd00::1".parse().unwrap();
+        let mut spec = ListenSpec::default();
+        assert!(Policy::from_spec(&spec).admits(ip));
+        spec.lan_allowed_ips = vec![cidr("0.0.0.0/0")];
+        assert!(!Policy::from_spec(&spec).admits(ip));
+        spec.lan_allowed_ips = vec![cidr("fd00::/8")];
+        assert!(Policy::from_spec(&spec).admits(ip));
+        spec.lan_disallowed_ips = vec![cidr("fd00::1")];
+        assert!(!Policy::from_spec(&spec).admits(ip));
+    }
+
+    #[test]
     fn credentials_split_at_the_first_colon() {
         assert_eq!(
             parse_credential("a:b:c"),

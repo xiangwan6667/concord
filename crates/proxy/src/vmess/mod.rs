@@ -103,6 +103,7 @@ impl Outbound for Vmess {
                     XudpFrames::new(cx.source()),
                     XudpFrames::new(None),
                     hint.clone(),
+                    self.link.tasks(),
                 )))
             }
             UdpMode::PacketAddr => {

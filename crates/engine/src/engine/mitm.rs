@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use arc_swap::ArcSwapOption;
+use concord_config::MitmDef;
 use concord_mitm::{
     CaError, EVENT_NETWORK_CHANGED, LocalClock, Mitm, MitmEnv, RawConfig as MitmConfig,
 };
@@ -80,8 +81,8 @@ impl MitmService {
     pub fn validate(&self, raw: Value) -> Result<Value, Failure> {
         let raw: MitmConfig = serde_json::from_value(raw)
             .map_err(|err| Failure::new("invalid_arguments", err.to_string()))?;
-        let issues = self.started()?.validate(&raw);
-        Ok(serde_json::to_value(issues).unwrap_or(Value::Null))
+        let validation = self.started()?.validate(&raw);
+        Ok(serde_json::to_value(validation).unwrap_or(Value::Null))
     }
 
     pub async fn run_script(&self, name: &str) -> Result<Value, Failure> {
@@ -116,19 +117,12 @@ impl MitmService {
     }
 
     /// `tunnel.UpdateMITM`. The section outlives a rejected config only as "off".
-    pub(crate) fn apply(&self, section: &concord_config::Map, trust: Arc<TrustStore>) {
+    pub(crate) fn apply(&self, section: &MitmDef, trust: Arc<TrustStore>) {
         let Some(mitm) = self.current.load_full() else {
             return;
         };
         mitm.set_trust(trust);
-        let raw = match serde_json::from_value::<MitmConfig>(Value::Object(section.clone())) {
-            Ok(raw) => Some(raw),
-            Err(err) => {
-                tracing::warn!("[MITM] the section cannot be read: {err}");
-                None
-            }
-        };
-        for line in mitm.apply(raw) {
+        for line in mitm.apply_section(Some(section.clone())) {
             tracing::warn!("[MITM] {line}");
         }
         self.table.set_closed_capacity(mitm.capture_entries());

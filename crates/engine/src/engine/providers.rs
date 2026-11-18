@@ -7,8 +7,8 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::Engine;
-use crate::error::Failure;
-use crate::resources::{ResourceError, RuleProvider, RuleProviders, behavior_of, format_of};
+use crate::error::{Failure, ResourceError};
+use crate::resources::{RuleProvider, RuleProviders, behavior_of};
 use crate::views::{ProviderView, SubscriptionInfo};
 
 /// The proxy and rule providers of the config in force.
@@ -179,7 +179,7 @@ fn rule_provider_view(provider: &RuleProvider) -> ProviderView {
         test_url: String::new(),
         expected_status: String::new(),
         behavior: behavior_of(provider.def.behavior).name(),
-        format: format_of(provider.def.format).name(),
+        format: concord_rules::Format::from(provider.def.format).name(),
     }
 }
 

@@ -10,11 +10,10 @@ use std::task::Poll;
 use concord_common::BoxStream;
 use concord_common::sync::lock;
 use concord_tls::{DecoyHandshake, TlsConnector, TlsOptions, TrustStore};
-use hmac::Mac;
 use rand::Rng;
 use tokio::io::{AsyncRead, ReadBuf};
 
-use self::conn::{HMAC_SIZE, new_hmac, sum, v2_conn, v3_conn};
+use self::conn::{HMAC_SIZE, new_hmac, v2_conn, v3_conn};
 use self::tap::{HashingRead, Lent, V3State, V3Tap};
 use crate::http1::invalid;
 
@@ -90,7 +89,7 @@ impl ShadowTlsClient {
                 lent.take()
             }
             (Handshake::Decoy(decoy), 2) => {
-                let mac = Arc::new(Mutex::new(new_hmac(self.password.as_bytes())?));
+                let mac = Arc::new(Mutex::new(new_hmac(self.password.as_bytes())));
                 let tap = HashingRead::new(lent.clone(), mac.clone());
                 let (mut stream, _) = decoy
                     .run(Box::new(tap), target_host, &|_: &[u8]| random_session_id())
@@ -98,7 +97,7 @@ impl ShadowTlsClient {
                 read_ready(&mut stream).await;
                 drop(stream);
                 let mut prefix = [0u8; 8];
-                let digest = sum(&lock(&mac));
+                let digest = lock(&mac).sum();
                 prefix.copy_from_slice(
                     digest
                         .get(..8)
@@ -127,10 +126,10 @@ impl ShadowTlsClient {
                 }
                 let server_random =
                     server_random.ok_or_else(|| invalid("shadow-tls: no server random"))?;
-                let mut add = new_hmac(self.password.as_bytes())?;
+                let mut add = new_hmac(self.password.as_bytes());
                 add.update(&server_random);
                 add.update(b"C");
-                let mut verify = new_hmac(self.password.as_bytes())?;
+                let mut verify = new_hmac(self.password.as_bytes());
                 verify.update(&server_random);
                 verify.update(b"S");
                 Ok(v3_conn(lent.take()?, add, verify, read_mac))
@@ -173,12 +172,12 @@ fn seal_session_id(password: &[u8], hello: &[u8]) -> io::Result<[u8; SESSION_ID_
     let (random, zeros) = id.split_at_mut(SESSION_ID_LEN - HMAC_SIZE);
     rand::rng().fill(random);
     zeros.fill(0);
-    let mut mac = new_hmac(password)?;
+    let mut mac = new_hmac(password);
     mac.update(head);
     mac.update(random);
     mac.update(zeros);
     mac.update(tail);
-    let digest = mac.finalize().into_bytes();
+    let digest = mac.sum();
     let tag = digest
         .get(..HMAC_SIZE)
         .ok_or_else(|| invalid("shadow-tls: short digest"))?;

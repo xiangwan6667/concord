@@ -1,8 +1,7 @@
 mod amnezia;
-mod config;
-mod dns;
+pub(crate) mod config;
+pub(crate) mod dns;
 mod session;
-mod stack;
 mod transport;
 mod tunnel;
 
@@ -12,28 +11,22 @@ mod tests;
 use std::future::poll_fn;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use concord_common::{
-    Address, BoxRead, BoxStream, BoxWrite, DialCx, Outbound, OutboundInfo, OutboundKind,
-    PacketSession, Stream,
+    Address, BoxStream, DialCx, Outbound, OutboundInfo, OutboundKind, PacketSession, Tasks,
 };
 use concord_config::proxy::{ProxyDef, WireGuardOpts};
 use concord_net::dial_found;
-use concord_netstack::{NetReadHalf, NetWriteHalf};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::timeout;
 
 use self::config::WgConfig;
-use self::session::WgSession;
-use self::stack::TcpConn;
 use self::tunnel::{Tunnel, watch_idle};
 use crate::ctx::{BuildCtx, BuildError};
 use crate::node::{Egress, info};
-use crate::session_slot::{SessionSlot, overtaken};
+use crate::session_slot::SessionSlot;
+use crate::stack::IpStream;
 
 pub(crate) struct Shared {
     info: OutboundInfo,
@@ -41,108 +34,16 @@ pub(crate) struct Shared {
     config: WgConfig,
     slot: SessionSlot<Tunnel>,
     init: tokio::sync::Mutex<()>,
+    tasks: Tasks,
 }
 
 struct WireGuard {
     shared: Arc<Shared>,
 }
 
-struct WgStream {
-    conn: TcpConn,
-    _tunnel: Arc<Tunnel>,
-}
-
-impl AsyncRead for WgStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().conn).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for WgStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        data: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().conn).poll_write(cx, data)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().conn).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().conn).poll_shutdown(cx)
-    }
-}
-
-impl Stream for WgStream {
-    concord_common::stream_policy!(conn;
-        forward: direct;
-        default: read_requirements, write_requirements, poll_read_buffer, poll_write_buffer,
-            raw_socket, tcp, peer_addr, needs_handshake, into_tcp;
-        own: into_split);
-    fn into_split(self: Box<Self>) -> (BoxRead, BoxWrite) {
-        let WgStream { conn, _tunnel } = *self;
-        let (read, write, active) = conn.into_split();
-        let hold = Arc::new((active, _tunnel));
-        (
-            Box::new(WgRead {
-                read,
-                _hold: hold.clone(),
-            }),
-            Box::new(WgWrite { write, _hold: hold }),
-        )
-    }
-}
-
-type Hold = Arc<(stack::Active, Arc<Tunnel>)>;
-
-struct WgRead {
-    read: NetReadHalf,
-    _hold: Hold,
-}
-
-impl AsyncRead for WgRead {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().read).poll_read(cx, buf)
-    }
-}
-
-struct WgWrite {
-    write: NetWriteHalf,
-    _hold: Hold,
-}
-
-impl AsyncWrite for WgWrite {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        data: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().write).poll_write(cx, data)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().write).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().write).poll_shutdown(cx)
-    }
-}
-
 impl Shared {
     fn current(&self) -> Option<Arc<Tunnel>> {
-        self.slot.get(|tunnel| !tunnel.is_broken()).0
+        self.slot.get(Tunnel::usable).0
     }
 
     fn retire(&self, tunnel: &Arc<Tunnel>) {
@@ -157,15 +58,18 @@ impl Shared {
                 .await;
             return Ok(tunnel);
         }
-        let _building = self.init.lock().await;
-        let (held, ticket) = self.slot.get(|tunnel| !tunnel.is_broken());
-        if let Some(tunnel) = held {
+        let mut built = false;
+        let build = || {
+            built = true;
+            Tunnel::build(cx, &self.egress, &self.config, &self.tasks)
+        };
+        let tunnel = self
+            .slot
+            .offer(&self.init, Tunnel::usable, build, |_| {})
+            .await?;
+        if !built {
             tunnel.touch();
             return Ok(tunnel);
-        }
-        let tunnel = Tunnel::build(cx, &self.egress, &self.config).await?;
-        if !self.slot.keep(ticket, &tunnel) {
-            return Err(overtaken());
         }
         let owner = Arc::downgrade(self);
         watch_idle(&tunnel, move |tunnel| {
@@ -217,10 +121,7 @@ impl Outbound for WireGuard {
                 dial_found(cx, found, dst, version, open).await?
             }
         };
-        Ok(Box::new(WgStream {
-            conn,
-            _tunnel: tunnel,
-        }))
+        Ok(Box::new(IpStream::new(conn, tunnel)))
     }
 
     async fn associate(
@@ -230,7 +131,7 @@ impl Outbound for WireGuard {
     ) -> io::Result<Arc<dyn PacketSession>> {
         let shared = &self.shared;
         let tunnel = shared.tunnel(cx).await?;
-        let session = WgSession::new(
+        let session = session::open(
             tunnel.clone(),
             shared.clone(),
             cx.env.resolver.clone(),
@@ -238,13 +139,7 @@ impl Outbound for WireGuard {
         )?;
         if let Address::Domain(host, _) = hint {
             session
-                .seed(
-                    host,
-                    &*cx.env.resolver,
-                    cx.initiator,
-                    &shared.config,
-                    shared.egress.version(),
-                )
+                .seed(host)
                 .await
                 .map_err(|err| io::Error::other(format!("can't resolve ip: {err}")))?;
         }
@@ -283,12 +178,12 @@ impl Outbound for WireGuard {
 pub(crate) fn build(
     def: &ProxyDef,
     opts: &WireGuardOpts,
-    _ctx: &BuildCtx,
+    ctx: &BuildCtx,
 ) -> Result<Arc<dyn Outbound>, BuildError> {
-    Ok(Arc::new(construct(def, opts)?))
+    Ok(Arc::new(construct(def, opts, ctx.tasks.clone())?))
 }
 
-fn construct(def: &ProxyDef, opts: &WireGuardOpts) -> Result<WireGuard, BuildError> {
+fn construct(def: &ProxyDef, opts: &WireGuardOpts, tasks: Tasks) -> Result<WireGuard, BuildError> {
     let config = config::parse(opts)?;
     let first = config
         .peers
@@ -308,6 +203,7 @@ fn construct(def: &ProxyDef, opts: &WireGuardOpts) -> Result<WireGuard, BuildErr
             config,
             slot: SessionSlot::default(),
             init: tokio::sync::Mutex::new(()),
+            tasks,
         }),
     })
 }

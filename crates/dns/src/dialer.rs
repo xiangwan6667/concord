@@ -9,6 +9,8 @@ use concord_common::{
     Address, BoxStream, CoreError, Initiator, PacketSession, SockOpts, SocketFactory, recv_packet,
     send_packet,
 };
+use concord_transport::SessionSocket;
+use quinn::{AsyncUdpSocket, Runtime, TokioRuntime};
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
@@ -215,21 +217,24 @@ impl Connector {
         Err(last)
     }
 
-    /// An unconnected direct socket for a QUIC endpoint, which names the peer on
-    /// every send; `None` when this upstream goes through a proxy.
+    /// The socket of a QUIC endpoint, which names the peer on every send: a local
+    /// socket, or a UDP session through the outbound, as mihomo's `ListenPacket` gives.
     pub(crate) async fn quic_socket(
         &self,
         host: &str,
         port: u16,
         cx: Cx,
-    ) -> io::Result<Option<(UdpSocket, SocketAddr)>> {
+    ) -> io::Result<(Arc<dyn AsyncUdpSocket>, SocketAddr)> {
         let ips = self.resolve(host, cx).await?;
         let peer = SocketAddr::new(first_ip(&ips)?, port);
-        if self.tunnel()?.is_some() {
-            return Ok(None);
+        if let Some((dialer, name)) = self.tunnel()? {
+            let session = passing(&name, dialer.bind_udp(&name, &Address::Socket(peer))).await?;
+            let socket: Arc<dyn AsyncUdpSocket> =
+                SessionSocket::new(session, peer, &Default::default());
+            return Ok((socket, peer));
         }
         let sock = self.shared.sockets.bind_udp(peer.ip(), &self.opts())?;
-        Ok(Some((sock, peer)))
+        Ok((TokioRuntime.wrap_udp_socket(sock.into_std()?)?, peer))
     }
 
     pub(crate) async fn udp(&self, host: &str, port: u16, cx: Cx) -> io::Result<UdpLink> {

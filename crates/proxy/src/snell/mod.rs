@@ -1,9 +1,15 @@
+mod codec;
 mod frame;
 mod stream;
 mod udp;
+mod v6;
+mod v6_frame;
+mod v6_profile;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod v6_tests;
 
 use std::io;
 use std::sync::Arc;
@@ -101,11 +107,17 @@ impl Outbound for Snell {
     }
 }
 
-pub(crate) fn build(
-    def: &ProxyDef,
-    opts: &SnellOpts,
-    ctx: &BuildCtx,
-) -> Result<Arc<dyn Outbound>, BuildError> {
+fn validate(opts: &SnellOpts, udp: bool) -> Result<u32, BuildError> {
+    if opts.userkey.len() > 255 {
+        return Err(BuildError::invalid(
+            "snell userkey must be at most 255 bytes",
+        ));
+    }
+    if opts.version != 6 && (!opts.mode.is_empty() || !opts.userkey.is_empty()) {
+        return Err(BuildError::invalid(
+            "snell mode and userkey are only supported on version 6",
+        ));
+    }
     let version = match opts.version {
         0 => 1,
         5 => 4,
@@ -113,17 +125,39 @@ pub(crate) fn build(
     };
     match version {
         1 | 2 => {
-            if def.common.udp {
+            if udp {
                 return Err(BuildError::invalid(format!(
                     "snell version {version} not support UDP"
                 )));
             }
         }
         3 | 4 => {}
+        6 => {
+            if !(12..=255).contains(&opts.psk.len()) {
+                return Err(BuildError::invalid(
+                    "snell v6 psk length must be between 12 and 255 bytes",
+                ));
+            }
+            if matches!(opts.obfs_mode.as_str(), "tls" | "http") {
+                return Err(BuildError::invalid(format!(
+                    "snell version 6 does not support obfs mode {}",
+                    opts.obfs_mode
+                )));
+            }
+        }
         other => {
             return Err(BuildError::invalid(format!("snell version error: {other}")));
         }
     }
+    Ok(version)
+}
+
+pub(crate) fn build(
+    def: &ProxyDef,
+    opts: &SnellOpts,
+    ctx: &BuildCtx,
+) -> Result<Arc<dyn Outbound>, BuildError> {
+    let version = validate(opts, def.common.udp)?;
     let mut transport_host = opts.server.clone();
     let layers = match opts.obfs_mode.as_str() {
         "" => Vec::new(),
@@ -149,7 +183,19 @@ pub(crate) fn build(
             transport_host = plugin.host.clone();
             vec![shadow_tls_layer(plugin, &opts.client_fingerprint, ctx)?]
         }
-        "restls" | "jls" => {
+        "jls" => {
+            let plugin = opts
+                .jls
+                .as_ref()
+                .ok_or_else(|| BuildError::invalid("snell jls options are missing"))?;
+            transport_host = plugin.host.clone();
+            vec![crate::link::jls_layer(
+                plugin,
+                &opts.client_fingerprint,
+                ctx,
+            )?]
+        }
+        "restls" => {
             return Err(BuildError::unsupported(format!(
                 "snell obfs mode {} is not implemented yet",
                 opts.obfs_mode
@@ -162,10 +208,30 @@ pub(crate) fn build(
         }
     };
     let link = Link {
-        stack: TransportStack::new(layers),
+        stack: TransportStack::new(layers, ctx.tasks.clone()),
         transport_host,
-        ..Link::plain(def, &opts.server, opts.port)
+        ..Link::plain(def, &opts.server, opts.port, &ctx.tasks)
     };
+    if version == 6 {
+        let mode = v6_frame::Mode::parse(&opts.mode)
+            .map_err(|err| BuildError::invalid(err.to_string()))?;
+        return Ok(Arc::new(v6::SnellV6 {
+            info: info_for(
+                def,
+                OutboundKind::Snell,
+                &opts.server,
+                opts.port,
+                def.common.udp,
+            ),
+            link,
+            psk: opts.psk.as_bytes().to_vec(),
+            userkey: opts.userkey.as_bytes().to_vec(),
+            mode,
+            profile: (mode == v6_frame::Mode::Default)
+                .then(|| Arc::new(v6_profile::Profile::new(opts.psk.as_bytes()))),
+            reuse: opts.reuse,
+        }));
+    }
     Ok(Arc::new(Snell {
         info: info_for(
             def,

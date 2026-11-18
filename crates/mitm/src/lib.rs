@@ -14,7 +14,9 @@ mod exchange;
 mod facade;
 mod forward;
 mod headers;
+mod heads;
 mod hostlist;
+mod jq;
 mod limits;
 mod pattern;
 #[cfg(feature = "script")]
@@ -25,15 +27,19 @@ mod script;
 mod script_tests;
 mod session;
 mod session_script;
+mod sources;
 mod target;
 mod task;
 #[cfg(test)]
 mod testing;
-mod text;
+mod view;
+#[cfg(test)]
+mod view_tests;
 
 pub use ca::{Authority, Ca, CaError, CertificateInfo};
 pub use capture::{Action, Body, Exchange, ExchangeList, ExchangeSummary};
-pub use config::{Config, Issue, RawConfig};
+pub use concord_config::mitm::{IssueKind, LineError};
+pub use config::{Config, Issue, LineEntry, RawConfig, Validation};
 pub use cron::{LocalClock, UtcClock};
 pub use engine::MitmEngine;
 pub use facade::{Mitm, MitmEnv};
@@ -43,8 +49,9 @@ pub use limits::{
 #[cfg(feature = "script")]
 pub use quickjs::QuickJs;
 pub use script::{
-    ConsoleSink, EVENT_ENGINE_STARTED, EVENT_NETWORK_CHANGED, EVENT_PROFILE_RELOADED, HeaderList,
-    ScriptDial, ScriptError, ScriptHost, ScriptInvocation, ScriptProgram, ScriptRequest,
-    ScriptResponse, ScriptResult, ScriptRuntime,
+    CompileError, ConsoleSink, EVENT_ENGINE_STARTED, EVENT_NETWORK_CHANGED, EVENT_PROFILE_RELOADED,
+    HeaderList, ScriptDial, ScriptError, ScriptHost, ScriptInvocation, ScriptProgram,
+    ScriptRequest, ScriptResponse, ScriptResult, ScriptRuntime,
 };
 pub use task::{ScriptOutput, ScriptRunError};
+pub use view::LineView;

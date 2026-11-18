@@ -1358,3 +1358,125 @@ async fn a_service_with_a_capability_it_lacks_answers_unsupported() {
     assert!(matches!(device.data, ErrorData::Unsupported { .. }));
     rig.finish().await;
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_inherited_tun_that_cannot_start_tells_the_host_why() {
+    let rig = Rig::new().await;
+    let fd = std::fs::File::open("/dev/null").unwrap().into();
+    let handle = rig.control.adopted_fds().adopt(fd);
+    let error = rig
+        .control
+        .tun_start(TunStartParams {
+            source: TunSource::Inherited { handle },
+            stack: None,
+            mtu: None,
+            address: vec!["nonsense".to_string()],
+            dns: vec![],
+            congestion_controller: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error.data, ErrorData::Unavailable { ref target } if target.as_deref() == Some("tun"))
+    );
+    assert!(
+        error.message.contains("invalid tun address nonsense"),
+        "{}",
+        error.message
+    );
+    assert!(rig.control.adopted_fds().is_empty());
+    rig.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mitm_validate_answers_each_line_with_its_view_or_its_issue() {
+    let rig = Rig::new().await;
+    let resources = rig.home.join("mitm").join("resources");
+    std::fs::create_dir_all(&resources).unwrap();
+    std::fs::write(resources.join("a.js"), "$done({})").unwrap();
+    let config = json!({
+        "hostname": ["a.com, bad host", "-*.b.com:8443"],
+        "client-source-address": ["10.0.0.0/8"],
+        "url-rewrite": [r"^https://ad\.com _ reject", "(broken _ reject"],
+        "header-rewrite": [r"^https://a\.com header-del Cookie"],
+        "body-rewrite": [r"http-response-jq ^https://a\.com '.a'"],
+        "map-local": [r"^https://a\.com/m data-type=text data=ok"],
+        "script": ["daily = type=cron, cronexp=0 8 * * *, script-path=a.js"],
+    });
+    let result = rig
+        .control
+        .mitm_validate(MitmValidateParams { config })
+        .await
+        .unwrap();
+    let kinds: Vec<(&str, u32, MitmIssueKind)> = result
+        .issues
+        .iter()
+        .flat_map(|(list, issues)| {
+            issues
+                .iter()
+                .map(move |issue| (list.as_str(), issue.index, issue.kind))
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ("hostname", 0, MitmIssueKind::Invalid),
+            ("url-rewrite", 1, MitmIssueKind::Pattern),
+        ]
+    );
+    let view = |list: &str, index: u32| {
+        result.views[list]
+            .iter()
+            .find(|entry| entry.index == index)
+            .map(|entry| entry.view.clone())
+    };
+    assert_eq!(
+        view("hostname", 0),
+        Some(MitmLineView::Hosts(MitmHosts {
+            entries: vec![MitmHostEntry {
+                host: "a.com".into(),
+                port: None,
+                exclude: false,
+            }],
+        }))
+    );
+    assert!(matches!(
+        view("hostname", 1),
+        Some(MitmLineView::Hosts(MitmHosts { ref entries })) if entries[0].port == Some(8443) && entries[0].exclude
+    ));
+    assert!(matches!(
+        view("client-source-address", 0),
+        Some(MitmLineView::Sources(MitmSources { ref entries })) if entries[0].network == "10.0.0.0/8"
+    ));
+    assert!(matches!(
+        view("url-rewrite", 0),
+        Some(MitmLineView::UrlRewrite(MitmUrlRewrite {
+            action: MitmUrlAction::Reject,
+            replacement: None,
+            ..
+        }))
+    ));
+    assert_eq!(view("url-rewrite", 1), None);
+    assert!(matches!(
+        view("header-rewrite", 0),
+        Some(MitmLineView::HeaderRewrite(MitmHeaderRewrite { action: MitmHeaderAction::HeaderDel, ref name, .. })) if name.as_deref() == Some("Cookie")
+    ));
+    assert!(matches!(
+        view("body-rewrite", 0),
+        Some(MitmLineView::BodyRewrite(MitmBodyRewrite { phase: MitmPhase::Response, ref jq, .. })) if jq.as_deref() == Some(".a")
+    ));
+    assert!(matches!(
+        view("map-local", 0),
+        Some(MitmLineView::MapLocal(MitmMapLocal {
+            data_type: MitmDataType::Text,
+            status: Some(200),
+            ..
+        }))
+    ));
+    assert!(matches!(
+        view("script", 0),
+        Some(MitmLineView::Script(MitmScript { kind: MitmScriptKind::Cron, ref name, .. })) if name == "daily"
+    ));
+    rig.finish().await;
+}

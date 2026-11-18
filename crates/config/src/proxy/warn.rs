@@ -1,4 +1,25 @@
+use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
+
 use super::types::*;
+
+/// A WireGuard `dns` entry the core can use, and whether it is TCP: plain UDP, or `udp://` or `tcp://` with an
+/// address.
+pub fn wireguard_dns(text: &str) -> Option<(SocketAddr, bool)> {
+    let (tcp, rest) = match text.split_once("://") {
+        Some(("udp", rest)) => (false, rest),
+        Some(("tcp", rest)) => (true, rest),
+        Some(_) => return None,
+        None => (false, text),
+    };
+    let rest = rest.split(['#', '?', '/']).next().unwrap_or(rest);
+    let addr = SocketAddr::from_str(rest).ok().or_else(|| {
+        IpAddr::from_str(rest.trim_matches(['[', ']']))
+            .ok()
+            .map(|ip| SocketAddr::new(ip, 53))
+    })?;
+    Some((addr, tcp))
+}
 
 /// The modern fingerprint that stands in for a name mihomo still accepts but marks deprecated.
 pub fn deprecated_fingerprint(name: &str) -> Option<&'static str> {
@@ -59,7 +80,7 @@ fn fingerprints(kind: &ProxyKind) -> Vec<(&'static str, &str)> {
 
 /// What the node's options say that the app should show, beyond what makes it unsupported.
 pub fn proxy_warnings(def: &ProxyDef) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut out = def.ignored.clone();
     for (key, value) in fingerprints(&def.kind) {
         if let Some(modern) = deprecated_fingerprint(value) {
             out.push(format!(
@@ -99,6 +120,22 @@ pub fn proxy_warnings(def: &ProxyDef) -> Vec<String> {
                  not to transport messages"
                     .to_string(),
             );
+        }
+    }
+    if let ProxyKind::WireGuard(wg) = &def.kind
+        && wg.remote_dns_resolve
+    {
+        let skipped: Vec<&str> = wg
+            .dns
+            .iter()
+            .map(String::as_str)
+            .filter(|text| wireguard_dns(text).is_none())
+            .collect();
+        if !skipped.is_empty() && skipped.len() < wg.dns.len() {
+            out.push(format!(
+                "dns {} is skipped: only plain UDP and TCP servers are used",
+                skipped.join(", ")
+            ));
         }
     }
     out
@@ -210,5 +247,28 @@ mod tests {
                  not to transport messages",
             ]
         );
+    }
+
+    #[test]
+    fn wireguard_dns_entries_the_core_skips_are_named() {
+        let node = |dns: Value| {
+            warnings(json!({
+                "name": "n", "type": "wireguard", "server": "h.test", "port": 51820,
+                "private-key": "AAAA", "public-key": "BBBB", "ip": "10.0.0.2",
+                "remote-dns-resolve": true, "dns": dns,
+            }))
+        };
+        assert_eq!(
+            node(json!([
+                "1.1.1.1",
+                "tcp://8.8.8.8:53",
+                "https://dns.test/dns-query",
+                "dns.test"
+            ])),
+            [
+                "dns https://dns.test/dns-query, dns.test is skipped: only plain UDP and TCP servers are used"
+            ]
+        );
+        assert!(node(json!(["1.1.1.1"])).is_empty());
     }
 }

@@ -77,6 +77,7 @@ struct Cx<'e> {
     targets: Vec<Box<str>>,
     target_ids: HashMap<String, u16>,
     sub_ids: HashMap<&'e str, u32>,
+    empty_sub: u32,
     demands: Demands,
     rule_sets: Vec<(Arc<RuleSetHandle>, bool, bool)>,
     check_targets: bool,
@@ -90,6 +91,7 @@ impl<'e> Cx<'e> {
             targets: Vec::new(),
             target_ids: HashMap::new(),
             sub_ids: HashMap::new(),
+            empty_sub: 0,
             demands: Demands::default(),
             rule_sets: Vec::new(),
             check_targets,
@@ -145,14 +147,17 @@ fn compile_from<D: Borrow<RuleDef>>(
     for (id, name) in sub_rules.keys().enumerate() {
         cx.sub_ids.insert(name, id as u32);
     }
-    let mut progs = Vec::with_capacity(sub_rules.len() + 1);
+    cx.empty_sub = sub_rules.len() as u32;
+    let mut progs = Vec::with_capacity(sub_rules.len() + 2);
     progs.push(compile_list(&mut cx, rules, "rules")?);
     for (name, list) in sub_rules {
         let section = format!("sub-rules[{name}]");
         progs.push(compile_list(&mut cx, list.iter().map(Ok), &section)?);
     }
+    progs.push(Default::default());
     Ok(RouteProgram {
         progs: progs.into_boxed_slice(),
+        sub_rule_names: sub_rules.keys().map(|name| name.as_str().into()).collect(),
         targets: cx.targets.into_boxed_slice(),
         rule_sets: cx.rule_sets.into_boxed_slice(),
         demands: cx.demands,
@@ -379,9 +384,20 @@ fn host_match(def: &RuleDef, payload: Option<&str>) -> Option<HostMatch> {
     same.then_some(how)
 }
 
+/// mihomo runs a top-level `SUB-RULE` aimed at a proxy as a rule that never matches.
+fn dead_sub_rule(cx: &Cx<'_>, def: &RuleDef, loc: &Loc<'_>) -> bool {
+    loc.section == "rules"
+        && !cx.sub_ids.contains_key(def.target.as_str())
+        && cx
+            .env
+            .known_target
+            .as_ref()
+            .is_none_or(|known| known(&def.target))
+}
+
 fn check_target(cx: &Cx<'_>, def: &RuleDef, loc: &Loc<'_>) -> Result<(), CompileError> {
     if matches!(def.cond, Cond::SubRule(_)) {
-        if cx.sub_ids.contains_key(def.target.as_str()) {
+        if cx.sub_ids.contains_key(def.target.as_str()) || dead_sub_rule(cx, def, loc) {
             return Ok(());
         }
         return Err(CompileError::UnknownSubRule {
@@ -431,16 +447,18 @@ fn regex(pattern: &str, loc: &Loc<'_>) -> Result<Matcher, CompileError> {
 fn node_for_def(cx: &mut Cx<'_>, def: &RuleDef, loc: &Loc<'_>) -> Result<Node, CompileError> {
     match &def.cond {
         Cond::SubRule(inner) => {
-            let sub = cx
-                .sub_ids
-                .get(def.target.as_str())
-                .copied()
-                .ok_or_else(|| CompileError::UnknownSubRule {
-                    section: loc.section.to_string(),
-                    index: loc.index,
-                    line: loc.line.to_string(),
-                    name: def.target.clone(),
-                })?;
+            let sub = match cx.sub_ids.get(def.target.as_str()) {
+                Some(&sub) => sub,
+                None if dead_sub_rule(cx, def, loc) => cx.empty_sub,
+                None => {
+                    return Err(CompileError::UnknownSubRule {
+                        section: loc.section.to_string(),
+                        index: loc.index,
+                        line: loc.line.to_string(),
+                        name: def.target.clone(),
+                    });
+                }
+            };
             let cond = node_for_cond(cx, inner, false, true, loc)?;
             Ok(Node::SubRule {
                 cond: Box::new(cond),
@@ -587,6 +605,9 @@ fn node_for_cond(
         Cond::InType(items) => Node::InType(in_type_mask(items)),
         Cond::InUser(items) => Node::InUser(items.iter().map(|i| i.as_str().into()).collect()),
         Cond::InName(items) => Node::InName(items.iter().map(|i| i.as_str().into()).collect()),
+        Cond::RematchName(items) => {
+            Node::RematchName(items.iter().map(|i| i.as_str().into()).collect())
+        }
         Cond::And(children) => Node::And(children_of(cx, children, loc)?),
         Cond::Or(children) => Node::Or(children_of(cx, children, loc)?),
         Cond::Not(child) => Node::Not(Box::new(node_for_cond(cx, child, false, true, loc)?)),

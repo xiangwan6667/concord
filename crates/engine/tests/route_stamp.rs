@@ -86,25 +86,6 @@ impl Rig {
     }
 }
 
-fn empty_update() -> UpdateRequest {
-    UpdateRequest {
-        tun: None,
-        allow_lan: None,
-        mixed_port: None,
-        find_process_mode: None,
-        mode: None,
-        log_level: None,
-        ipv6: None,
-        tcp_concurrent: None,
-        unified_delay: None,
-        authentication: None,
-        geo_auto_update: None,
-        geo_update_interval: None,
-        geox_url: BTreeMap::new(),
-        options: None,
-    }
-}
-
 async fn http_body(body: &'static str) -> SocketAddr {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -152,7 +133,7 @@ async fn an_apply_and_a_listener_start_advance_the_epoch() {
     assert_eq!(reapplied.epoch, applied.epoch + 1);
     assert_eq!(reapplied.version, applied.version + 1);
 
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
     let started = rig.stamp();
     assert_eq!(started.epoch, reapplied.epoch + 1);
     assert_eq!(started.version, reapplied.version + 1);
@@ -166,12 +147,12 @@ async fn a_start_and_a_stop_report_the_listeners_with_the_epoch_they_move() {
     let applied = rig.engine.watch_route(true);
     assert!(!applied.running);
 
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
     let started = rig.engine.route_view();
     assert!(started.running);
     assert_eq!(started.stamp.epoch, applied.stamp.epoch + 1);
 
-    rig.engine.stop_listeners().await.unwrap();
+    rig.engine.stop_listeners().await;
     let stopped = rig.engine.route_view();
     assert!(!stopped.running);
     assert_eq!(stopped.stamp.epoch, started.stamp.epoch + 1);
@@ -200,8 +181,10 @@ async fn repeating_a_mode_moves_the_route_once_and_a_pick_never_moves_the_epoch(
     let before = rig.stamp();
 
     for _ in 0..2 {
-        let mut request = empty_update();
-        request.mode = Some("global".to_string());
+        let request = UpdateRequest {
+            mode: Some("global".to_string()),
+            ..UpdateRequest::default()
+        };
         rig.engine.update(request).await.unwrap();
     }
     let after_mode = rig.stamp();

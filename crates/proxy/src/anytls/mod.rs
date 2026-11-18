@@ -111,7 +111,7 @@ impl Outbound for AnyTls {
         hint: &Address,
     ) -> io::Result<Arc<dyn PacketSession>> {
         let stream = self.open_stream(cx, &uot::destination(UOT_VERSION)).await?;
-        uot::session(stream, UOT_VERSION, hint)
+        uot::session(stream, UOT_VERSION, hint, &self.pool.tasks)
     }
 
     fn reset_sessions(&self) {
@@ -150,7 +150,11 @@ pub(crate) fn build(
         password,
         padding: Arc::new(ArcSwap::from_pointee(Padding::default_scheme())),
         metadata: opts.client_metadata.clone(),
-        pool: Pool::new(opts.disable_reuse, opts.min_idle_session as usize),
+        pool: Pool::new(
+            opts.disable_reuse,
+            opts.min_idle_session as usize,
+            ctx.tasks.clone(),
+        ),
         sessions: AtomicU64::new(0),
         check_interval: interval(opts.idle_session_check_interval),
         idle_timeout: interval(opts.idle_session_timeout),

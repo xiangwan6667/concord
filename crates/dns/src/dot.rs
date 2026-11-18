@@ -9,6 +9,7 @@ use rustls_pki_types::ServerName;
 
 use crate::client::{BoxIo, Client, Params, exchange_framed, with_random_id, with_timeout};
 use crate::dialer::{Connector, Cx};
+use crate::resets::{Resets, Ticket};
 
 const MAX_IDLE: usize = 8;
 
@@ -41,6 +42,7 @@ pub(crate) struct DotClient {
     tls: tokio_rustls::TlsConnector,
     reuse: bool,
     idle: Mutex<Vec<BoxIo>>,
+    resets: Resets,
 }
 
 impl DotClient {
@@ -58,6 +60,7 @@ impl DotClient {
             tls,
             reuse: !params.is_true("disable-reuse"),
             idle: Mutex::new(Vec::new()),
+            resets: Resets::new(),
         })
     }
 
@@ -68,12 +71,15 @@ impl DotClient {
         lock(&self.idle).pop()
     }
 
-    fn put_idle(&self, conn: BoxIo) {
+    fn put_idle(&self, conn: BoxIo, ticket: Ticket) {
         if !self.reuse {
             return;
         }
         {
             let mut idle = lock(&self.idle);
+            if !self.resets.none_since(ticket) {
+                return;
+            }
             if idle.len() >= MAX_IDLE {
                 idle.remove(0);
             }
@@ -96,14 +102,15 @@ impl Client for DotClient {
         let req = with_random_id(req);
         with_timeout(async {
             loop {
+                let ticket = self.resets.ticket();
                 let (mut conn, reused) = match self.take_idle() {
                     Some(conn) => (conn, true),
-                    None => (self.dial(cx).await?, false),
+                    None => (self.resets.dial(ticket, self.dial(cx)).await?, false),
                 };
                 match exchange_framed(&mut conn, &req).await {
                     Ok(mut resp) => {
                         resp.metadata.id = original;
-                        self.put_idle(conn);
+                        self.put_idle(conn, ticket);
                         return Ok(resp);
                     }
                     Err(err) if !reused => return Err(err),
@@ -119,6 +126,7 @@ impl Client for DotClient {
     }
 
     fn reset(&self) {
+        self.resets.bump();
         {
             let mut idle = lock(&self.idle);
             idle.clear();

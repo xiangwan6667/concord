@@ -10,7 +10,9 @@ use concord_platform::HomeDir;
 use concord_tls::TrustStore;
 use rquickjs::{CatchResultExt, Context, Runtime};
 
-use crate::script::{ScriptError, ScriptInvocation, ScriptProgram, ScriptResult, ScriptRuntime};
+use crate::script::{
+    CompileError, ScriptError, ScriptInvocation, ScriptProgram, ScriptResult, ScriptRuntime,
+};
 use store::Store;
 
 const QUANTUMULT_APIS: [&str; 3] = ["$task.fetch", "$prefs.", "$notify("];
@@ -41,9 +43,9 @@ impl QuickJs {
 }
 
 impl ScriptRuntime for QuickJs {
-    fn compile(&self, _name: &str, source: &[u8]) -> Result<Arc<dyn ScriptProgram>, String> {
+    fn compile(&self, _name: &str, source: &[u8]) -> Result<Arc<dyn ScriptProgram>, CompileError> {
         let text = std::str::from_utf8(source)
-            .map_err(|err| err.to_string())?
+            .map_err(|err| CompileError(err.to_string()))?
             .to_string();
         check_syntax(&text)?;
         Ok(Arc::new(Program {
@@ -55,15 +57,16 @@ impl ScriptRuntime for QuickJs {
     }
 }
 
-fn check_syntax(source: &str) -> Result<(), String> {
-    let runtime = Runtime::new().map_err(|err| err.to_string())?;
-    let context = Context::full(&runtime).map_err(|err| err.to_string())?;
-    let literal = serde_json::to_string(source).map_err(|err| err.to_string())?;
+fn check_syntax(source: &str) -> Result<(), CompileError> {
+    let fail = |err: &dyn std::fmt::Display| CompileError(err.to_string());
+    let runtime = Runtime::new().map_err(|err| fail(&err))?;
+    let context = Context::full(&runtime).map_err(|err| fail(&err))?;
+    let literal = serde_json::to_string(source).map_err(|err| fail(&err))?;
     context.with(|ctx| {
         ctx.eval::<rquickjs::Value<'_>, _>(format!("new Function({literal})"))
             .catch(&ctx)
             .map(|_| ())
-            .map_err(|err| run::describe(&err))
+            .map_err(|err| CompileError(run::describe(&err)))
     })
 }
 

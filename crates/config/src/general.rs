@@ -3,7 +3,7 @@ use concord_common::{FindProcessMode, LogLevel, TunnelMode};
 use crate::Map;
 use crate::error::{ConfigError, Result};
 use crate::keys::DEFAULT_GLOBAL_UA;
-use crate::lenient::Fields;
+use crate::lenient::{Fields, Ignored};
 use crate::net::IpCidr;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -12,11 +12,37 @@ pub struct Credential {
     pub pass: String,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum GeodataLoader {
-    Standard,
-    #[default]
-    MemConservative,
+/// Which browser origins may call the external controller, as mihomo's `external-controller-cors`.
+/// No origin at all refuses every cross-origin request; a profile cannot ask for that, since mihomo
+/// reads an empty `allow-origins` as every origin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControllerCors {
+    pub allow_origins: Vec<String>,
+    pub allow_private_network: bool,
+}
+
+impl Default for ControllerCors {
+    /// mihomo's defaults (`config/config.go`, `DefaultRawConfig`).
+    fn default() -> Self {
+        ControllerCors {
+            allow_origins: vec!["*".to_string()],
+            allow_private_network: true,
+        }
+    }
+}
+
+impl ControllerCors {
+    /// What a host asks for, with mihomo's default for a part it leaves out.
+    pub fn or_defaults(
+        allow_origins: Option<Vec<String>>,
+        allow_private_network: Option<bool>,
+    ) -> Self {
+        let default = ControllerCors::default();
+        ControllerCors {
+            allow_origins: allow_origins.unwrap_or(default.allow_origins),
+            allow_private_network: allow_private_network.unwrap_or(default.allow_private_network),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,6 +53,9 @@ pub struct General {
     pub redir_port: u16,
     pub tproxy_port: u16,
     pub allow_lan: bool,
+    pub bind_address: String,
+    pub lan_allowed_ips: Vec<IpCidr>,
+    pub lan_disallowed_ips: Vec<IpCidr>,
     pub authentication: Vec<Credential>,
     pub skip_auth_prefixes: Vec<IpCidr>,
     pub mode: TunnelMode,
@@ -43,9 +72,9 @@ pub struct General {
     pub global_ua: String,
     pub geo_auto_update: bool,
     pub geo_update_interval: u32,
-    pub geodata_loader: GeodataLoader,
     pub external_controller: String,
     pub secret: String,
+    pub external_controller_cors: ControllerCors,
 }
 
 impl Default for General {
@@ -57,6 +86,9 @@ impl Default for General {
             redir_port: 0,
             tproxy_port: 0,
             allow_lan: false,
+            bind_address: "*".to_string(),
+            lan_allowed_ips: everywhere(),
+            lan_disallowed_ips: Vec::new(),
             authentication: Vec::new(),
             skip_auth_prefixes: Vec::new(),
             mode: TunnelMode::Rule,
@@ -73,26 +105,50 @@ impl Default for General {
             global_ua: DEFAULT_GLOBAL_UA.to_string(),
             geo_auto_update: false,
             geo_update_interval: 24,
-            geodata_loader: GeodataLoader::MemConservative,
             external_controller: String::new(),
             secret: String::new(),
+            external_controller_cors: ControllerCors::default(),
         }
     }
 }
 
-fn choice<T>(text: String, parse: impl Fn(&str) -> Option<T>, what: &str) -> Result<T> {
-    parse(&text).ok_or_else(|| ConfigError::new(format!("invalid {what}")))
+/// mihomo's `lan-allowed-ips` default (`config/config.go`, `UnmarshalRawConfig`).
+fn everywhere() -> Vec<IpCidr> {
+    ["0.0.0.0/0", "::/0"]
+        .into_iter()
+        .filter_map(IpCidr::parse)
+        .collect()
+}
+
+fn prefixes(f: &mut Fields<'_>, key: &str) -> Result<Vec<IpCidr>> {
+    f.strings(key)?
+        .iter()
+        .map(|text| {
+            IpCidr::parse(text.trim())
+                .ok_or_else(|| ConfigError::new(format!("invalid {key} entry: {text}")))
+        })
+        .collect()
+}
+
+fn choice<T>(text: String, parse: impl Fn(&str) -> Option<T>, key: &str, what: &str) -> Result<T> {
+    parse(&text).ok_or_else(|| ConfigError::new(format!("{key}: invalid {what} \"{text}\"")))
 }
 
 impl General {
     pub fn from_map(map: &Map) -> Result<General> {
+        Ok(General::read(map)?.0)
+    }
+
+    /// A port out of range leaves its listener closed; another number out of range takes its
+    /// default. Both are returned as notes.
+    pub fn read(map: &Map) -> Result<(General, Vec<Ignored>)> {
         let mut f = Fields::new(map, "", false);
         let mut general = General {
-            port: f.u16("port")?,
-            socks_port: f.u16("socks-port")?,
-            mixed_port: f.u16("mixed-port")?,
-            redir_port: f.u16("redir-port")?,
-            tproxy_port: f.u16("tproxy-port")?,
+            port: f.loose("port", 0)?,
+            socks_port: f.loose("socks-port", 0)?,
+            mixed_port: f.loose("mixed-port", 0)?,
+            redir_port: f.loose("redir-port", 0)?,
+            tproxy_port: f.loose("tproxy-port", 0)?,
             allow_lan: f.boolean("allow-lan")?,
             ..General::default()
         };
@@ -104,44 +160,58 @@ impl General {
                 });
             }
         }
-        for text in f.strings("skip-auth-prefixes")? {
-            let prefix = IpCidr::parse(text.trim()).ok_or_else(|| {
-                ConfigError::new(format!("invalid skip-auth-prefixes entry: {text}"))
-            })?;
-            general.skip_auth_prefixes.push(prefix);
+        general.skip_auth_prefixes = prefixes(&mut f, "skip-auth-prefixes")?;
+        if let Some(bind) = f.opt_string("bind-address")? {
+            general.bind_address = bind;
         }
+        // yaml.v3 sets a slice written as null to nil, which admits no one.
+        if map.contains_key("lan-allowed-ips") {
+            general.lan_allowed_ips = prefixes(&mut f, "lan-allowed-ips")?;
+        }
+        general.lan_disallowed_ips = prefixes(&mut f, "lan-disallowed-ips")?;
         if let Some(mode) = f.opt_string("mode")? {
-            general.mode = choice(mode, TunnelMode::parse, "mode")?;
+            general.mode = choice(mode, TunnelMode::parse, "mode", "mode")?;
         }
         if let Some(level) = f.opt_string("log-level")? {
-            general.log_level = choice(level, LogLevel::parse, "log level")?;
+            general.log_level = choice(level, LogLevel::parse, "log-level", "log level")?;
         }
         if let Some(mode) = f.opt_string("find-process-mode")? {
-            general.find_process_mode = choice(mode, FindProcessMode::parse, "find process mode")?;
+            general.find_process_mode = choice(
+                mode,
+                FindProcessMode::parse,
+                "find-process-mode",
+                "find process mode",
+            )?;
         }
         general.ipv6 = f.opt_bool("ipv6")?.unwrap_or(true);
         general.tcp_concurrent = f.boolean("tcp-concurrent")?;
         general.unified_delay = f.boolean("unified-delay")?;
         general.interface_name = f.string("interface-name")?;
-        general.routing_mark = f.u32("routing-mark")?;
-        general.keep_alive_idle = f.u32("keep-alive-idle")?;
-        general.keep_alive_interval = f.u32("keep-alive-interval")?;
+        general.routing_mark = f.mark("routing-mark")?;
+        general.keep_alive_idle = f.loose("keep-alive-idle", 0)?;
+        general.keep_alive_interval = f.loose("keep-alive-interval", 0)?;
         general.disable_keep_alive = f.boolean("disable-keep-alive")?;
         if let Some(ua) = f.opt_string("global-ua")? {
             general.global_ua = ua;
         }
         general.geo_auto_update = f.boolean("geo-auto-update")?;
-        if f.has("geo-update-interval") {
-            general.geo_update_interval = f.u32("geo-update-interval")?;
-        }
-        general.geodata_loader = match f.string("geodata-loader")?.to_ascii_lowercase().as_str() {
-            "standard" => GeodataLoader::Standard,
-            _ => GeodataLoader::MemConservative,
-        };
+        general.geo_update_interval =
+            f.loose("geo-update-interval", general.geo_update_interval)?;
+        f.string("geodata-loader")?;
         general.external_controller = f.string("external-controller")?;
         general.secret = f.string("secret")?;
+        if let Some(mut cors) = f.sub("external-controller-cors")? {
+            let origins = cors.strings("allow-origins")?;
+            if !origins.is_empty() {
+                general.external_controller_cors.allow_origins = origins;
+            }
+            if let Some(allow) = cors.opt_bool("allow-private-network")? {
+                general.external_controller_cors.allow_private_network = allow;
+            }
+        }
+        let notes = f.take_ignored();
         f.finish()?;
-        Ok(general)
+        Ok((general, notes))
     }
 }
 
@@ -157,6 +227,25 @@ mod tests {
             General::from_map(&general_defaults()).unwrap(),
             General::default()
         );
+    }
+
+    #[test]
+    fn controller_cors_keeps_mihomos_defaults_for_what_is_not_written() {
+        let mut map = general_defaults();
+        map.insert(
+            "external-controller-cors".into(),
+            json!({"allow-origins": ["https://board.example"]}),
+        );
+        let cors = General::from_map(&map).unwrap().external_controller_cors;
+        assert_eq!(cors.allow_origins, ["https://board.example"]);
+        assert!(cors.allow_private_network);
+        map.insert(
+            "external-controller-cors".into(),
+            json!({"allow-origins": [], "allow-private-network": false}),
+        );
+        let cors = General::from_map(&map).unwrap().external_controller_cors;
+        assert_eq!(cors.allow_origins, ["*"]);
+        assert!(!cors.allow_private_network);
     }
 
     #[test]
@@ -189,6 +278,35 @@ mod tests {
         let general = General::from_map(&map).unwrap();
         assert_eq!(general.skip_auth_prefixes.len(), 2);
         map.insert("skip-auth-prefixes".into(), json!(["127.0.0.1"]));
+        assert!(General::from_map(&map).is_err());
+    }
+
+    #[test]
+    fn the_lan_keys_follow_mihomo() {
+        let defaults = General::from_map(&general_defaults()).unwrap();
+        assert_eq!(defaults.bind_address, "*");
+        assert_eq!(defaults.lan_allowed_ips, everywhere());
+        assert!(defaults.lan_disallowed_ips.is_empty());
+        assert_eq!(
+            General::from_map(&Map::new()).unwrap().lan_allowed_ips,
+            everywhere()
+        );
+
+        let mut map = general_defaults();
+        map.insert("bind-address".into(), json!("192.168.1.2"));
+        map.insert(
+            "lan-allowed-ips".into(),
+            json!(["192.168.0.0/16", "fd00::/8"]),
+        );
+        map.insert("lan-disallowed-ips".into(), json!(["192.168.1.1/32"]));
+        let general = General::from_map(&map).unwrap();
+        assert_eq!(general.bind_address, "192.168.1.2");
+        assert_eq!(general.lan_allowed_ips.len(), 2);
+        assert_eq!(general.lan_disallowed_ips.len(), 1);
+
+        map.insert("lan-allowed-ips".into(), serde_json::Value::Null);
+        assert!(General::from_map(&map).unwrap().lan_allowed_ips.is_empty());
+        map.insert("lan-disallowed-ips".into(), json!(["192.168.1.1"]));
         assert!(General::from_map(&map).is_err());
     }
 }

@@ -20,7 +20,7 @@ behaviour closely enough for its licence to matter, the project is listed here w
 | Xray-core XTLS Vision, via mihomo | MPL-2.0 | The Vision framing in `crates/proxy/src/vless/stream.rs`. Source for the MPL-covered work is this repository. |
 | meow-rs | MIT, Copyright (c) 2026 Max Lv | Leaf code and design, ported across crates. |
 | shoes (cfal) | MIT, Copyright (c) 2021-2023 Alex Lau | Protocol code, ported across `crates/proxy` and `crates/transport`. |
-| sing-tun (SagerNet / MetaCubeX fork v0.4.28) | GPL-3.0-or-later | Policy-routing plan in `crates/tun/src/route/linux.rs` and forwarding rules in `crates/tun/src/wire.rs`. |
+| sing-tun (SagerNet / MetaCubeX fork v0.4.28) | GPL-3.0-or-later | Policy-routing plan in `crates/tun/src/route/linux.rs` and forwarding rules in `crates/tun/src/stack/driver.rs` and `crates/netstack/src/wire.rs`. |
 | sing, sing-vmess, sing-shadowsocks2, sing-quic, sing-mux (MetaCubeX forks) | GPL-3.0-or-later | Behavioural reference for VMess, Shadowsocks 2022, QUIC-based protocols and sing-mux. The Hysteria2 realm client in `crates/proxy/src/hysteria2/realm` follows sing-quic `hysteria2/realm` (control API calls, STUN discovery, the punch packet format and the port-prediction rule) and is checked against mihomo's `hysteria2-realm` listener. |
 | shadowsocks-rust | MIT, Copyright (c) 2017 Y. T. Chung | Shadowsocks stream and AEAD behaviour in `crates/proxy`. |
 | smux (xtaci, MetaCubeX fork) | MIT, Copyright (c) 2016-2017 xtaci | `crates/proxy/src/smux.rs`. |

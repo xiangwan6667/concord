@@ -192,6 +192,8 @@ mod tests {
     use crate::runtime::Tunnel;
     use crate::table::ConnTable;
 
+    mod alloc;
+
     #[derive(Default)]
     struct Wire {
         send_error: Option<io::ErrorKind>,
@@ -420,6 +422,15 @@ mod tests {
         client: Arc<Client>,
         outbound: usize,
     ) -> Arc<Session> {
+        session_with(inner, wire, client, outbound)
+    }
+
+    fn session_with(
+        inner: &Inner,
+        wire: Arc<dyn PacketSession>,
+        client: Arc<dyn UdpReply>,
+        outbound: usize,
+    ) -> Arc<Session> {
         let state = FlowState::new(FlowMeta {
             dscp: 0,
             network: Network::Udp,
@@ -446,7 +457,7 @@ mod tests {
             key: key.clone(),
             inner: wire,
             registration: inner.table.register(record, 0),
-            reply: ArcSwap::from_pointee(client as Arc<dyn UdpReply>),
+            reply: ArcSwap::from_pointee(client),
             first_target: "1.1.1.1:53".parse().unwrap(),
             restore: RwLock::new(HashMap::new()),
             has_restore: AtomicBool::new(false),

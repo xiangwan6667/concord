@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::io;
 use std::sync::{Arc, Mutex};
 
@@ -75,6 +76,44 @@ impl<T> SessionSlot<T> {
         true
     }
 
+    /// `offer`'s last step, for a dial that runs outside it, such as a handshake its callers
+    /// share from a task of its own.
+    pub(crate) fn adopt(
+        &self,
+        ticket: Ticket,
+        conn: Arc<T>,
+        discard: impl FnOnce(Arc<T>),
+    ) -> io::Result<Arc<T>> {
+        if !self.keep(ticket, &conn) {
+            discard(conn);
+            return Err(overtaken());
+        }
+        Ok(conn)
+    }
+
+    /// The held connection if `usable` says it still is, or the one `establish` makes. `dialing`
+    /// lets one dial run at a time, so the callers that wait for it take what it made.
+    pub(crate) async fn offer<F>(
+        &self,
+        dialing: &tokio::sync::Mutex<()>,
+        usable: impl Fn(&T) -> bool,
+        establish: impl FnOnce() -> F,
+        discard: impl FnOnce(Arc<T>),
+    ) -> io::Result<Arc<T>>
+    where
+        F: Future<Output = io::Result<Arc<T>>>,
+    {
+        if let (Some(conn), _) = self.get(&usable) {
+            return Ok(conn);
+        }
+        let _turn = dialing.lock().await;
+        let (held, ticket) = self.get(&usable);
+        if let Some(conn) = held {
+            return Ok(conn);
+        }
+        self.adopt(ticket, establish().await?, discard)
+    }
+
     pub(crate) fn reset(&self) -> Option<Arc<T>> {
         let mut held = lock(&self.held);
         held.resets.bump();
@@ -118,6 +157,44 @@ mod tests {
         slot.forget(&second);
         assert!(slot.get(|_| true).0.is_some());
         slot.forget(&first);
+        assert!(slot.get(|_| true).0.is_none());
+    }
+
+    #[tokio::test]
+    async fn callers_that_wait_take_what_the_one_dial_made() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (slot, dialing) = (SessionSlot::default(), tokio::sync::Mutex::new(()));
+        let dials = AtomicUsize::new(0);
+        let dial = || async {
+            dials.fetch_add(1, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            Ok(Arc::new(7u8))
+        };
+        let (first, second) = tokio::join!(
+            slot.offer(&dialing, |_| true, dial, |_| {}),
+            slot.offer(&dialing, |_| true, dial, |_| {}),
+        );
+        assert!(Arc::ptr_eq(&first.unwrap(), &second.unwrap()));
+        assert_eq!(dials.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_dial_a_reset_overtook_is_discarded() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (slot, dialing) = (SessionSlot::default(), tokio::sync::Mutex::new(()));
+        let discarded = AtomicBool::new(false);
+        let dial = || async {
+            slot.reset();
+            Ok(Arc::new(1u8))
+        };
+        let discard = |_| discarded.store(true, Ordering::SeqCst);
+        let err = slot
+            .offer(&dialing, |_| true, dial, discard)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(discarded.load(Ordering::SeqCst));
         assert!(slot.get(|_| true).0.is_none());
     }
 }

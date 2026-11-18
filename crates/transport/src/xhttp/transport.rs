@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use concord_common::Tasks;
 use concord_common::sync::lock;
 use futures_util::future::BoxFuture;
 use h2::client::SendRequest;
@@ -13,6 +14,7 @@ use tokio::io::AsyncReadExt;
 
 use super::config::{Range, XhttpReuse, parse_range};
 use super::h1::H1Transport;
+use super::h3::{H3Transport, QuicDialFn};
 use super::request::Built;
 use super::{BoxRead, BoxWrite};
 use crate::DialFn;
@@ -29,6 +31,7 @@ pub(crate) type Pending = BoxFuture<'static, io::Result<(u16, BoxRead)>>;
 
 pub(crate) struct H2Transport {
     dial: DialFn,
+    tasks: Tasks,
     keep_alive: Option<Duration>,
     sender: tokio::sync::Mutex<Option<SendRequest<Bytes>>>,
 }
@@ -43,7 +46,7 @@ impl H2Transport {
                     .handshake::<_, Bytes>(io)
                     .await
                     .map_err(h2_io_error)?;
-                spawn_connection(conn, self.keep_alive, Activity::new());
+                spawn_connection(&self.tasks, conn, self.keep_alive, Activity::new());
                 *slot = Some(sender);
             }
             let Some(current) = slot.clone() else {
@@ -125,11 +128,15 @@ impl H2Transport {
 pub(crate) enum Transport {
     H2(H2Transport),
     H1(H1Transport),
+    H3(H3Transport),
 }
 
 impl Transport {
+    pub fn h3(dial: QuicDialFn, tasks: Tasks) -> Arc<Self> {
+        Arc::new(Self::H3(H3Transport::new(dial, tasks)))
+    }
     /// `period` is `h-keep-alive-period`: 0 keeps Chrome's 45 s, negative turns pings off.
-    pub fn new(http1: bool, dial: DialFn, period: i64) -> Arc<Transport> {
+    pub fn new(http1: bool, dial: DialFn, period: i64, tasks: Tasks) -> Arc<Transport> {
         if http1 {
             return Arc::new(Transport::H1(H1Transport::new(dial)));
         }
@@ -140,6 +147,7 @@ impl Transport {
         };
         Arc::new(Transport::H2(H2Transport {
             dial,
+            tasks,
             keep_alive,
             sender: tokio::sync::Mutex::new(None),
         }))
@@ -149,6 +157,7 @@ impl Transport {
         match self {
             Transport::H2(t) => t.fixed(req, body).await,
             Transport::H1(t) => t.fixed(req, body).await,
+            Transport::H3(t) => t.fixed(req, body).await,
         }
     }
 
@@ -156,6 +165,7 @@ impl Transport {
         match self {
             Transport::H2(t) => t.start_download(req).await,
             Transport::H1(t) => t.download(req).await,
+            Transport::H3(t) => t.download(req).await,
         }
     }
 
@@ -163,10 +173,14 @@ impl Transport {
         match self {
             Transport::H2(t) => t.stream(req).await,
             Transport::H1(t) => t.stream(req).await,
+            Transport::H3(t) => t.stream(req).await,
         }
     }
 
     fn close(&self) {
+        if let Transport::H3(t) = self {
+            t.close();
+        }
         if let Transport::H2(t) = self
             && let Ok(mut slot) = t.sender.try_lock()
         {
@@ -378,7 +392,7 @@ mod tests {
         let dial: DialFn = Arc::new(|| Box::pin(async { Err(io::Error::other("unused")) }));
         let maker: Maker = Arc::new(move || {
             counter.fetch_add(1, Ordering::SeqCst);
-            Transport::new(false, dial.clone(), 0)
+            Transport::new(false, dial.clone(), 0, Default::default())
         });
         (ReuseManager::new(&reuse, maker).unwrap(), made)
     }
@@ -444,7 +458,8 @@ mod tests {
     #[test]
     fn invalid_reuse_settings_are_rejected() {
         let dial: DialFn = Arc::new(|| Box::pin(async { Err(io::Error::other("unused")) }));
-        let maker: Maker = Arc::new(move || Transport::new(false, dial.clone(), 0));
+        let maker: Maker =
+            Arc::new(move || Transport::new(false, dial.clone(), 0, Default::default()));
         let bad = XhttpReuse {
             max_connections: "x".into(),
             ..XhttpReuse::default()

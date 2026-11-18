@@ -136,7 +136,7 @@ mod ws_server {
 }
 
 fn ws_stack(opts: WsOptions) -> TransportStack {
-    TransportStack::new(vec![Layer::Ws(opts)])
+    TransportStack::new(vec![Layer::Ws(opts)], Default::default())
 }
 
 type SeenHeaders = (String, String, String, String);
@@ -406,8 +406,9 @@ async fn grpc_follows_the_gun_server_contract_and_shares_a_connection() {
             ..GrpcOptions::default()
         },
         dial,
+        Default::default(),
     );
-    let stack = TransportStack::new(vec![Layer::Grpc(client)]);
+    let stack = TransportStack::new(vec![Layer::Grpc(client)], Default::default());
     assert!(stack.owns_dial());
     let mut first = stack.apply_owned("node.example.com").await.unwrap();
     let mut second = stack.apply_owned("node.example.com").await.unwrap();
@@ -459,6 +460,7 @@ async fn grpc_survives_a_malformed_server_message() {
             ..GrpcOptions::default()
         },
         dial,
+        Default::default(),
     );
     let mut conn = client.dial().await.unwrap();
     let mut buf = [0u8; 8];
@@ -631,8 +633,14 @@ fn xhttp_opts(mode: &str) -> XhttpOptions {
 
 async fn xhttp_roundtrip(mode: &str) -> Arc<XhttpServer> {
     let server = Arc::new(XhttpServer::default());
-    let client = XhttpClient::new(xhttp_opts(mode), xhttp_dial(server.clone()), None).unwrap();
-    let stack = TransportStack::new(vec![Layer::Xhttp(client)]);
+    let client = XhttpClient::new(
+        xhttp_opts(mode),
+        xhttp_dial(server.clone()),
+        None,
+        Default::default(),
+    )
+    .unwrap();
+    let stack = TransportStack::new(vec![Layer::Xhttp(client)], Default::default());
     let conn = stack.apply_owned("cdn.example.com").await.unwrap();
     let payload = pattern(120_000);
     let (mut rd, mut wr) = tokio::io::split(conn);
@@ -677,7 +685,8 @@ async fn xhttp_stream_one_uses_a_single_request() {
     let server = Arc::new(XhttpServer::default());
     let mut opts = xhttp_opts("stream-one");
     opts.path = "/xh/".into();
-    let client = XhttpClient::new(opts, xhttp_dial(server.clone()), None).unwrap();
+    let client =
+        XhttpClient::new(opts, xhttp_dial(server.clone()), None, Default::default()).unwrap();
     let mut conn = client.dial().await.unwrap();
     conn.write_all(b"hello stream-one").await.unwrap();
     let mut got = [0u8; 16];
@@ -697,10 +706,18 @@ async fn xhttp_stream_one_uses_a_single_request() {
 #[tokio::test]
 async fn xhttp_rejects_unknown_modes_and_bad_ranges() {
     let server = Arc::new(XhttpServer::default());
-    assert!(XhttpClient::new(xhttp_opts("mekya"), xhttp_dial(server.clone()), None).is_err());
+    assert!(
+        XhttpClient::new(
+            xhttp_opts("mekya"),
+            xhttp_dial(server.clone()),
+            None,
+            Default::default()
+        )
+        .is_err()
+    );
     let mut opts = xhttp_opts("packet-up");
     opts.sc_max_each_post_bytes = "0".into();
-    assert!(XhttpClient::new(opts, xhttp_dial(server), None).is_err());
+    assert!(XhttpClient::new(opts, xhttp_dial(server), None, Default::default()).is_err());
 }
 
 #[tokio::test]
@@ -708,9 +725,15 @@ async fn xhttp_server_errors_reach_the_reader() {
     let server = Arc::new(XhttpServer::default());
     let mut opts = xhttp_opts("packet-up");
     opts.path = "/other".into();
-    let client = XhttpClient::new(opts, xhttp_dial(server), None).unwrap();
+    let client = XhttpClient::new(opts, xhttp_dial(server), None, Default::default()).unwrap();
     let mut conn = client.dial().await.unwrap();
     let mut buf = [0u8; 1];
     let err = conn.read(&mut buf).await.unwrap_err();
     assert!(err.to_string().contains("404"), "{err}");
 }
+
+#[path = "interop/h3.rs"]
+mod h3_tests;
+
+#[path = "interop/h3_lifecycle.rs"]
+mod h3_lifecycle;

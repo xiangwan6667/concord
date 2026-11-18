@@ -8,7 +8,9 @@ const XSO_INPCB: u32 = 0x10;
 const INP_IPV4: u8 = 0x1;
 const INP_IPV6: u8 = 0x2;
 const MIN_INPCB: usize = 80;
-const MIN_SOCKET: usize = 72;
+const MIN_SOCKET: usize = 88;
+const SS_NOFDREF: u16 = 0x1;
+const SOF_MP_SUBFLOW: u32 = 0x0100_0000;
 const PATH_MAX: usize = 4096;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -39,11 +41,22 @@ pub fn parse_pcblist(buf: &[u8]) -> Vec<Pcb> {
         } else if kind == XSO_SOCKET
             && len >= MIN_SOCKET
             && let (Some((local, v4)), Some(pid)) = (pending.take(), word(record, 68))
+            && has_descriptor(record)
         {
             sockets.push(Pcb { local, v4, pid });
         }
     }
     sockets
+}
+
+/// A closed socket lingering on a live socket's address keeps its last pid. MPTCP subflows never
+/// have a descriptor; xnu's `soreceive` exempts them the same way. `pack(4)` puts `so_flags` at 84.
+fn has_descriptor(socket: &[u8]) -> bool {
+    let state = socket
+        .get(26..28)
+        .map_or(0, |b| u16::from_ne_bytes([b[0], b[1]]));
+    let flags = word(socket, 84).unwrap_or(0);
+    state & SS_NOFDREF == 0 || flags & SOF_MP_SUBFLOW != 0
 }
 
 fn parse_inpcb(record: &[u8]) -> Option<(SocketAddr, bool)> {
@@ -148,6 +161,8 @@ pub fn find(network: Network, src: SocketAddr) -> Option<ProcessInfo> {
 mod tests {
     use std::net::{TcpListener, TcpStream, UdpSocket};
 
+    use socket2::{Domain, Socket, Type};
+
     use super::*;
 
     #[allow(
@@ -241,6 +256,68 @@ mod tests {
             assert_eq!(Path::new(&info.path).file_name(), exe.file_name());
             assert_eq!(info.name, exe.file_name().unwrap().to_string_lossy());
         }
+    }
+
+    #[test]
+    fn a_socket_without_a_descriptor_is_skipped_unless_it_is_a_subflow() {
+        let inpcb = record(
+            XSO_INPCB,
+            104,
+            &[
+                (18, &8080u16.to_be_bytes()),
+                (44, &[INP_IPV4]),
+                (76, &[127, 0, 0, 1]),
+            ],
+        );
+        let socket = |pid: u32, state: u16, flags: u32| {
+            record(
+                XSO_SOCKET,
+                104,
+                &[
+                    (26, &state.to_ne_bytes()),
+                    (68, &pid.to_ne_bytes()),
+                    (84, &flags.to_ne_bytes()),
+                ],
+            )
+        };
+        let dump = [
+            record(0, 24, &[]),
+            inpcb.clone(),
+            socket(1, SS_NOFDREF, 0),
+            inpcb.clone(),
+            socket(2, SS_NOFDREF, SOF_MP_SUBFLOW),
+            inpcb,
+            socket(3, 0, 0),
+        ]
+        .concat();
+        let pids: Vec<u32> = parse_pcblist(&dump).iter().map(|pcb| pcb.pid).collect();
+        assert_eq!(pids, [2, 3]);
+    }
+
+    #[test]
+    fn a_closed_socket_on_the_same_port_is_not_listed() {
+        // Newer than the live socket, the closed one comes first in the list until its peer closes.
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let second = TcpListener::bind("127.0.0.1:0").unwrap();
+        let reusable = || {
+            let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+            socket.set_reuse_address(true).unwrap();
+            socket
+        };
+        let live = reusable();
+        let any: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        live.bind(&any.into()).unwrap();
+        live.connect(&second.local_addr().unwrap().into()).unwrap();
+        let src = live.local_addr().unwrap().as_socket().unwrap();
+        let closed = reusable();
+        closed.bind(&src.into()).unwrap();
+        closed.connect(&first.local_addr().unwrap().into()).unwrap();
+        let _peer = first.accept().unwrap();
+        drop(closed);
+
+        let sockets = parse_pcblist(&read_pcblist(Network::Tcp).unwrap());
+        let listed = sockets.iter().filter(|pcb| pcb.local == src).count();
+        assert_eq!(listed, 1);
     }
 
     #[test]

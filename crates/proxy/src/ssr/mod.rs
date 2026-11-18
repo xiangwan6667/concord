@@ -1,3 +1,4 @@
+mod chacha;
 mod chain;
 mod cipher;
 mod obfs;
@@ -17,7 +18,7 @@ use concord_common::{
 use concord_config::proxy::{ProxyDef, SsrOpts};
 use tokio::io::AsyncWriteExt;
 
-use self::cipher::SsrCipher;
+pub(crate) use self::cipher::SsrCipher;
 use self::obfs::ObfsFactory;
 use self::protocol::{PacketProtocol, ProtocolFactory};
 use self::stream::CodecStream;
@@ -43,7 +44,7 @@ impl Outbound for ShadowsocksR {
     async fn connect(&self, cx: &DialCx<'_>, dst: &Address) -> io::Result<BoxStream> {
         let raw = self.link.open(cx).await?;
         let obfs = CodecStream::new(raw, self.obfs.layer());
-        let cipher = CodecStream::new(obfs, self.cipher.layer());
+        let cipher = CodecStream::new(obfs, self.cipher.layer()?);
         let iv = cipher.layer().iv.clone();
         let mut stream = CodecStream::new(cipher, self.protocol.stream(iv));
         let mut head = Vec::new();
@@ -68,9 +69,23 @@ impl Outbound for ShadowsocksR {
     }
 }
 
-struct SsrUdp {
+pub(crate) struct SsrUdp {
     cipher: SsrCipher,
     protocol: PacketProtocol,
+}
+
+/// A shadowsocks stream cipher is SSR with protocol `origin` and obfs `plain` on the wire: the IV,
+/// then everything after it under the cipher. Shadowsocks and trojan's `ss-opts` run djb ChaCha20
+/// and XChaCha20, which the `shadowsocks` crate lacks, through this layer.
+pub(crate) fn stream_cipher(raw: BoxStream, cipher: &SsrCipher) -> io::Result<BoxStream> {
+    Ok(Box::new(CodecStream::new(raw, cipher.layer()?)))
+}
+
+pub(crate) fn stream_udp(cipher: SsrCipher) -> SsrUdp {
+    SsrUdp {
+        cipher,
+        protocol: PacketProtocol::Plain,
+    }
 }
 
 impl UdpCodec for SsrUdp {
@@ -82,8 +97,7 @@ impl UdpCodec for SsrUdp {
         let len = SOCKS.len(dst);
         SOCKS.write_into(dst, pkt.prepend(len))?;
         self.protocol.seal(pkt);
-        self.cipher.seal_packet(pkt);
-        Ok(())
+        self.cipher.seal_packet(pkt)
     }
 
     fn open(&self, pkt: &mut PacketBuf) -> io::Result<Address> {
@@ -124,7 +138,7 @@ pub(crate) fn build(
         &opts.protocol_param,
         ctx.clock.clone(),
     )?;
-    let link = Link::plain(def, &opts.server, opts.port);
+    let link = Link::plain(def, &opts.server, opts.port, &ctx.tasks);
     Ok(Arc::new(ShadowsocksR {
         info: info_for(
             def,

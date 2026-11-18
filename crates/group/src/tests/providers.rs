@@ -63,7 +63,12 @@ async fn a_file_provider_loads_from_the_home_directory() {
 async fn a_path_outside_the_home_directory_is_refused() {
     let escaped = FILE_PROVIDER.replace("p.yaml", "../p.yaml");
     let built = Rig::try_with(&profile(&escaped), Arc::new(SelectionStore::new()), None);
-    assert!(built.is_err());
+    let message = built.err().unwrap().to_string();
+    assert!(
+        message.starts_with("parse proxy provider p error: path ")
+            && message.ends_with(": ../p.yaml"),
+        "{message}"
+    );
 }
 
 fn answered() -> CancellationToken {
@@ -319,6 +324,23 @@ async fn an_http_error_status_carries_its_code() {
     let err = rig.out.provider("p").unwrap().update().await.unwrap_err();
     assert_eq!(err.status_code(), Some(404));
     assert_eq!(err.to_string(), "404 Not Found");
+}
+
+#[tokio::test]
+async fn a_providers_payload_stands_in_until_a_load_succeeds() {
+    let text = HTTP_PROVIDER.replace(
+        "    interval: 3600\n",
+        "    interval: 3600\n    payload:\n      - {name: spare, type: direct}\n",
+    );
+    let rig = Rig::new(&text);
+    let provider = rig.out.provider("p").unwrap();
+    assert_eq!(names(&rig, "g"), ["spare"]);
+    assert!(provider.initial().await.is_err());
+    assert_eq!(names(&rig, "g"), ["spare"]);
+    rig.fetcher
+        .serve_with("http://sub.test/list", 200, &[], &list(&["n1"]));
+    provider.update().await.unwrap();
+    assert_eq!(names(&rig, "g"), ["n1"]);
 }
 
 #[tokio::test]

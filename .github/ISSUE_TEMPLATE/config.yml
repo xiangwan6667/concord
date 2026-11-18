@@ -1,0 +1,13 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/chen08209/concord/security/advisories/new
+    about: Report it privately, as SECURITY.md describes. Never in a public issue.
+  - name: Usage question
+    url: https://github.com/chen08209/concord/blob/main/docs/usage.md
+    about: Concord does not offer usage support. Issues are for bugs and differences from mihomo only.
+  - name: A problem in an app that embeds Concord
+    url: https://github.com/chen08209/concord/blob/main/docs/usage.md#embedding
+    about: >-
+      Report an app's own screens and features to that app's repository. Open an issue here only after reproducing
+      the problem with the standalone `concord run`.

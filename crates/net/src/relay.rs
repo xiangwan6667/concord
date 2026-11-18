@@ -7,11 +7,8 @@ use std::time::Duration;
 
 use concord_common::stream_buffer::{ReadBufferOptions, StreamBuffer};
 use concord_common::{Attached, BoxStream, Stream};
-#[cfg(any(target_os = "linux", target_os = "android"))]
-use concord_platform::SplicePipe;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+use concord_platform::{SEND_TCP_VECTORED, SplicePipe};
 use tokio::io::Interest;
-#[cfg(any(target_os = "linux", target_os = "android"))]
 use tokio::net::TcpStream;
 use tokio::task::coop::poll_proceed;
 use tokio::time::{Instant, Sleep, sleep};
@@ -47,21 +44,18 @@ enum Step {
     Finished,
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
 enum Bulk {
     Unused,
     Pipe(SplicePipe),
     Off,
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
 enum Moved {
     Some,
     Eof,
     Unavailable,
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
 fn splice_unsupported(err: &io::Error) -> bool {
     matches!(
         err.kind(),
@@ -74,8 +68,7 @@ fn poll_vectored<W: Stream + ?Sized>(
     writer: &mut W,
     buffers: &[IoSlice<'_>],
 ) -> Poll<io::Result<usize>> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    if let Some(socket) = writer.tcp() {
+    if SEND_TCP_VECTORED && let Some(socket) = writer.tcp() {
         loop {
             ready!(socket.poll_write_ready(cx))?;
             match socket.try_io(Interest::WRITABLE, || {
@@ -108,7 +101,6 @@ struct Half {
     remaining: usize,
     total: u64,
     need_flush: bool,
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     bulk: Bulk,
 }
 
@@ -123,7 +115,6 @@ impl Half {
             remaining: 0,
             total: 0,
             need_flush: false,
-            #[cfg(any(target_os = "linux", target_os = "android"))]
             bulk: Bulk::Unused,
         }
     }
@@ -232,7 +223,6 @@ impl Half {
         Poll::Ready(Ok(()))
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn poll_bulk(
         &mut self,
         cx: &mut Context<'_>,
@@ -334,8 +324,8 @@ impl Half {
                 ready!(Pin::new(&mut *writer).poll_flush(cx))?;
                 self.need_flush = false;
             }
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            if self.buffer.is_none()
+            if SplicePipe::AVAILABLE
+                && self.buffer.is_none()
                 && !self.read_done()
                 && !matches!(self.bulk, Bulk::Off)
                 && let (Some(src), Some(dst)) = (reader.tcp(), writer.tcp())

@@ -11,6 +11,13 @@
     "127.0.0.1/8"
   ],
   "allow-lan": true,
+  "bind-address": "*",
+  "lan-allowed-ips": [
+    "192.168.0.0/16"
+  ],
+  "lan-disallowed-ips": [
+    "192.168.9.0/24"
+  ],
   "mode": "global",
   "unified-delay": true,
   "log-level": "debug",
@@ -149,13 +156,6 @@
     "h2": false,
     "limits": {}
   },
-  "bind-address": "*",
   "global-client-fingerprint": "chrome",
-  "geodata-mode": false,
-  "lan-allowed-ips": [
-    "192.168.0.0/16"
-  ],
-  "lan-disallowed-ips": [
-    "192.168.9.0/24"
-  ]
+  "geodata-mode": false
 }

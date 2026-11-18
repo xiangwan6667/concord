@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use concord_common::BoxStream;
 use concord_common::sync::lock;
+use concord_common::{BoxStream, Tasks};
 use h2::client::SendRequest;
 use http::{Method, Request, Uri};
 
@@ -83,12 +83,13 @@ pub struct GunClient {
     max_connections: usize,
     dial: DialFn,
     pool: Mutex<Vec<Arc<Transport>>>,
+    tasks: Tasks,
 }
 
 impl GunClient {
     /// `dial` returns a stream ready for HTTP/2: TCP, then TLS offering `h2` when the
     /// node uses TLS. Reuse `tls_dial` for the TLS case.
-    pub fn new(opts: GrpcOptions, dial: DialFn) -> Arc<GunClient> {
+    pub fn new(opts: GrpcOptions, dial: DialFn, tasks: Tasks) -> Arc<GunClient> {
         let mut opts = opts;
         if opts.max_connections == 0 && opts.min_streams == 0 && opts.max_streams == 0 {
             opts.max_connections = 1;
@@ -98,6 +99,7 @@ impl GunClient {
             opts,
             dial,
             pool: Mutex::new(Vec::new()),
+            tasks,
         })
     }
 
@@ -146,7 +148,12 @@ impl GunClient {
                     .map_err(h2_io_error)?;
                 let interval = Duration::from_secs(u64::from(self.opts.ping_interval));
                 transport.activity.touch();
-                spawn_connection(conn, Some(interval), transport.activity.clone());
+                spawn_connection(
+                    &self.tasks,
+                    conn,
+                    Some(interval),
+                    transport.activity.clone(),
+                );
                 *slot = Some(sender);
             }
             let Some(current) = slot.clone() else {

@@ -105,7 +105,11 @@ fn service_paths_match_gun() {
 #[tokio::test]
 async fn request_shape_and_large_echo() {
     let seen = Arc::new(Seen::default());
-    let client = GunClient::new(opts(), dial_to_server(seen.clone(), 200));
+    let client = GunClient::new(
+        opts(),
+        dial_to_server(seen.clone(), 200),
+        Default::default(),
+    );
     let conn = client.dial().await.unwrap();
     let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 247) as u8).collect();
     let send = payload.clone();
@@ -136,7 +140,7 @@ async fn custom_user_agent_is_sent() {
     let seen = Arc::new(Seen::default());
     let mut o = opts();
     o.user_agent = "my-agent".into();
-    let client = GunClient::new(o, dial_to_server(seen.clone(), 200));
+    let client = GunClient::new(o, dial_to_server(seen.clone(), 200), Default::default());
     let mut conn = client.dial().await.unwrap();
     conn.write_all(b"x").await.unwrap();
     let mut one = [0u8; 1];
@@ -147,7 +151,11 @@ async fn custom_user_agent_is_sent() {
 #[tokio::test]
 async fn streams_share_one_connection_by_default() {
     let seen = Arc::new(Seen::default());
-    let client = GunClient::new(opts(), dial_to_server(seen.clone(), 200));
+    let client = GunClient::new(
+        opts(),
+        dial_to_server(seen.clone(), 200),
+        Default::default(),
+    );
     let mut conns = Vec::new();
     for _ in 0..5 {
         conns.push(client.dial().await.unwrap());
@@ -167,7 +175,7 @@ async fn max_streams_opens_another_connection_when_full() {
     let seen = Arc::new(Seen::default());
     let mut o = opts();
     o.max_streams = 2;
-    let client = GunClient::new(o, dial_to_server(seen.clone(), 200));
+    let client = GunClient::new(o, dial_to_server(seen.clone(), 200), Default::default());
     let mut conns = Vec::new();
     for _ in 0..5 {
         conns.push(client.dial().await.unwrap());
@@ -184,7 +192,7 @@ async fn max_connections_bounds_the_pool_and_min_streams_fills_first() {
     let mut o = opts();
     o.max_connections = 2;
     o.min_streams = 3;
-    let client = GunClient::new(o, dial_to_server(seen.clone(), 200));
+    let client = GunClient::new(o, dial_to_server(seen.clone(), 200), Default::default());
     let mut conns = Vec::new();
     for _ in 0..3 {
         conns.push(client.dial().await.unwrap());
@@ -199,7 +207,7 @@ async fn max_connections_bounds_the_pool_and_min_streams_fills_first() {
 #[tokio::test]
 async fn half_close_still_delivers_the_reply() {
     let seen = Arc::new(Seen::default());
-    let client = GunClient::new(opts(), dial_to_server(seen, 200));
+    let client = GunClient::new(opts(), dial_to_server(seen, 200), Default::default());
     let mut conn = client.dial().await.unwrap();
     conn.write_all(b"last words").await.unwrap();
     conn.shutdown().await.unwrap();
@@ -211,7 +219,7 @@ async fn half_close_still_delivers_the_reply() {
 #[tokio::test]
 async fn a_failing_status_is_a_read_error() {
     let seen = Arc::new(Seen::default());
-    let client = GunClient::new(opts(), dial_to_server(seen, 404));
+    let client = GunClient::new(opts(), dial_to_server(seen, 404), Default::default());
     let mut conn = client.dial().await.unwrap();
     conn.write_all(b"x").await.unwrap();
     let mut buf = [0u8; 1];
@@ -222,7 +230,11 @@ async fn a_failing_status_is_a_read_error() {
 #[tokio::test]
 async fn a_dead_connection_is_replaced() {
     let seen = Arc::new(Seen::default());
-    let client = GunClient::new(opts(), dial_to_server(seen.clone(), 200));
+    let client = GunClient::new(
+        opts(),
+        dial_to_server(seen.clone(), 200),
+        Default::default(),
+    );
     drop(client.dial().await.unwrap());
     {
         let transport = lock(&client.pool).first().cloned().unwrap();
@@ -239,7 +251,7 @@ async fn a_dead_connection_is_replaced() {
 #[tokio::test]
 async fn split_halves_echo_concurrently_and_shutdown_keeps_reading() {
     let seen = Arc::new(Seen::default());
-    let client = GunClient::new(opts(), dial_to_server(seen, 200));
+    let client = GunClient::new(opts(), dial_to_server(seen, 200), Default::default());
     let (mut rd, mut wr) = client.dial().await.unwrap().into_split();
     let payload: Vec<u8> = (0..100_000u32).map(|i| (i % 241) as u8).collect();
     let send = payload.clone();

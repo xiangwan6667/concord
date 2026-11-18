@@ -160,6 +160,7 @@ pub enum Ext {
     Alpn,
     StatusRequest,
     SignatureAlgorithms,
+    SignatureAlgorithmsCert(&'static [u16]),
     Sct,
     KeyShare,
     PskModes,

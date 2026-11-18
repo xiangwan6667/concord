@@ -39,12 +39,14 @@ pub enum Backend {
     Rustls,
     Boring,
     Reality,
+    Jls,
 }
 
 enum Engine {
     Rustls(Arc<ClientConfig>),
     Boring(BoringConnector),
     Reality(RealityClient),
+    Jls(RealityClient),
 }
 
 /// Built once per node; `connect` is the only per-connection work.
@@ -95,7 +97,7 @@ struct LazyEch {
 
 impl TlsConnector {
     pub fn new(options: TlsOptions, trust: Arc<TrustStore>) -> Result<Self, TlsError> {
-        match options.ech_lookup.clone() {
+        match options.ech_lookup.clone().filter(|_| options.jls.is_none()) {
             Some(lookup) if options.ech_config_list.is_none() => {
                 let options = TlsOptions {
                     ech_lookup: None,
@@ -122,9 +124,25 @@ impl TlsConnector {
                 .then(|| Box::new((options.clone(), trust.clone()))),
             adopted: Mutex::new(None),
         };
+        let server_name = options.server_name.clone().filter(|name| !name.is_empty());
+
+        if options.jls.is_some() {
+            if options.reality.is_some() {
+                return Err(TlsError::Config(
+                    "security modes are mutually exclusive: JLS, REALITY".into(),
+                ));
+            }
+            return Ok(Self {
+                server_name,
+                engine: Engine::Jls(RealityClient::jls(&options, trust)?),
+                fingerprint: options.client_fingerprint,
+                ech: None,
+                retry: EchRetry::default(),
+            });
+        }
+
         let policy = Arc::new(CertPolicy::new(&options, trust.clone())?);
         let client_auth = load_client_auth(&options)?;
-        let server_name = options.server_name.clone().filter(|name| !name.is_empty());
 
         if let Some(reality) = options.reality.clone() {
             if client_auth.is_some() {
@@ -134,8 +152,13 @@ impl TlsConnector {
             }
             // mihomo's REALITY hello carries the uTLS preset's ALPN whatever the node or
             // its network asks for.
-            let client =
-                RealityClient::new(reality, options.client_fingerprint, Vec::new(), trust)?;
+            let client = RealityClient::new(
+                reality,
+                options.client_fingerprint,
+                Vec::new(),
+                trust,
+                &options.tasks,
+            )?;
             return Ok(Self {
                 server_name,
                 engine: Engine::Reality(client),
@@ -223,6 +246,7 @@ impl TlsConnector {
             Engine::Rustls(_) => Backend::Rustls,
             Engine::Boring(_) => Backend::Boring,
             Engine::Reality(_) => Backend::Reality,
+            Engine::Jls(_) => Backend::Jls,
         }
     }
 
@@ -389,7 +413,9 @@ impl TlsConnector {
             )),
             Engine::Boring(connector) if aligned => connector.connect(name, io).await?,
             Engine::Boring(connector) => connector.connect_buffered(name, io).await?,
-            Engine::Reality(client) => TlsConn::Reality(Box::new(client.connect(io, &name).await?)),
+            Engine::Reality(client) | Engine::Jls(client) => {
+                TlsConn::Reality(Box::new(client.connect(io, &name).await?))
+            }
         };
         if !aligned {
             conn.set_unaligned();

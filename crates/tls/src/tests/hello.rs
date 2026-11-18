@@ -178,8 +178,9 @@ pub fn reality_hello(fp: ClientFingerprint, mlkem: bool) -> Vec<u8> {
     build_client_hello(
         spec,
         &HelloParams {
+            jls: false,
             server_name: Some("example.com"),
-            alpn: &[],
+            alpn: None,
             random: &[7u8; 32],
             x25519_public: &[9u8; 32],
             mlkem_encapsulation_key: mlkem.then_some(ek.as_slice()),

@@ -12,9 +12,9 @@ use crate::run::{Frame, Run};
 
 pub use concord_config::rule::{Cond, RuleDef, RuleLines};
 
-/// A top-level rule, by position in the `rules` list.
+/// A rule in the list where matching started, by list and position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct RuleRef(pub(crate) u32);
+pub struct RuleRef(pub(crate) u32, pub(crate) u32);
 
 impl RuleRef {
     pub fn index(self) -> usize {
@@ -213,6 +213,7 @@ impl std::error::Error for CompileError {}
 pub struct RouteProgram {
     /// Index 0 is the main list, `n + 1` the n-th sub-rule list.
     pub(crate) progs: Box<[Prog]>,
+    pub(crate) sub_rule_names: Box<[Box<str>]>,
     pub(crate) targets: Box<[Box<str>]>,
     pub(crate) rule_sets: Box<[(Arc<RuleSetHandle>, bool, bool)]>,
     pub(crate) demands: Demands,
@@ -269,7 +270,7 @@ impl RouteProgram {
     }
 
     pub fn rule_at(&self, rule: RuleRef) -> RuleInfo<'_> {
-        let main = self.progs.first();
+        let main = self.progs.get(rule.1 as usize);
         RuleInfo {
             type_name: main
                 .and_then(|p| p.table.kind(rule.0))
@@ -287,13 +288,18 @@ impl RouteProgram {
             let target = main
                 .and_then(|p| p.table.target(index))
                 .map_or("", |id| self.target_name(id));
-            (self.rule_at(RuleRef(index)), target)
+            (self.rule_at(RuleRef(index, 0)), target)
         })
     }
 
     pub fn memory_estimate(&self) -> usize {
         self.progs.iter().map(Prog::heap_bytes).sum::<usize>()
             + self.targets.iter().map(|t| t.len() + 16).sum::<usize>()
+            + self
+                .sub_rule_names
+                .iter()
+                .map(|t| t.len() + 16)
+                .sum::<usize>()
     }
 
     pub(crate) fn target_name(&self, id: u16) -> &str {

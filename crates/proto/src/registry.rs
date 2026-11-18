@@ -1,5 +1,3 @@
-use schemars::{Schema, SchemaGenerator};
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exec {
     /// Runs on the task that reads frames, so it keeps arrival order: opening and
@@ -71,18 +69,12 @@ pub enum Kind {
     Rpc,
 }
 
-pub type SchemaOf = fn(&mut SchemaGenerator) -> Schema;
-
 pub struct MethodSpec {
     pub name: &'static str,
     pub kind: Kind,
     pub exec: Exec,
     pub policy: Option<StreamPolicy>,
     pub capability: Cap,
-    pub params: SchemaOf,
-    /// The result; for a stream, the snapshot.
-    pub result: SchemaOf,
-    pub event: SchemaOf,
 }
 
 macro_rules! policy_of {
@@ -102,9 +94,6 @@ macro_rules! build_table {
             exec: Exec::$exec,
             policy: policy_of!($policy),
             capability: Cap::$cap,
-            params: |generator| generator.subschema_for::<$params>(),
-            result: |generator| generator.subschema_for::<$result>(),
-            event: |generator| generator.subschema_for::<$event>(),
         },)*];
     };
 }

@@ -61,8 +61,8 @@ impl MitmService {
         Err(unavailable())
     }
 
-    pub(crate) fn apply(&self, section: &concord_config::Map, _trust: Arc<TrustStore>) {
-        if !section.is_empty() {
+    pub(crate) fn apply(&self, section: &concord_config::MitmDef, _trust: Arc<TrustStore>) {
+        if section.enable {
             tracing::warn!("[MITM] this build has no MITM; the section is ignored");
         }
     }

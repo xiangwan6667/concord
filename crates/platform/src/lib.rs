@@ -3,17 +3,22 @@
     reason = "socket options, process tables, rlimits and ownership syscalls have no safe std wrapper"
 )]
 
+mod accept;
 mod certs;
 mod clock;
 mod cpus;
 mod exhaustion;
 mod home;
+mod icmp;
 mod identity;
 mod limits;
 mod mem;
 pub mod mmap;
 mod native;
 mod netinfo;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+mod nosplice;
+mod observer;
 pub mod owner;
 #[cfg(unix)]
 mod sigpipe;
@@ -35,35 +40,34 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use concord_common::{FlowKey, ProcessInfo, RawSocket};
 
+pub use accept::is_lost_connection;
 pub use certs::{certs_from_dirs, system_root_certs};
 pub use clock::{local_utc_offset, set_system_time};
-pub use cpus::available_cpus;
+pub use cpus::{assignable_cpus, available_cpus};
 pub use exhaustion::is_local_exhaustion;
 pub use home::HomeDir;
+pub use icmp::{IcmpSocket, icmp_echo_socket};
 pub use identity::{SocketIdentity, with_same_socket};
 pub use limits::{FdPressure, fd_limit, open_fd_count, raise_fd_limit};
 pub use mem::{release_free_memory, resident_memory};
 pub use native::NativePlatform;
-pub use netinfo::{interface_by_name, parse_resolv_conf};
+pub use netinfo::{interface_addrs, interface_by_name, parse_resolv_conf};
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub use nosplice::SplicePipe;
+pub use observer::SocketObserver;
 #[cfg(unix)]
 pub use sigpipe::ignore_sigpipe;
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub use sockopt::send_tcp_vectored;
-#[cfg(target_os = "linux")]
-pub use sockopt::try_send_vectored;
 pub use sockopt::{
-    bind_to_interface, enable_tfo, is_global_unicast, mptcp_protocol, prepare_udp_socket,
-    raw_socket_of, send_space, set_routing_mark,
+    KEEP_ALIVE, SEND_TCP_VECTORED, TRY_SEND_VECTORED, bind_to_interface, enable_tfo,
+    is_global_unicast, mptcp_protocol, prepare_udp_socket, raw_socket_of, send_space,
+    send_tcp_vectored, set_routing_mark, try_send_vectored,
 };
 pub use sparse::SparseBuf;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use splice::SplicePipe;
 pub use tproxy_udp::{TproxyDatagram, bind_foreign_udp, prepare_tproxy_udp, recv_original_dst};
 pub use transparent::{make_transparent, original_dst, prepare_listener};
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub use udp_batch::{
-    UDP_BATCH, UdpGso, recv_udp_batch, recv_udp_batch_fd, send_udp_batch, send_udp_batch_fd,
-};
+pub use udp_batch::{UDP_BATCH, UdpBatch};
 pub use udpbuf::grow_udp_buffers;
 #[cfg(target_os = "macos")]
 pub use utun::{UTUN_BATCH, UTUN_BATCH_FRAME, utun_recv_batch, utun_send_batch};

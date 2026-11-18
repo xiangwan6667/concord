@@ -1,0 +1,56 @@
+name: labels
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/labels.json
+      - .github/workflows/labels.yaml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  sync:
+    name: Sync labels
+    if: ${{ !github.event.repository.fork }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github
+
+      # Labels not in the file are deleted, which also removes them from every issue.
+      - name: Make the repository's labels those in .github/labels.json
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const wanted = JSON.parse(
+              fs.readFileSync(`${process.env.GITHUB_WORKSPACE}/.github/labels.json`, 'utf8'),
+            );
+            const repo = context.repo;
+            const existing = await github.paginate(github.rest.issues.listLabelsForRepo, repo);
+            const byName = new Map(existing.map((label) => [label.name.toLowerCase(), label]));
+            for (const label of wanted) {
+              const found = byName.get(label.name.toLowerCase());
+              if (!found) {
+                await github.rest.issues.createLabel({ ...repo, ...label });
+              } else if (
+                found.name !== label.name ||
+                found.color !== label.color ||
+                (found.description || '') !== label.description
+              ) {
+                await github.rest.issues.updateLabel({ ...repo, name: found.name, new_name: label.name,
+                  color: label.color, description: label.description });
+              }
+            }
+            const keep = new Set(wanted.map((label) => label.name.toLowerCase()));
+            for (const label of existing.filter((label) => !keep.has(label.name.toLowerCase()))) {
+              await github.rest.issues.deleteLabel({ ...repo, name: label.name });
+            }

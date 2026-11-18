@@ -21,16 +21,17 @@ concord-engine = { workspace = true }
 concord-ffi = { workspace = true }
 concord-platform = { workspace = true }
 concord-rpc = { workspace = true }
+concord-tun = { workspace = true }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true, features = ["release_max_level_debug"] }
 # Never called here: it caps the `log` records that dependencies such as rustls compile in.
 log = { workspace = true, features = ["release_max_level_debug"] }
 tracing-subscriber = { workspace = true }
-
-[dev-dependencies]
-serde_json = { workspace = true }
 
 [lints]
 workspace = true

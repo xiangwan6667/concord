@@ -227,8 +227,7 @@ async fn a_session_that_outlives_its_listener_does_not_hold_the_udp_port() {
     let sessions = std::sync::Arc::new(Sessions::default());
     let listeners = concord_inbound::Listeners::new();
     assert!(
-        listeners
-            .reconcile(&mixed(), sessions.clone())
+        open(&listeners, &mixed(), sessions.clone())
             .await
             .is_empty()
     );

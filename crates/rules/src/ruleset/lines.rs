@@ -49,6 +49,18 @@ pub(crate) fn text_items(buf: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// Surge's DOMAIN-SET lines as Clash domain patterns: a leading dot covers the domain itself
+/// as well as what is under it, which Clash writes `+.`.
+pub(crate) fn domain_set_items(buf: &[u8]) -> Vec<String> {
+    text_items(buf)
+        .into_iter()
+        .map(|item| match item.strip_prefix('.') {
+            Some(rest) => format!("+.{rest}"),
+            None => item,
+        })
+        .collect()
+}
+
 fn is_head(line: &str) -> bool {
     let Some((key, after)) = line.split_once(':') else {
         return false;

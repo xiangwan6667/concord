@@ -7,7 +7,6 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use concord_common::{
     Address, BoxStream, DialCx, Outbound, OutboundInfo, OutboundKind, PacketSession,
@@ -22,10 +21,8 @@ use self::udp::{Relay, TuicPackets};
 use self::wire::Version;
 use crate::ctx::{BuildCtx, BuildError};
 use crate::lazy::{HeadFirst, Kick};
-use crate::link::EnvSlot;
 use crate::node::{Egress, info_for};
-use crate::quic::{BbrProfile, ObfsSpec, QuicLink, QuicStream, bbr_factory, io_error, quic_crypto};
-use crate::tlsmap::{TlsSpec, tls_options};
+use crate::quic::{BbrProfile, ObfsSpec, QuicLink, QuicStream, bbr_factory, io_error, node_crypto};
 use crate::uot;
 
 const DEFAULT_STREAM_WINDOW: u64 = 15_728_640;
@@ -115,7 +112,7 @@ impl Outbound for Tuic {
     ) -> io::Result<Arc<dyn PacketSession>> {
         if let Some(version) = self.uot {
             let stream = self.open_stream(cx, &uot::destination(version)).await?;
-            return uot::session(stream, version, hint);
+            return uot::session(stream, version, hint, &self.shared.link.tasks);
         }
         let slot = self.udp.pick(true, self.max_open);
         let live = slot.live(&self.shared, cx).await?;
@@ -209,32 +206,11 @@ pub(crate) fn build(
     } else {
         [0; 16]
     };
-    let server_name = if opts.tls.server_name.is_empty() {
-        opts.server.clone()
-    } else {
-        opts.tls.server_name.clone()
-    };
-    let alpn = if opts.tls.alpn.is_empty() {
-        vec!["h3".to_string()]
-    } else {
-        opts.tls.alpn.clone()
-    };
     let mut tls_def = opts.tls.clone();
     if opts.disable_sni {
         tls_def.skip_cert_verify = true;
     }
-    let env_slot: EnvSlot = Arc::new(ArcSwapOption::empty());
-    let tls_opts = tls_options(
-        &tls_def,
-        TlsSpec {
-            sni: server_name.clone(),
-            alpn: alpn.clone(),
-        },
-        ctx,
-        Some(&env_slot),
-    )?;
-    let alpn_refs: Vec<&str> = alpn.iter().map(String::as_str).collect();
-    let tls = quic_crypto(&tls_opts, ctx.trust.clone(), &alpn_refs, env_slot)?;
+    let (server_name, tls) = node_crypto(&tls_def, &opts.server, "h3", ctx)?;
 
     let heartbeat = Duration::from_millis(if opts.heartbeat_interval == 0 {
         10_000
@@ -304,6 +280,7 @@ pub(crate) fn build(
         obfs: ObfsSpec::None,
         hop: None,
         datagram_frame: u64::try_from(frame).ok(),
+        tasks: ctx.tasks.clone(),
     };
     let shared = Arc::new(Shared {
         link,

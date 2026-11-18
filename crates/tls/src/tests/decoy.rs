@@ -71,3 +71,35 @@ async fn tls12_only_caps_the_version() {
     let conn = connector.connect(client, "ignored").await.unwrap();
     assert!(!conn.is_tls13());
 }
+
+#[tokio::test]
+async fn shadowtls_ws_chrome_hello_keeps_alps_with_http1_alpn() {
+    let (near, mut far) = tokio::io::duplex(1 << 20);
+    let handshake = DecoyHandshake::new(
+        &TlsOptions {
+            client_fingerprint: Some(crate::ClientFingerprint::Chrome),
+            ..options()
+        },
+        Ca::new().trust(),
+        true,
+    )
+    .unwrap();
+    let task = tokio::spawn(async move {
+        let sealer = |_: &[u8]| -> io::Result<[u8; 32]> { Ok([1; 32]) };
+        let _ = handshake.run(Box::new(near), "", &sealer).await;
+    });
+    let mut head = [0; 5];
+    far.read_exact(&mut head).await.unwrap();
+    let mut hello = vec![0; usize::from(u16::from_be_bytes([head[3], head[4]]))];
+    far.read_exact(&mut hello).await.unwrap();
+    let parsed = super::hello::parse_hello("shadowtls-ws", &hello);
+    assert_eq!(parsed.alpn, ["http/1.1"]);
+    assert!(parsed.extensions.iter().any(|ext| ext == "44cd"));
+    assert!(
+        hello
+            .windows(9)
+            .any(|bytes| bytes == [0x44, 0xcd, 0, 5, 0, 3, 2, b'h', b'2'])
+    );
+    drop(far);
+    task.await.unwrap();
+}

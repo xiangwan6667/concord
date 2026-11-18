@@ -294,7 +294,7 @@ struct Sizes {
     owner: Vec<String>,
 }
 
-fn is_test(attrs: &[syn::Attribute]) -> bool {
+pub(crate) fn is_test(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| {
         let path = attr.path();
         if path.is_ident("cfg") {

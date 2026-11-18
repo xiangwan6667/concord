@@ -1,5 +1,12 @@
 /// Seconds east of UTC in the zone the device is set to, at the Unix time `unix`.
 #[cfg(unix)]
+#[cfg_attr(
+    target_pointer_width = "32",
+    allow(
+        clippy::useless_conversion,
+        reason = "tm_gmtoff is a 32-bit long here and 64 bits on 64-bit targets"
+    )
+)]
 pub fn local_utc_offset(unix: i64) -> i32 {
     #[allow(
         irrefutable_let_patterns,

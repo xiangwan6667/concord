@@ -1,0 +1,16 @@
+[
+  { "name": "bug", "color": "d73a4a", "description": "Concord fails, crashes or misroutes traffic" },
+  { "name": "compatibility", "color": "5319e7", "description": "Concord differs from mihomo" },
+  { "name": "enhancement", "color": "a2eeef", "description": "Something mihomo or sing-box has that Concord lacks" },
+  { "name": "needs-info", "color": "fbca04", "description": "Incomplete; closed 7 days after this label unless completed" },
+  { "name": "needs-repro", "color": "f9d0c4", "description": "Complete, but not reproduced yet" },
+  { "name": "confirmed", "color": "0e8a16", "description": "Reproduced by a maintainer" },
+  { "name": "wontfix", "color": "ffffff", "description": "Will not be changed" },
+  { "name": "duplicate", "color": "cfd3d7", "description": "Already reported in another issue" },
+  { "name": "platform: linux", "color": "c5def5", "description": "Linux only" },
+  { "name": "platform: macos", "color": "c5def5", "description": "macOS only" },
+  { "name": "platform: windows", "color": "c5def5", "description": "Windows only" },
+  { "name": "platform: android", "color": "c5def5", "description": "Android only" },
+  { "name": "dependencies", "color": "0366d6", "description": "Dependabot updates a dependency" },
+  { "name": "github_actions", "color": "000000", "description": "Dependabot updates a GitHub Action" }
+]

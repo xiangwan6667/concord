@@ -538,7 +538,7 @@ impl Model<'_> {
             }
             if let Cond::SubRule(_) = def.cond {
                 let subs = self.subs;
-                let sub = &subs[def.target.as_str()];
+                let sub = subs.get(def.target.as_str()).map_or(&[][..], Vec::as_slice);
                 if self.run(sub, Some(idx)) && top.is_some() {
                     return true;
                 }

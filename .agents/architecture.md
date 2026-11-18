@@ -27,7 +27,7 @@ The exact edges are in `xtask/src/layers.rs`. From the bottom up:
 | Pure | `config`, `rules` | Profile parsing and validation; the rule compiler and route program. No tokio |
 | OS | `platform` | The `Platform` trait a host implements (`protect`, process lookup, default interface) and native system calls (sockopts, splice, tproxy, rlimits, owned mmap buffers) |
 | Sockets and crypto | `net`, `tls`, `netstack` | Socket factory, dialing, loopback guard, the relay; rustls and BoringSSL backends, fingerprints, REALITY, ECH; the user-space TCP/IP stack shared by TUN and WireGuard |
-| Links | `transport`, `proxy` | ws, gRPC, h2, xhttp, obfs, ShadowTLS, sing-mux; the outbound protocols and how a node's link is composed |
+| Links | `transport`, `proxy` | ws, gRPC, h2, xhttp, obfs, ShadowTLS, sing-mux, QUIC over a `PacketSession` (proxy and DNS); the outbound protocols and how a node's link is composed |
 | Services | `dns`, `group` | Resolver, upstreams, fake-ip, cache; groups, providers, health checks |
 | Pipeline | `tunnel` | Pre-handle, sniff, route, dial, track, relay; UDP NAT; connection table |
 | Edges | `inbound`, `tun`, `mitm` | mixed/http/socks/redir/tproxy listeners; TUN device, routes and stack driver; MITM, scripts, capture |
@@ -104,7 +104,9 @@ like any inbound. Receive rings are owned mmaps that opt out of transparent huge
 the current runtime. An apply is serialized: load the profile, compile the route program, build the runtime, swap it,
 then reconcile listeners, TUN and DNS; providers load afterwards and report `loaded`. A rejected profile falls back to
 the built-in empty config and says so. Background tasks belong to the engine's `TaskTracker` and are awaited on
-shutdown.
+shutdown, up to a bound. The proxy layer registers its tasks there through `concord_common::Tasks`, which a build
+context carries; a node's tasks end when the node is dropped or the engine stops, and xtask's `task_owner` test
+keeps `tokio::spawn` out of `proxy`, `transport`, `net` and `tls`.
 
 The control plane is layered: `proto` (types, errors, the method registry with execution class `inline`, `serial` or
 `concurrent`, stream policies `latest`, `drop_oldest` or `resync`) → `api` (one async function per method) → `rpc`
@@ -114,9 +116,14 @@ delivery.
 
 ## Pending Restructure
 
-Still open: move QUIC infrastructure into its own crate; fold `udprelay::UdpCodec` into `dgram`; move the two
-`lock` helpers left in `proxy/src/quic` (`congestion.rs`, `socket.rs`) onto `concord_common::sync::lock`, which the
-rest of the workspace uses. mieru's and AmneziaWG's `invalid` add a protocol prefix and stay local.
+Still open:
+
+- Proxy and transport owners: move the QUIC infrastructure in `proxy/src/quic` into its own crate, preserving
+  the transport and DNS users' dependency direction.
+- Proxy owners: fold `udprelay::UdpCodec` into `dgram`.
+
+`proxy/src/quic/congestion.rs` and `proxy/src/quic/socket.rs` already use `concord_common::sync::lock`.
+mieru's and AmneziaWG's `invalid` add a protocol prefix and stay local.
 
 Settled, not pending: `ss::crypto::CryptoIo` and `SsKey` stay in `ss`, because Trojan's `ss` option is the Shadowsocks
 AEAD stream itself, not a general AEAD layer. The per-protocol counting nonces stay separate: mieru increments
@@ -132,9 +139,6 @@ Found in the structure survey and left to their owners:
 
 - `proxy/src/lazy.rs` spreads the deferred-header state across `HeadFirst`'s stage and `Kick`'s four states. Low
   priority: one state machine when the file next changes.
-- Data-path size and timing constants still without a `reference-choices.md` row (tunnel `FIRST_BYTES_WINDOW`,
-  sniff waits, h2io `PING_TIMEOUT`, xhttp `CHROME_H2_KEEP_ALIVE`). Each protocol's owner: add the row when the
-  constant is next touched.
-- tunnel `MeteredStream` forwards the owned write but leaves `poll_read_buffer` at the copying default; it wraps
-  only the core's own inner dials and the MITM upstream. Tunnel owner: forward the owned read and meter the returned
-  buffer.
+
+The tunnel first-byte window and sniff waits, h2io ping timeout and xhttp keepalive period are registered in
+`reference-choices.md`. `tunnel::tcp::MeteredStream` forwards both owned reads and writes and meters their bytes.

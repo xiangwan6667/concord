@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use concord_common::sync::lock;
 use concord_common::{
     Address, BoxStream, DialCx, DialEnv, Initiator, Outbound, OutboundInfo, PacketBuf,
-    PacketSession,
+    PacketSession, Tasks,
 };
 use concord_config::proxy::SmuxOpts;
 use concord_transport::{
@@ -31,6 +31,7 @@ struct Muxed {
     client: Arc<SingMuxClient>,
     slot: EnvSlot,
     only_tcp: bool,
+    tasks: Tasks,
 }
 
 impl Muxed {
@@ -60,7 +61,12 @@ impl Outbound for Muxed {
         }
         self.remember(cx);
         let (reader, writer) = self.client.listen_packet(Some(hint)).await?;
-        Ok(Arc::new(MuxPackets::new(reader, writer, hint.clone())))
+        Ok(Arc::new(MuxPackets::new(
+            reader,
+            writer,
+            hint.clone(),
+            &self.tasks,
+        )))
     }
 
     fn multi_destination_udp(&self) -> bool {
@@ -70,9 +76,8 @@ impl Outbound for Muxed {
     fn reset_sessions(&self) {
         self.inner.reset_sessions();
         let client = self.client.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move { client.close().await });
-        }
+        self.tasks
+            .spawn_detached(async move { client.close().await });
     }
 }
 
@@ -84,10 +89,15 @@ struct MuxPackets {
 }
 
 impl MuxPackets {
-    fn new(mut reader: PacketReader, mut writer: PacketWriter, hint: Address) -> Self {
+    fn new(
+        mut reader: PacketReader,
+        mut writer: PacketWriter,
+        hint: Address,
+        tasks: &Tasks,
+    ) -> Self {
         let (outgoing, mut queue) = mpsc::channel::<(Vec<u8>, Address)>(QUEUE);
         let (feed, incoming) = mpsc::channel(QUEUE);
-        let write = tokio::spawn(async move {
+        let write = tasks.spawn(async move {
             while let Some((payload, to)) = queue.recv().await {
                 if writer.send(&payload, Some(&to)).await.is_err() {
                     break;
@@ -95,7 +105,7 @@ impl MuxPackets {
             }
             let _ = writer.shutdown().await;
         });
-        let read = tokio::spawn(async move {
+        let read = tasks.spawn(async move {
             while let Ok(packet) = reader.recv().await {
                 if feed.send(packet).await.is_err() {
                     break;
@@ -172,6 +182,7 @@ fn dial_through(inner: Arc<dyn Outbound>, slot: EnvSlot) -> MuxDialFn {
 pub(crate) fn wrap(
     inner: Arc<dyn Outbound>,
     opts: &SmuxOpts,
+    tasks: &Tasks,
 ) -> Result<Arc<dyn Outbound>, BuildError> {
     let brutal = opts
         .brutal
@@ -195,6 +206,7 @@ pub(crate) fn wrap(
             brutal,
         },
         dial_through(inner.clone(), slot.clone()),
+        tasks.clone(),
     );
     let mut info = inner.info().clone();
     info.udp = info.udp || !opts.only_tcp;
@@ -204,5 +216,6 @@ pub(crate) fn wrap(
         client,
         slot,
         only_tcp: opts.only_tcp,
+        tasks: tasks.clone(),
     }))
 }

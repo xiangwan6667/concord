@@ -163,6 +163,23 @@ async fn selecting_a_dead_fallback_member_probes_it_first() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn routing_before_the_probe_of_a_dead_pick_leaves_the_pick_to_the_probe() {
+    let rig = Rig::new(&config(&format!(
+        "  - {{name: f, type: fallback, proxies: [a, b], url: '{TEST_URL}'}}\n"
+    )));
+    let node = rig.out.node("b").unwrap();
+    node.health()
+        .record(TEST_URL, 0, true, false, &rig.out.shared.health_epoch);
+    let staged = rig.out.stage_selection("f", "b").unwrap();
+    assert_eq!(rig.leaf("f"), "a");
+    rig.out.probe_selection(&staged).await;
+    let outcome = rig.out.settle_selection(staged);
+    assert!(outcome.changed);
+    assert_eq!(rig.leaf("f"), "b");
+    assert_eq!(rig.store.get("f").as_deref(), Some("b"));
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_url_test_group_picks_the_fastest_and_keeps_it_within_tolerance() {
     let rig = Rig::new(&config(&format!(
         "  - {{name: wide, type: url-test, proxies: [a, b], url: '{TEST_URL}', tolerance: 100}}\n  - {{name: tight, type: url-test, proxies: [a, b], url: '{TEST_URL}', tolerance: 10}}\n"

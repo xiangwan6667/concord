@@ -5,14 +5,14 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use concord_common::{Address, PacketBuf, PacketSession};
+use concord_common::{Address, PacketBuf, PacketSession, Tasks};
 use rand::Rng;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::wire::{Defrag, UdpHeader, parse_udp, put_udp_header, udp_header_len};
-use crate::quic::QuicStream;
+use crate::quic::{DatagramHub, QuicStream};
 use crate::util::lock;
 
 const QUEUE: usize = 64;
@@ -36,12 +36,14 @@ impl Hub {
     pub(super) fn remove(&self, id: u32) {
         lock(&self.sessions).remove(&id);
     }
+}
 
-    pub(super) fn close_all(&self) {
+impl DatagramHub for Hub {
+    fn close_all(&self) {
         lock(&self.sessions).clear();
     }
 
-    pub(super) fn dispatch(&self, datagram: &[u8]) {
+    fn dispatch(&self, datagram: &Bytes) {
         let Ok(message) = parse_udp(datagram) else {
             return;
         };
@@ -75,12 +77,13 @@ impl Hy1Packets {
         id: u32,
         control: QuicStream,
         conn_hold: Arc<dyn Send + Sync>,
+        tasks: &Tasks,
     ) -> Self {
         let incoming = hub.register(id);
         let closed = Arc::new(AtomicBool::new(false));
         let hold = {
             let (hub, closed) = (hub.clone(), closed.clone());
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 let mut control = control;
                 let mut sink = [0u8; 1024];
                 while matches!(control.read(&mut sink).await, Ok(n) if n > 0) {}

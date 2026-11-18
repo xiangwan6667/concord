@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use concord_common::Tasks;
 use concord_net::LoopbackGuard;
 use concord_platform::HomeDir;
 use concord_tls::{TlsError, TrustStore};
@@ -15,6 +16,8 @@ pub struct BuildCtx {
     pub loopback: Option<Arc<LoopbackGuard>>,
     pub clock: Clock,
     pub home: Option<Arc<HomeDir>>,
+    /// Every task a built node or its sessions start; the engine stops them on shutdown.
+    pub tasks: Tasks,
 }
 
 impl BuildCtx {
@@ -24,6 +27,7 @@ impl BuildCtx {
             loopback: None,
             clock: Arc::new(SystemTime::now),
             home: None,
+            tasks: Tasks::default(),
         }
     }
 
@@ -43,13 +47,13 @@ impl BuildCtx {
     }
 
     /// mihomo's `C.Path.Resolve` and `IsSafePath`: a relative path joins the home
-    /// directory, and except on Android the file must lie inside it, so a profile cannot
-    /// point a node at a key or certificate of the user's elsewhere.
+    /// directory, and where the platform confines profile files the file must lie inside it,
+    /// so a profile cannot point a node at a key or certificate of the user's elsewhere.
     pub(crate) fn resolve_file(&self, path: &str) -> Result<PathBuf, BuildError> {
         let Some(home) = &self.home else {
             return Ok(PathBuf::from(path));
         };
-        if cfg!(target_os = "android") {
+        if !HomeDir::CONFINES_PROFILE_FILES {
             return Ok(home.join(path));
         }
         home.confine(path).map_err(|_| {

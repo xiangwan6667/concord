@@ -1,4 +1,6 @@
-use super::{Json, RouteHit};
+use std::collections::BTreeMap;
+
+use super::{Json, MitmIssue, MitmLineEntry, RouteHit};
 
 dto! {
     pub struct RouteCheckParams {
@@ -78,8 +80,13 @@ dto! {
         pub config: Json,
     }
 
+    /// Both keyed by list, as the section names it (`hostname`, `url-rewrite`, ...), in
+    /// line order. A line in force has a view; one that cannot be read has an issue; a
+    /// `hostname` or `client-source-address` line some of whose items apply has both.
     pub struct MitmValidateResult {
-        pub issues: Json,
+        pub issues: BTreeMap<String, Vec<MitmIssue>>,
+        #[serde(default)]
+        pub views: BTreeMap<String, Vec<MitmLineEntry>>,
     }
 
     pub struct MitmIssueParams {

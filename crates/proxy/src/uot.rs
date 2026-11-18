@@ -1,7 +1,7 @@
 use std::io;
 use std::sync::Arc;
 
-use concord_common::{Address, BoxStream, PacketBuf, PacketSession};
+use concord_common::{Address, BoxStream, PacketBuf, PacketSession, Tasks};
 
 use crate::addr_codec::{MAX_ADDR_LEN, SOCKS, UOT};
 use crate::dgram::{Decoded, Decoder, Encoder, StreamSession};
@@ -26,6 +26,7 @@ pub(crate) fn session(
     stream: BoxStream,
     version: u8,
     hint: &Address,
+    tasks: &Tasks,
 ) -> io::Result<Arc<dyn PacketSession>> {
     let mut request = Vec::new();
     if version != LEGACY_VERSION {
@@ -37,6 +38,7 @@ pub(crate) fn session(
         UotFrames,
         UotFrames,
         hint.clone(),
+        tasks,
     )))
 }
 

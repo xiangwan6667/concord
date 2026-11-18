@@ -1,4 +1,7 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fmt;
+use std::rc::Rc;
 
 use base64::Engine;
 use indexmap::IndexMap;
@@ -94,11 +97,26 @@ enum Lookup<'a> {
     Folded(HashMap<String, &'a Value>),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ignored {
+    pub code: &'static str,
+    pub key: String,
+    pub why: String,
+}
+
+impl fmt::Display for Ignored {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} is ignored: {}", self.key, self.why)
+    }
+}
+
 pub struct Fields<'a> {
     lookup: Lookup<'a>,
     path: String,
     missing: Vec<String>,
     replace_underscore: bool,
+    /// Shared with the fields of every sub-map, so a note from one reaches the caller.
+    ignored: Rc<RefCell<Vec<Ignored>>>,
 }
 
 impl<'a> Fields<'a> {
@@ -125,6 +143,7 @@ impl<'a> Fields<'a> {
             path: path.to_string(),
             missing: Vec::new(),
             replace_underscore,
+            ignored: Rc::default(),
         }
     }
 
@@ -141,6 +160,10 @@ impl<'a> Fields<'a> {
     }
 
     fn lookup(&self, key: &str) -> Option<&'a Value> {
+        self.lookup_present(key).filter(|value| !value.is_null())
+    }
+
+    fn lookup_present(&self, key: &str) -> Option<&'a Value> {
         let lowered;
         let key = if key.bytes().any(|b| b.is_ascii_uppercase()) {
             lowered = key.to_ascii_lowercase();
@@ -148,11 +171,10 @@ impl<'a> Fields<'a> {
         } else {
             key
         };
-        let found = match &self.lookup {
+        match &self.lookup {
             Lookup::Direct(map) => map.get(key),
             Lookup::Folded(map) => map.get(key).copied(),
-        };
-        found.filter(|value| !value.is_null())
+        }
     }
 
     pub fn has(&self, key: &str) -> bool {
@@ -171,8 +193,9 @@ impl<'a> Fields<'a> {
         ))
     }
 
+    /// A key written with no value is set, as mihomo's decoder reads it; it keeps the zero value.
     pub fn require(&mut self, key: &str) {
-        if self.lookup(key).is_none() {
+        if self.lookup_present(key).is_none() {
             self.missing.push(key.to_string());
         }
     }
@@ -237,6 +260,18 @@ impl<'a> Fields<'a> {
         self.u16(key)
     }
 
+    /// A number mihomo keeps as a Go `int` and does not check: one this type cannot hold is
+    /// noted and read as `fallback`, as is an absent one.
+    pub fn loose<T: TryFrom<i128>>(&mut self, key: &str, fallback: T) -> Result<T> {
+        let Some(number) = self.integer(key, "int", i128::MIN, i128::MAX)? else {
+            return Ok(fallback);
+        };
+        Ok(T::try_from(number).unwrap_or_else(|_| {
+            self.note("out_of_range", key, format!("{number} is out of range"));
+            fallback
+        }))
+    }
+
     pub fn u32(&mut self, key: &str) -> Result<u32> {
         Ok(self
             .integer(key, "uint32", 0, i128::from(u32::MAX))?
@@ -256,6 +291,12 @@ impl<'a> Fields<'a> {
             .integer(key, "int64", i128::from(i64::MIN), i128::from(i64::MAX))?
             .and_then(|n| i64::try_from(n).ok())
             .unwrap_or(0))
+    }
+
+    /// mihomo keeps a mark as an `int` and hands it to `setsockopt` as a C `int`, so its low 32
+    /// bits are the mark.
+    pub fn mark(&mut self, key: &str) -> Result<u32> {
+        Ok(self.i64(key)? as u32)
     }
 
     pub fn i32(&mut self, key: &str) -> Result<i32> {
@@ -328,11 +369,11 @@ impl<'a> Fields<'a> {
     pub fn sub(&mut self, key: &str) -> Result<Option<Fields<'a>>> {
         match self.lookup(key) {
             None => Ok(None),
-            Some(Value::Object(map)) => Ok(Some(Fields::new(
-                map,
-                &self.name(key),
-                self.replace_underscore,
-            ))),
+            Some(Value::Object(map)) => {
+                let mut sub = Fields::new(map, &self.name(key), self.replace_underscore);
+                sub.ignored = self.ignored.clone();
+                Ok(Some(sub))
+            }
             Some(other) => Err(ConfigError::new(format!(
                 "'{}' expected a map, got '{}'",
                 self.name(key),
@@ -380,6 +421,25 @@ impl<'a> Fields<'a> {
             }
         }
         Ok(out)
+    }
+
+    /// Notes a key this core reads past when it asks for something, for the load report.
+    pub fn ignore(&mut self, key: &str, why: &str) {
+        if self.lookup(key).is_some_and(crate::raw::asks_for_something) {
+            self.note("not_applied", key, why.to_string());
+        }
+    }
+
+    fn note(&self, code: &'static str, key: &str, why: String) {
+        self.ignored.borrow_mut().push(Ignored {
+            code,
+            key: self.name(key),
+            why,
+        });
+    }
+
+    pub fn take_ignored(&mut self) -> Vec<Ignored> {
+        std::mem::take(&mut *self.ignored.borrow_mut())
     }
 
     pub fn finish(self) -> Result<()> {

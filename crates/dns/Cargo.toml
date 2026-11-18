@@ -15,6 +15,7 @@ doctest = false
 concord-common = { workspace = true, features = ["io"] }
 concord-config = { workspace = true }
 concord-tls = { workspace = true }
+concord-transport = { workspace = true }
 concord-platform = { workspace = true }
 tokio = { workspace = true, features = ["net", "time", "io-util", "macros", "rt", "sync"] }
 tokio-rustls = { workspace = true }

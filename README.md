@@ -1,19 +1,19 @@
 # Concord
 
-Concord is a proxy core written in Rust. It reads Clash and mihomo configuration and routes each connection by rules
-through proxy groups to an outbound protocol. It runs on its own from a profile, or inside an application that drives
+Concord is a proxy core written in Rust. It reads Clash profiles and routes each connection by rules through proxy
+groups to an outbound protocol. It runs on its own from a profile, or inside an application that drives
 it through an API.
 
 ## Highlights
 
-- **Your existing configuration.** Clash and mihomo YAML with mihomo's rules, groups, providers and DNS. A node
+- **Your existing configuration.** Clash profiles with their rules, groups, providers and DNS. A node
   Concord does not support is set aside with a warning instead of failing the whole profile.
 - **Broad protocol coverage.** Shadowsocks, ShadowsocksR, VMess, VLESS with REALITY, Trojan, AnyTLS, Snell, Hysteria,
   Hysteria2, TUIC, ShadowQUIC, mieru, WireGuard, SSH, SOCKS5 and HTTP; over WebSocket, gRPC, HTTP/2, xhttp, ShadowTLS
   and sing-mux; with ECH and browser TLS fingerprints.
 - **Built-in TUN** on macOS, Linux, Windows and Android, beside mixed, HTTP, SOCKS, redirect and TProxy listeners.
 - **HTTPS interception.** Optional MITM for listed hosts, with rewrite rules and scripts.
-- **A control API.** JSON-RPC 2.0 with live streams, described by [`schema/api.json`](schema/api.json), and mihomo's
+- **A control API.** JSON-RPC 2.0 with live streams, described by [`schema/api.json`](schema/api.json), and the Clash
   REST API for dashboards.
 
 ## Platforms
@@ -36,7 +36,7 @@ target/release/concord run -c config.yaml
 
 | Option | Meaning |
 |---|---|
-| `-c`, `--config <file>` | The Clash or mihomo profile to run (default: `config.yaml` in the home directory) |
+| `-c`, `--config <file>` | The Clash profile to run (default: `config.yaml` in the home directory) |
 | `-d`, `--directory <dir>` | The home directory (default: `~/.config/concord`) |
 | `-h`, `--help` | Print the options |
 

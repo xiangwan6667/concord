@@ -81,6 +81,7 @@ pub(crate) enum Node {
     Dscp(Box<[PortRange]>),
     InUser(Box<[Box<str>]>),
     InName(Box<[Box<str>]>),
+    RematchName(Box<[Box<str>]>),
     InType(u8),
     Process {
         by_name: bool,
@@ -292,6 +293,10 @@ impl<'a> Ev<'a> {
                 .is_some_and(|user| users.iter().any(|u| &**u == user)),
             Node::InName(names) => {
                 let name: &str = &self.flow.inbound.name;
+                names.iter().any(|n| &**n == name)
+            }
+            Node::RematchName(names) => {
+                let name = self.state.rematch_name.as_deref().unwrap_or_default();
                 names.iter().any(|n| &**n == name)
             }
             Node::InType(mask) => mask & inbound_bit(self.flow.inbound.kind) != 0,

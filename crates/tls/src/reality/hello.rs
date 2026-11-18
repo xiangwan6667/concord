@@ -11,7 +11,8 @@ pub(crate) const SESSION_ID_LEN: usize = 32;
 
 pub(crate) struct HelloParams<'a> {
     pub server_name: Option<&'a str>,
-    pub alpn: &'a [String],
+    pub jls: bool,
+    pub alpn: Option<&'a [String]>,
     pub random: &'a [u8; 32],
     pub x25519_public: &'a [u8; 32],
     pub mlkem_encapsulation_key: Option<&'a [u8]>,
@@ -154,11 +155,10 @@ pub(crate) fn build_client_hello(
     put_u16_list(&mut body, spec.cipher_suites, grease.cipher)?;
     body.extend_from_slice(&[1, 0]);
 
-    let protocols: Vec<String> = if params.alpn.is_empty() {
-        spec.alpn.iter().map(|proto| (*proto).to_owned()).collect()
-    } else {
-        params.alpn.to_vec()
-    };
+    let protocols: Vec<String> = params.alpn.map_or_else(
+        || spec.alpn.iter().map(|proto| (*proto).to_owned()).collect(),
+        <[String]>::to_vec,
+    );
 
     let mut exts = Vec::with_capacity(768);
     let mut greases_seen = 0;
@@ -210,6 +210,11 @@ pub(crate) fn build_client_hello(
                 let mut data = Vec::new();
                 put_u16_list(&mut data, spec.signature_algorithms, GREASE)?;
                 (13, data)
+            }
+            Ext::SignatureAlgorithmsCert(algorithms) => {
+                let mut data = Vec::new();
+                put_u16_list(&mut data, algorithms, GREASE)?;
+                (50, data)
             }
             Ext::Sct => (18, Vec::new()),
             Ext::KeyShare => {
@@ -271,6 +276,9 @@ pub(crate) fn build_client_hello(
                 (27, data)
             }
             Ext::Alps(codepoint) => {
+                if params.jls && !protocols.iter().any(|proto| proto == "h2") {
+                    continue;
+                }
                 let mut list = Vec::new();
                 for proto in spec.alps_protocols {
                     list.push(u8::try_from(proto.len()).unwrap_or(0));

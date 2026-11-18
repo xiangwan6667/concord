@@ -1,0 +1,72 @@
+name: Compatibility
+description: Concord reads or does something differently from mihomo.
+labels: [compatibility]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check `docs/compatibility.md` first: a difference it lists is deliberate. Incomplete reports are labelled
+        `needs-info` and closed after 7 days.
+  - type: input
+    id: version
+    attributes:
+      label: Concord version
+      description: The release tag (`v1.2.3`) or the full commit hash of the current `main`.
+    validations:
+      required: true
+  - type: input
+    id: key
+    attributes:
+      label: Configuration key or protocol
+      placeholder: proxies[].reality-opts, rule SUB-RULE, hysteria2 obfs
+    validations:
+      required: true
+  - type: input
+    id: mihomo-version
+    attributes:
+      label: mihomo version
+    validations:
+      required: true
+  - type: textarea
+    id: mihomo-behaviour
+    attributes:
+      label: Behaviour under mihomo
+      description: What mihomo does, with the source location (file and line at that version) if you can.
+    validations:
+      required: true
+  - type: textarea
+    id: concord-behaviour
+    attributes:
+      label: Behaviour under Concord
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Minimal configuration
+      render: yaml
+    validations:
+      required: true
+  - type: textarea
+    id: warnings
+    attributes:
+      label: Load output
+      description: The output of `concord -t` on this profile if your build has it, otherwise the warnings logged when the profile loads.
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I reproduced this on the latest release or the current `main`.
+          required: true
+        - label: I removed servers, passwords, UUIDs, keys and subscription URLs from the configuration and output.
+          required: true
+        - label: "`docs/compatibility.md` does not list this difference."
+          required: true
+        - label: I searched the existing issues, open and closed.
+          required: true
+        - label: This issue reports one difference.
+          required: true

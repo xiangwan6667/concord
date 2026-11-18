@@ -27,7 +27,7 @@ use tokio_tungstenite::tungstenite::protocol::{Message, Role};
 use tokio_util::sync::CancellationToken;
 
 use crate::http::{Body, is_websocket};
-use crate::mihomo;
+use crate::shapes;
 
 pub type Values = BoxStream<'static, Value>;
 
@@ -183,7 +183,7 @@ pub async fn logs(control: &Arc<Control>, level: LogLevel, structured: bool) -> 
             .filter(move |entry| {
                 std::future::ready(level != LogLevel::Silent && entry.level >= level)
             })
-            .map(move |entry| mihomo::log(entry.level, entry.time, &entry.text, structured))
+            .map(move |entry| shapes::log(entry.level, entry.time, &entry.text, structured))
             .boxed(),
         Err(_) => stream::empty().boxed(),
     }
@@ -268,7 +268,7 @@ impl Table {
             .core_stats(Empty {})
             .await
             .map_or(0, |stats| stats.rss);
-        mihomo::snapshot(self.open.values(), upload, download, memory)
+        shapes::snapshot(self.open.values(), upload, download, memory)
     }
 }
 

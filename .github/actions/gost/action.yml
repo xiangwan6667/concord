@@ -1,0 +1,49 @@
+name: gost
+description: >-
+  Fetches the gost v2 and v3 releases the interop tests use (`.agents/benchmarking.md`, Gost peers), pinned by hash
+  per architecture, and sets CONCORD_GOST2 and CONCORD_GOST3 to them.
+
+runs:
+  using: composite
+  steps:
+    - name: Cache gost
+      id: cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/gost-dl
+        key: gost-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/actions/gost/action.yml') }}
+
+    - name: Fetch gost
+      shell: bash
+      env:
+        GOST2_VERSION: 2.12.0
+        GOST2_SHA256_X64: 1b6d47e6b850479b23fda484b3a8193c7bc0d5dc38fa5a02b4b4c57a77534d92
+        GOST2_SHA256_ARM64: 3c1bf20c223f424f9a706cc4a3042f6e79084ebe3becca4899e1dc9fb86fd661
+        GOST3_VERSION: 3.3.3
+        GOST3_SHA256_X64: f4c1255dc892a7014c0ad6e5f1c3573108f7bea4403f04f21873406ab58aa666
+        GOST3_SHA256_ARM64: 4c704c92df6eeea8a3b08d0de4fd3c44343095a20136b3b6cf334f98d2f174ab
+      run: |
+        case "$(uname -m)" in
+          x86_64) arch=amd64 v2=$GOST2_SHA256_X64 v3=$GOST3_SHA256_X64 ;;
+          aarch64) arch=arm64 v2=$GOST2_SHA256_ARM64 v3=$GOST3_SHA256_ARM64 ;;
+          *) echo "no pinned gost for $(uname -m)" >&2; exit 1 ;;
+        esac
+        fetch() {
+          local repo=$1 version=$2 sum=$3
+          local asset=gost_${version}_linux_$arch.tar.gz
+          local download=$RUNNER_TEMP/gost-dl/$asset
+          if [ ! -f "$download" ]; then
+            mkdir -p "$RUNNER_TEMP/gost-dl"
+            curl -fsSL --retry 3 -o "$download" \
+              "https://github.com/$repo/releases/download/v$version/$asset"
+          fi
+          echo "$sum  $download" | sha256sum -c -
+          local dir=$RUNNER_TEMP/gost-$version
+          mkdir -p "$dir"
+          tar -xzf "$download" -C "$dir" gost
+          "$dir/gost" -V
+        }
+        fetch ginuerzh/gost "$GOST2_VERSION" "$v2"
+        fetch go-gost/gost "$GOST3_VERSION" "$v3"
+        echo "CONCORD_GOST2=$RUNNER_TEMP/gost-$GOST2_VERSION/gost" >> "$GITHUB_ENV"
+        echo "CONCORD_GOST3=$RUNNER_TEMP/gost-$GOST3_VERSION/gost" >> "$GITHUB_ENV"

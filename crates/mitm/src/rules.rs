@@ -1,90 +1,51 @@
 use std::path::{Component, Path};
 
+use concord_config::mitm::text::{decode_base64, quote};
+use concord_config::mitm::{
+    BodyActionDef, BodyRewriteDef, HeaderEditDef, HeaderRewriteDef, LineError, MapLocalBody,
+    MapLocalDef, UrlRewriteDef,
+};
 use http::StatusCode;
-use http::header::{HeaderMap, HeaderName, HeaderValue};
+use http::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 
+use crate::heads::{HeadConditions, Heads};
+use crate::jq::{Jq, JqOutcome};
 use crate::pattern::Pattern;
-use crate::script::Script;
-use crate::text::{Field, canonical_header, decode_base64, quote, remainder, split_fields, texts};
+use crate::script::{Script, ScriptKind};
+use crate::view::LineView;
+
+pub(crate) use concord_config::mitm::UrlAction;
+
+mod views;
 
 const TINY_GIF_BASE64: &str = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UrlAction {
-    Header,
-    Redirect302,
-    Redirect307,
-    Reject,
-    Reject200,
-    RejectImg,
-    RejectDict,
-    RejectArray,
-}
-
-impl UrlAction {
-    fn named(text: &str) -> Option<UrlAction> {
-        Some(match text {
-            "header" => UrlAction::Header,
-            "302" => UrlAction::Redirect302,
-            "307" => UrlAction::Redirect307,
-            "reject" => UrlAction::Reject,
-            "reject-200" => UrlAction::Reject200,
-            "reject-img" | "reject-tinygif" => UrlAction::RejectImg,
-            "reject-dict" => UrlAction::RejectDict,
-            "reject-array" => UrlAction::RejectArray,
-            _ => return None,
-        })
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            UrlAction::Header => "header",
-            UrlAction::Redirect302 => "302",
-            UrlAction::Redirect307 => "307",
-            UrlAction::Reject => "reject",
-            UrlAction::Reject200 => "reject-200",
-            UrlAction::RejectImg => "reject-img",
-            UrlAction::RejectDict => "reject-dict",
-            UrlAction::RejectArray => "reject-array",
-        }
-    }
-
-    pub fn rejects(self) -> bool {
-        matches!(
-            self,
-            UrlAction::Reject
-                | UrlAction::Reject200
-                | UrlAction::RejectImg
-                | UrlAction::RejectDict
-                | UrlAction::RejectArray
-        )
-    }
-}
 
 #[derive(Debug)]
 pub struct UrlRewrite {
     pattern: Pattern,
+    /// Quantumult X's `url-and-header`: matched against the request head once the URL matches.
+    head: Option<Pattern>,
     pub replacement: String,
     pub action: UrlAction,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HeaderAction {
-    Add,
-    Del,
-    Replace,
-    ReplaceRegex,
+#[derive(Debug)]
+enum HeaderEdit {
+    Add(HeaderName, HeaderValue),
+    Del(HeaderName),
+    Replace(HeaderName, HeaderValue),
+    ReplaceRegex(HeaderName, Pattern, String),
+    /// Quantumult X's `request-header` and `response-header`: a replacement over the whole
+    /// head, its first line included.
+    Text(Pattern, String),
 }
 
 #[derive(Debug)]
 pub struct HeaderRewrite {
     response: bool,
     pattern: Pattern,
-    action: HeaderAction,
-    name: HeaderName,
-    value: HeaderValue,
-    value_regex: Option<Pattern>,
-    replacement: String,
+    conditions: HeadConditions,
+    edit: HeaderEdit,
 }
 
 #[derive(Debug)]
@@ -94,15 +55,23 @@ struct BodyReplacement {
 }
 
 #[derive(Debug)]
+enum BodyAction {
+    Replace(Vec<BodyReplacement>),
+    Jq(Jq),
+}
+
+#[derive(Debug)]
 pub struct BodyRewrite {
     response: bool,
     pattern: Pattern,
-    replacements: Vec<BodyReplacement>,
+    conditions: HeadConditions,
+    action: BodyAction,
 }
 
 #[derive(Debug)]
 pub struct MapLocal {
     pattern: Pattern,
+    conditions: HeadConditions,
     pub status: StatusCode,
     pub header: HeaderMap,
     pub body: Vec<u8>,
@@ -112,8 +81,10 @@ pub struct MapLocal {
 pub struct Rules {
     pub(crate) url_rewrites: Vec<UrlRewrite>,
     pub(crate) header_rewrites: Vec<HeaderRewrite>,
-    pub(crate) body_rewrites: Vec<BodyRewrite>,
+    pub(crate) body_rewrites: Vec<std::sync::Arc<BodyRewrite>>,
     pub(crate) map_locals: Vec<MapLocal>,
+    /// Loon's `mock-request-body`: bodies a request goes upstream with instead of its own.
+    pub(crate) request_mocks: Vec<MapLocal>,
     pub(crate) scripts: Vec<std::sync::Arc<Script>>,
 }
 
@@ -121,218 +92,131 @@ pub fn tiny_gif() -> Vec<u8> {
     decode_base64(TINY_GIF_BASE64).unwrap_or_default()
 }
 
-pub(crate) fn parse_url_rewrite(line: &str) -> Result<UrlRewrite, String> {
-    let fields = split_fields(line)?;
-    if fields.len() < 2 {
-        return Err("expected a pattern and a replacement or type".to_string());
-    }
-    let args = texts(fields.get(1..).unwrap_or_default());
-    let first = args.first().copied().unwrap_or_default();
-    let mut action = UrlAction::Header;
-    let mut replacement = String::new();
-    match args.len() {
-        _ if first == "url" && args.len() >= 2 => {
-            action = url_action_of(args.get(1).copied().unwrap_or_default())?;
-            if let Some(third) = args.get(2) {
-                replacement = (*third).to_string();
-            }
-        }
-        1 => match UrlAction::named(first) {
-            Some(named) if named.rejects() => action = named,
-            _ => replacement = first.to_string(),
-        },
-        2 => {
-            let second = args.get(1).copied().unwrap_or_default();
-            if let Some(named) = UrlAction::named(second) {
-                (replacement, action) = (first.to_string(), named);
-            } else if let Some(named) = UrlAction::named(first) {
-                (action, replacement) = (named, second.to_string());
-            } else {
-                return Err(format!("unknown type {}", quote(second)));
-            }
-        }
-        _ => return Err("too many fields".to_string()),
-    }
-    if action.rejects() {
-        replacement.clear();
-    } else if replacement.is_empty() || replacement == "_" {
-        return Err(format!("{} needs a replacement URL", action.name()));
-    }
-    let pattern = Pattern::new(&field_text(&fields, 0))?;
+pub(crate) fn compile_url_rewrite(def: &UrlRewriteDef) -> Result<UrlRewrite, LineError> {
     Ok(UrlRewrite {
-        pattern,
-        replacement,
-        action,
+        pattern: Pattern::new(&def.pattern)?,
+        head: def.head.as_deref().map(Pattern::new).transpose()?,
+        replacement: def.replacement.clone(),
+        action: def.action,
     })
 }
 
-fn field_text(fields: &[Field], at: usize) -> String {
-    fields
-        .get(at)
-        .map(|field| field.text.clone())
-        .unwrap_or_default()
-}
-
-fn url_action_of(text: &str) -> Result<UrlAction, String> {
-    UrlAction::named(text).ok_or_else(|| format!("unknown type {}", quote(text)))
-}
-
-pub(crate) fn parse_header_rewrite(line: &str) -> Result<HeaderRewrite, String> {
-    let mut fields = split_fields(line)?;
-    let mut response = false;
-    if let Some(first) = fields.first() {
-        match first.text.to_ascii_lowercase().as_str() {
-            "http-response" => {
-                response = true;
-                fields.remove(0);
-            }
-            "http-request" => {
-                fields.remove(0);
-            }
-            _ => {}
+pub(crate) fn compile_header_rewrite(def: &HeaderRewriteDef) -> Result<HeaderRewrite, LineError> {
+    let edit = match &def.edit {
+        HeaderEditDef::Add(name, value) => HeaderEdit::Add(name.clone(), value.clone()),
+        HeaderEditDef::Del(name) => HeaderEdit::Del(name.clone()),
+        HeaderEditDef::Replace(name, value) => HeaderEdit::Replace(name.clone(), value.clone()),
+        HeaderEditDef::ReplaceRegex(name, pattern, with) => {
+            HeaderEdit::ReplaceRegex(name.clone(), Pattern::new(pattern)?, with.clone())
         }
-    }
-    if fields.len() < 3 {
-        return Err("expected a pattern, an action and a header name".to_string());
-    }
-    let action_text = field_text(&fields, 1).to_ascii_lowercase();
-    let name_text = canonical_header(&field_text(&fields, 2));
-    if matches!(name_text.as_str(), "Content-Length" | "Transfer-Encoding") {
-        return Err(format!(
-            "{name_text} frames the message and cannot be rewritten"
-        ));
-    }
-    let name = HeaderName::from_bytes(name_text.as_bytes())
-        .map_err(|_| format!("invalid header name {}", quote(&name_text)))?;
-    let rest = fields.get(3..).unwrap_or_default();
-    let mut value = HeaderValue::from_static("");
-    let mut value_regex = None;
-    let mut replacement = String::new();
-    let action = match action_text.as_str() {
-        "header-add" | "header-replace" => {
-            let text = fields
-                .get(2)
-                .map(|name_field| remainder(line, name_field))
-                .unwrap_or_default();
-            value = HeaderValue::from_str(&text)
-                .map_err(|_| format!("invalid header value {}", quote(&text)))?;
-            if action_text == "header-add" {
-                HeaderAction::Add
-            } else {
-                HeaderAction::Replace
-            }
+        HeaderEditDef::Text(pattern, with) => {
+            HeaderEdit::Text(Pattern::new(pattern)?, with.clone())
         }
-        "header-del" => HeaderAction::Del,
-        "header-replace-regex" => {
-            if rest.len() < 2 {
-                return Err("header-replace-regex needs a pattern and a replacement".to_string());
-            }
-            value_regex = Some(Pattern::new(&field_text(rest, 0))?);
-            replacement = field_text(rest, 1);
-            HeaderAction::ReplaceRegex
-        }
-        _ => return Err(format!("unknown action {}", quote(&field_text(&fields, 1)))),
     };
-    let pattern = Pattern::new(&field_text(&fields, 0))?;
     Ok(HeaderRewrite {
-        response,
-        pattern,
-        action,
-        name,
-        value,
-        value_regex,
-        replacement,
+        response: def.response,
+        pattern: Pattern::new(&def.pattern)?,
+        conditions: HeadConditions::compile(&def.conditions)?,
+        edit,
     })
 }
 
 impl HeaderRewrite {
-    fn apply(&self, header: &mut HeaderMap) -> bool {
-        match self.action {
-            HeaderAction::Add => {
-                header.append(self.name.clone(), self.value.clone());
+    /// The pattern and replacement of a rule that rewrites the whole head, which its caller
+    /// applies as only it knows the first line.
+    pub(crate) fn whole_head(&self) -> Option<(&Pattern, &str)> {
+        match &self.edit {
+            HeaderEdit::Text(pattern, replacement) => Some((pattern, replacement)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn apply(&self, header: &mut HeaderMap) -> bool {
+        match &self.edit {
+            HeaderEdit::Add(name, value) => {
+                header.append(name.clone(), value.clone());
             }
-            HeaderAction::Del => {
-                if !header.contains_key(&self.name) {
+            HeaderEdit::Del(name) => return header.remove(name).is_some(),
+            HeaderEdit::Replace(name, value) => {
+                if !header.contains_key(name) {
                     return false;
                 }
-                header.remove(&self.name);
+                header.insert(name.clone(), value.clone());
             }
-            HeaderAction::Replace => {
-                if !header.contains_key(&self.name) {
+            HeaderEdit::ReplaceRegex(name, regex, replacement) => {
+                if !header.contains_key(name) {
                     return false;
                 }
-                header.insert(self.name.clone(), self.value.clone());
-            }
-            HeaderAction::ReplaceRegex => {
-                if !header.contains_key(&self.name) {
-                    return false;
-                }
-                let Some(regex) = &self.value_regex else {
-                    return false;
-                };
                 let values: Vec<HeaderValue> = header
-                    .get_all(&self.name)
+                    .get_all(name)
                     .iter()
                     .map(|value| {
                         value
                             .to_str()
                             .ok()
-                            .and_then(|text| regex.replace(text, &self.replacement, true))
+                            .and_then(|text| regex.replace(text, replacement, true))
                             .and_then(|text| HeaderValue::from_str(&text).ok())
                             .unwrap_or_else(|| value.clone())
                     })
                     .collect();
-                header.remove(&self.name);
+                header.remove(name);
                 for value in values {
-                    header.append(self.name.clone(), value);
+                    header.append(name.clone(), value);
                 }
             }
+            HeaderEdit::Text(..) => return false,
         }
         true
     }
 }
 
-pub(crate) fn parse_body_rewrite(line: &str) -> Result<BodyRewrite, String> {
-    let fields = split_fields(line)?;
-    if fields.len() < 4 {
-        return Err("expected a type, a pattern and a regex with its replacement".to_string());
-    }
-    let first = field_text(&fields, 0);
-    let response = match first.to_ascii_lowercase().as_str() {
-        "http-request" => false,
-        "http-response" => true,
-        "http-request-jq" | "http-response-jq" => {
-            return Err("jq rewrites are not supported".to_string());
-        }
-        _ => return Err(format!("unknown type {}", quote(&first))),
+pub(crate) fn compile_body_rewrite(def: &BodyRewriteDef) -> Result<BodyRewrite, LineError> {
+    let action = match &def.action {
+        BodyActionDef::Replace(pairs) => BodyAction::Replace(
+            pairs
+                .iter()
+                .map(|(pattern, with)| {
+                    Ok(BodyReplacement {
+                        pattern: Pattern::multiline(pattern)?,
+                        with: with.clone(),
+                    })
+                })
+                .collect::<Result<_, LineError>>()?,
+        ),
+        BodyActionDef::Jq(expression) => BodyAction::Jq(Jq::compile(expression)?),
     };
-    let pairs = fields.get(2..).unwrap_or_default();
-    if pairs.len() % 2 != 0 {
-        return Err("a regex is missing its replacement".to_string());
-    }
-    let mut replacements = Vec::new();
-    for pair in pairs.chunks(2) {
-        let pattern = Pattern::multiline(&field_text(pair, 0))?;
-        replacements.push(BodyReplacement {
-            pattern,
-            with: field_text(pair, 1),
-        });
-    }
     Ok(BodyRewrite {
-        response,
-        pattern: Pattern::new(&field_text(&fields, 1))?,
-        replacements,
+        response: def.response,
+        pattern: Pattern::new(&def.pattern)?,
+        conditions: HeadConditions::compile(&def.conditions)?,
+        action,
     })
 }
 
 impl BodyRewrite {
     pub(crate) fn apply(&self, body: String) -> String {
-        self.replacements.iter().fold(body, |body, replacement| {
-            replacement
-                .pattern
-                .replace(&body, &replacement.with, true)
-                .unwrap_or(body)
-        })
+        match &self.action {
+            BodyAction::Replace(replacements) => {
+                replacements.iter().fold(body, |body, replacement| {
+                    replacement
+                        .pattern
+                        .replace(&body, &replacement.with, true)
+                        .unwrap_or(body)
+                })
+            }
+            BodyAction::Jq(jq) => match jq.run(&body) {
+                JqOutcome::Rewritten(rewritten) => rewritten,
+                JqOutcome::NotJson => {
+                    tracing::debug!("[MITM] jq rewrite skipped: the body is not JSON");
+                    body
+                }
+                JqOutcome::Empty => body,
+                JqOutcome::Failed(err) => {
+                    tracing::warn!("[MITM] jq rewrite failed: {err}");
+                    body
+                }
+            },
+        }
     }
 }
 
@@ -357,12 +241,12 @@ fn is_local(name: &str) -> bool {
     true
 }
 
-pub(crate) fn read_resource(dir: &Path, param: &str, name: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn read_resource(dir: &Path, param: &str, name: &str) -> Result<Vec<u8>, LineError> {
     if !is_local(name) {
-        return Err(format!(
+        return Err(LineError::resource(format!(
             "{param} {} is not a file in the resources directory",
             quote(name)
-        ));
+        )));
     }
     let path = dir.join(name);
     let info = std::fs::symlink_metadata(&path).map_err(|err| {
@@ -371,124 +255,104 @@ pub(crate) fn read_resource(dir: &Path, param: &str, name: &str) -> Result<Vec<u
             std::io::ErrorKind::PermissionDenied => "permission denied".to_string(),
             _ => "cannot be read".to_string(),
         };
-        format!("{param} {}: {reason}", quote(name))
+        LineError::resource(format!("{param} {}: {reason}", quote(name)))
     })?;
     if !info.file_type().is_file() {
-        return Err(format!("{param} {} is not a regular file", quote(name)));
+        return Err(LineError::resource(format!(
+            "{param} {} is not a regular file",
+            quote(name)
+        )));
     }
-    std::fs::read(&path).map_err(|_| format!("{param} {} cannot be read", quote(name)))
+    std::fs::read(&path)
+        .map_err(|_| LineError::resource(format!("{param} {} cannot be read", quote(name))))
 }
 
-fn mime_by_extension(name: &str) -> Option<&'static str> {
-    let ext = Path::new(name).extension()?.to_str()?.to_ascii_lowercase();
-    Some(match ext.as_str() {
-        "avif" => "image/avif",
-        "css" => "text/css; charset=utf-8",
-        "gif" => "image/gif",
-        "htm" | "html" => "text/html; charset=utf-8",
-        "jpeg" | "jpg" => "image/jpeg",
-        "js" | "mjs" => "text/javascript; charset=utf-8",
-        "json" => "application/json",
-        "pdf" => "application/pdf",
-        "png" => "image/png",
-        "svg" => "image/svg+xml",
-        "wasm" => "application/wasm",
-        "webp" => "image/webp",
-        "xml" => "text/xml; charset=utf-8",
-        "txt" => "text/plain; charset=utf-8",
-        _ => return None,
-    })
-}
-
-pub(crate) fn parse_map_local(line: &str, resources: &Path) -> Result<MapLocal, String> {
-    let fields = split_fields(line)?;
-    if fields.len() < 2 {
-        return Err("expected a pattern and the data to answer with".to_string());
-    }
-    let mut params = std::collections::HashMap::new();
-    for field in fields.get(1..).unwrap_or_default() {
-        let (key, value) = field
-            .text
-            .split_once('=')
-            .ok_or_else(|| format!("expected key=value, got {}", quote(&field.text)))?;
-        params.insert(key.to_ascii_lowercase(), value.to_string());
-    }
-    let get = |key: &str| params.get(key).map(String::as_str).unwrap_or_default();
-    let (body, content_type) = match get("data-type") {
-        "text" => (
-            get("data").as_bytes().to_vec(),
-            "text/plain; charset=utf-8".to_string(),
-        ),
-        "tiny-gif" => (tiny_gif(), "image/gif".to_string()),
-        "base64" => (
-            decode_base64(get("data")).map_err(|err| format!("data: {err}"))?,
-            "application/octet-stream".to_string(),
-        ),
-        "" | "file" => (
-            read_resource(resources, "data", get("data"))?,
-            mime_by_extension(get("data"))
-                .unwrap_or("application/octet-stream")
-                .to_string(),
-        ),
-        other => return Err(format!("unknown data-type {}", quote(other))),
+/// A `map-local` or `request-body-mock` line's rule, its body read from the resources
+/// directory when the line names a file.
+pub(crate) fn compile_map_local(
+    def: &MapLocalDef,
+    resources: &Path,
+) -> Result<(MapLocal, LineView), LineError> {
+    let body = match &def.body {
+        MapLocalBody::Text => def.data.as_bytes().to_vec(),
+        MapLocalBody::TinyGif => tiny_gif(),
+        MapLocalBody::Base64(bytes) => bytes.clone(),
+        MapLocalBody::File => read_resource(resources, "data", &def.data)?,
     };
-    let mut status = StatusCode::OK;
-    if let Some(text) = params.get("status-code") {
-        status = text
-            .parse::<u16>()
-            .ok()
-            .filter(|code| (200..=999).contains(code))
-            .and_then(|code| StatusCode::from_u16(code).ok())
-            .ok_or_else(|| format!("invalid status-code {}", quote(text)))?;
+    let mut header = def.header.clone();
+    if !header.contains_key(CONTENT_TYPE) {
+        header.insert(CONTENT_TYPE, HeaderValue::from_static(def.content_type));
     }
-    let mut header = HeaderMap::new();
-    let header_text = get("header");
-    if !header_text.is_empty() {
-        parse_map_local_header(header_text, &mut header)?;
-    }
-    if !header.contains_key(http::header::CONTENT_TYPE) {
-        let value =
-            HeaderValue::from_str(&content_type).map_err(|_| "invalid content type".to_string())?;
-        header.insert(http::header::CONTENT_TYPE, value);
-    }
-    Ok(MapLocal {
-        pattern: Pattern::new(&field_text(&fields, 0))?,
-        status,
+    let rule = MapLocal {
+        pattern: Pattern::new(&def.pattern)?,
+        conditions: HeadConditions::compile(&def.conditions)?,
+        status: def.status,
         header,
         body,
-    })
+    };
+    let data = match def.body {
+        MapLocalBody::TinyGif => "",
+        _ => &def.data,
+    };
+    let view = views::map_local_view(&rule, def.body.data_type(), data, def.request, &def.header);
+    Ok((rule, view))
 }
 
-fn parse_map_local_header(text: &str, header: &mut HeaderMap) -> Result<(), String> {
-    let decoded;
-    let (text, separator) = if text.contains(':') {
-        (text, '|')
-    } else {
-        let bytes = decode_base64(text).map_err(|err| format!("header: {err}"))?;
-        decoded = String::from_utf8_lossy(&bytes).into_owned();
-        (decoded.as_str(), '\n')
-    };
-    for line in text.split(separator) {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| format!("header {} has no value", quote(line)))?;
-        let name = HeaderName::from_bytes(name.trim().as_bytes())
-            .map_err(|_| format!("invalid header name {}", quote(name.trim())))?;
-        let value = HeaderValue::from_str(value.trim())
-            .map_err(|_| format!("invalid header value {}", quote(value.trim())))?;
-        header.append(name, value);
-    }
-    Ok(())
+#[cfg(test)]
+pub(crate) fn parse_url_rewrite(line: &str) -> Result<UrlRewrite, LineError> {
+    compile_url_rewrite(&concord_config::mitm::parse_url_rewrite(line)?)
+}
+
+#[cfg(test)]
+pub(crate) fn parse_header_rewrite(line: &str) -> Result<HeaderRewrite, LineError> {
+    compile_header_rewrite(&concord_config::mitm::parse_header_rewrite(line)?)
+}
+
+#[cfg(test)]
+pub(crate) fn parse_body_rewrite(line: &str) -> Result<BodyRewrite, LineError> {
+    compile_body_rewrite(&concord_config::mitm::parse_body_rewrite(line)?)
+}
+
+#[cfg(test)]
+pub(crate) fn parse_map_local(
+    line: &str,
+    resources: &Path,
+    request: bool,
+) -> Result<(MapLocal, LineView), LineError> {
+    compile_map_local(
+        &concord_config::mitm::parse_map_local(line, request)?,
+        resources,
+    )
+}
+
+fn first_local<'r>(rules: &'r [MapLocal], url: &str, heads: &Heads<'_>) -> Option<&'r MapLocal> {
+    rules
+        .iter()
+        .find(|rule| rule.pattern.is_match(url) && heads.allow(&rule.conditions))
 }
 
 impl Rules {
-    pub(crate) fn rewrite_url(&self, url: &str) -> Option<(&UrlRewrite, String)> {
+    pub(crate) fn acts_on_requests(&self) -> bool {
+        !self.url_rewrites.is_empty()
+            || !self.header_rewrites.is_empty()
+            || !self.body_rewrites.is_empty()
+            || !self.map_locals.is_empty()
+            || !self.request_mocks.is_empty()
+            || self.scripts.iter().any(|script| {
+                matches!(
+                    script.kind,
+                    ScriptKind::HttpRequest | ScriptKind::HttpResponse
+                )
+            })
+    }
+
+    pub(crate) fn rewrite_url(
+        &self,
+        url: &str,
+        heads: &Heads<'_>,
+    ) -> Option<(&UrlRewrite, String)> {
         for rule in &self.url_rewrites {
-            if !rule.pattern.is_match(url) {
+            if !rule.pattern.is_match(url) || !heads.request_allows(rule.head.as_ref()) {
                 continue;
             }
             if rule.action.rejects() {
@@ -500,36 +364,54 @@ impl Rules {
         None
     }
 
-    pub(crate) fn map_local(&self, url: &str) -> Option<&MapLocal> {
-        self.map_locals
-            .iter()
-            .find(|rule| rule.pattern.is_match(url))
+    pub(crate) fn map_local(&self, url: &str, heads: &Heads<'_>) -> Option<&MapLocal> {
+        first_local(&self.map_locals, url, heads)
     }
 
-    pub(crate) fn rewrite_headers(
+    pub(crate) fn request_mock(&self, url: &str, heads: &Heads<'_>) -> Option<&MapLocal> {
+        first_local(&self.request_mocks, url, heads)
+    }
+
+    /// The header rewrites for an exchange, picked before any of them runs so that each
+    /// condition reads the head as the phase began.
+    pub(crate) fn header_rewrites_for(
         &self,
         url: &str,
-        header: &mut HeaderMap,
         response: bool,
-    ) -> usize {
+        heads: &Heads<'_>,
+    ) -> Vec<&HeaderRewrite> {
         self.header_rewrites
             .iter()
             .filter(|rule| rule.response == response && rule.pattern.is_match(url))
-            .filter(|rule| rule.apply(header))
-            .count()
-    }
-
-    pub(crate) fn body_rewrites_for(&self, url: &str, response: bool) -> Vec<&BodyRewrite> {
-        self.body_rewrites
-            .iter()
-            .filter(|rule| rule.response == response && rule.pattern.is_match(url))
+            .filter(|rule| heads.allow(&rule.conditions))
             .collect()
     }
 
-    pub(crate) fn script_for(&self, url: &str, response: bool) -> Option<&std::sync::Arc<Script>> {
+    pub(crate) fn body_rewrites_for(
+        &self,
+        url: &str,
+        response: bool,
+        heads: &Heads<'_>,
+    ) -> Vec<std::sync::Arc<BodyRewrite>> {
+        self.body_rewrites
+            .iter()
+            .filter(|rule| rule.response == response && rule.pattern.is_match(url))
+            .filter(|rule| heads.allow(&rule.conditions))
+            .cloned()
+            .collect()
+    }
+
+    /// The first script whose URL and conditions match; one whose conditions do not
+    /// leaves the turn to the next.
+    pub(crate) fn script_for(
+        &self,
+        url: &str,
+        response: bool,
+        heads: &Heads<'_>,
+    ) -> Option<&std::sync::Arc<Script>> {
         self.scripts
             .iter()
-            .find(|script| script.matches_http(url, response))
+            .find(|script| script.matches_http(url, response) && heads.allow(&script.conditions))
     }
 }
 
@@ -597,6 +479,18 @@ mod tests {
         }
     }
 
+    fn rewrite_with<'r>(
+        rules: &'r Rules,
+        url: &str,
+        head: impl Fn() -> String,
+    ) -> Option<(&'r UrlRewrite, String)> {
+        rules.rewrite_url(url, &Heads::new(Some(&head), None))
+    }
+
+    fn local(line: &str, resources: &Path) -> Result<MapLocal, LineError> {
+        parse_map_local(line, resources, false).map(|(rule, _)| rule)
+    }
+
     fn rules_with(urls: &[&str]) -> Rules {
         let mut rules = Rules::default();
         for line in urls {
@@ -612,14 +506,58 @@ mod tests {
             r"^http://www\.google\.cn _ reject",
             r"^https://a\.com/(\w+)/(\d+) https://b.com/$2/$1 302",
         ]);
-        let (rule, replaced) = rules
-            .rewrite_url("http://www.google.cn/search?q=x")
-            .unwrap();
+        let (rule, replaced) =
+            rewrite_with(&rules, "http://www.google.cn/search?q=x", String::new).unwrap();
         assert_eq!(rule.action, UrlAction::Header);
         assert_eq!(replaced, "http://www.google.com/search?q=x");
-        let (_, replaced) = rules.rewrite_url("https://a.com/item/42").unwrap();
+        let (_, replaced) = rewrite_with(&rules, "https://a.com/item/42", String::new).unwrap();
         assert_eq!(replaced, "https://b.com/42/item");
-        assert!(rules.rewrite_url("https://c.com/").is_none());
+        assert!(rewrite_with(&rules, "https://c.com/", String::new).is_none());
+    }
+
+    #[test]
+    fn url_and_header_checks_the_head_after_the_url() {
+        let rules = rules_with(&[
+            r"^http:\/\/.+\/amdc\/mobileDispatch %E8%8F%9C%E9%B8%9F%E8%A3%B9%E8%A3%B9* url-and-header reject",
+            r#"^http://example\.com/resource1/1/ "\r\nUser-Agent: example-agent" url-and-header reject-dict"#,
+            r"^http://example\.com/resource1/1/ ^POST url-and-header 302 http://example.com/post",
+        ]);
+        let head = |method: &str, agent: &str| {
+            let text = format!(
+                "{method} /amdc/mobileDispatch HTTP/1.1\r\nHost: a.test\r\nUser-Agent: {agent}\r\n\r\n"
+            );
+            move || text.clone()
+        };
+        let cainiao = "%E8%8F%9C%E9%B8%9F%E8%A3%B9%E8%A3%B9/8.8.1 CFNetwork/1410";
+        let (rule, _) = rewrite_with(
+            &rules,
+            "http://1.2.3.4/amdc/mobileDispatch",
+            head("GET", cainiao),
+        )
+        .unwrap();
+        assert_eq!(rule.action, UrlAction::Reject);
+        assert!(
+            rewrite_with(
+                &rules,
+                "http://1.2.3.4/amdc/mobileDispatch",
+                head("GET", "Other/1")
+            )
+            .is_none()
+        );
+        let url = "http://example.com/resource1/1/x";
+        let (rule, _) = rewrite_with(&rules, url, head("GET", "example-agent")).unwrap();
+        assert_eq!(rule.action, UrlAction::RejectDict);
+        let (rule, replaced) = rewrite_with(&rules, url, head("POST", "curl")).unwrap();
+        assert_eq!(
+            (rule.action, replaced.as_str()),
+            (UrlAction::Redirect302, "http://example.com/postx")
+        );
+        assert!(rewrite_with(&rules, url, head("GET", "curl")).is_none());
+        let unbuilt = || -> String { panic!("the head is built only after the URL matches") };
+        assert!(rewrite_with(&rules, "https://other.test/", unbuilt).is_none());
+        for line in [r"^a ^POST url-and-header", r"^a (bad url-and-header reject"] {
+            assert!(parse_url_rewrite(line).is_err(), "{line}");
+        }
     }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
@@ -656,8 +594,12 @@ mod tests {
             ("referer", "http://a.com/x"),
             ("set-cookie", "c=d"),
         ]);
+        let picked = rules.header_rewrites_for("https://a.com/", false, &Heads::new(None, None));
         assert_eq!(
-            rules.rewrite_headers("https://a.com/", &mut header, false),
+            picked
+                .into_iter()
+                .filter(|rule| rule.apply(&mut header))
+                .count(),
             5
         );
         let get = |name: &str| {
@@ -676,6 +618,142 @@ mod tests {
         assert_eq!(get("set-cookie").as_deref(), Some("c=d"));
         assert_eq!(get("cookie"), None);
         assert_eq!(header.len(), 5);
+    }
+
+    #[test]
+    fn head_conditions_read_each_head_once_and_only_past_the_url() {
+        let lines = [
+            r"http-response ^https://a\.com/ response-head ^HTTP/\S+\s200\s request-head ^POST\s header-add X-A 1",
+            r"http-response ^https://a\.com/ request-head ^POST\s header-add X-B 1",
+            r"http-response ^https://b\.com/ request-head ^GET header-add X-C 1",
+            r"http-response ^https://a\.com/ header-del X-D",
+        ];
+        let mut rules = Rules::default();
+        for line in lines {
+            rules
+                .header_rewrites
+                .push(parse_header_rewrite(line).unwrap_or_else(|e| panic!("{line}: {e}")));
+        }
+        let built = std::cell::Cell::new(0);
+        let picked = |request: &str, response: &str| {
+            let request = || {
+                built.set(built.get() + 1);
+                request.to_string()
+            };
+            let response = || response.to_string();
+            rules
+                .header_rewrites_for(
+                    "https://a.com/x",
+                    true,
+                    &Heads::new(Some(&request), Some(&response)),
+                )
+                .len()
+        };
+        assert_eq!(
+            picked("POST /x HTTP/1.1\r\n\r\n", "HTTP/1.1 200 OK\r\n\r\n"),
+            3
+        );
+        assert_eq!(
+            built.get(),
+            1,
+            "two conditions on the request head read it once"
+        );
+        assert_eq!(
+            picked("POST /x HTTP/1.1\r\n\r\n", "HTTP/2.0 404 Not Found\r\n\r\n"),
+            2
+        );
+        assert_eq!(
+            picked("GET /x HTTP/1.1\r\n\r\n", "HTTP/1.1 200 OK\r\n\r\n"),
+            1
+        );
+        assert_eq!(
+            rules
+                .header_rewrites_for("https://a.com/x", true, &Heads::new(None, None))
+                .len(),
+            3,
+            "a head not known yet lets its condition pass"
+        );
+        built.set(0);
+        let request = || {
+            built.set(built.get() + 1);
+            String::new()
+        };
+        rules.header_rewrites_for("https://c.com/", true, &Heads::new(Some(&request), None));
+        assert_eq!(
+            built.get(),
+            0,
+            "no rule matched the URL, so no head is written"
+        );
+    }
+
+    #[test]
+    fn head_conditions_and_whole_head_rewrites_parse() {
+        let rule = parse_header_rewrite(
+            r#"^https://a\.com/ header-text-replace "(\r\n)User-Agent:[^\r]*(\r\n)" "$1User-Agent: app$2""#,
+        )
+        .unwrap();
+        assert!(rule.whole_head().is_some());
+        assert!(!rule.apply(&mut HeaderMap::new()));
+        for line in [
+            r"http-request ^a response-head x header-add X 1",
+            r"http-response ^a request-head",
+            r"http-response ^a request-head a request-head b header-del X",
+            r"http-response ^a request-head ( header-del X",
+            r"^a header-text-replace only",
+            r"^a header-text-replace a b c",
+        ] {
+            assert!(parse_header_rewrite(line).is_err(), "{line}");
+        }
+        let body = parse_body_rewrite(r"http-response ^a request-head ^POST\s a b").unwrap();
+        assert!(body.conditions.request.is_some());
+        let jq = parse_body_rewrite(
+            r#"http-response-jq ^a response-head "^HTTP/\S+ 200 " request-head ^POST '.ad = false'"#,
+        )
+        .unwrap();
+        assert!(jq.conditions.response.is_some() && jq.conditions.request.is_some());
+        assert_eq!(jq.apply(r#"{"ad":true}"#.to_string()), r#"{"ad":false}"#);
+        for line in [
+            r"http-request ^a response-head x a b",
+            r"http-response ^a request-head x",
+            r"http-request-jq ^a response-head x '.a'",
+        ] {
+            assert!(parse_body_rewrite(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn local_answers_read_a_request_head_condition() {
+        let nowhere = Path::new("/nonexistent-resources");
+        let mut rules = Rules::default();
+        rules.map_locals.push(
+            local(
+                r#"^https://a\.com/ request-head ^POST\s data-type=text data="{}""#,
+                nowhere,
+            )
+            .unwrap(),
+        );
+        let post = || "POST / HTTP/1.1\r\n\r\n".to_string();
+        let get = || "GET / HTTP/1.1\r\n\r\n".to_string();
+        assert!(
+            rules
+                .map_local("https://a.com/", &Heads::new(Some(&post), None))
+                .is_some()
+        );
+        assert!(
+            rules
+                .map_local("https://a.com/", &Heads::new(Some(&get), None))
+                .is_none()
+        );
+        for line in [
+            r"^a response-head x data-type=text data=x",
+            r"^a request-head x",
+        ] {
+            assert!(local(line, nowhere).is_err(), "{line}");
+        }
+        assert!(
+            parse_map_local(r"^a data-type=text data=x status-code=500", nowhere, true).is_err()
+        );
+        assert!(parse_map_local(r"^a data-type=text data=x", nowhere, true).is_ok());
     }
 
     #[test]
@@ -698,7 +776,8 @@ mod tests {
         assert_eq!(got, "{\"ad\":false}\nreplaced\nkeep line");
         for line in [
             "http-response ^a only",
-            "http-response-jq ^a '.a'",
+            "http-response-jq ^a '.a ='",
+            "http-response-jq ^a",
             "sideways ^a b c",
         ] {
             assert!(parse_body_rewrite(line).is_err(), "{line}");
@@ -708,7 +787,7 @@ mod tests {
     #[test]
     fn map_local_parameters() {
         let nowhere = Path::new("/nonexistent-resources");
-        let rule = parse_map_local(
+        let rule = local(
             r#"^https://a\.com/json data-type=text data="{\"ok\":1}" status-code=500 header="Content-Type:application/json|X-A:b""#,
             nowhere,
         )
@@ -717,10 +796,10 @@ mod tests {
         assert_eq!(rule.status.as_u16(), 500);
         assert_eq!(rule.header.get("content-type").unwrap(), "application/json");
         assert_eq!(rule.header.get("x-a").unwrap(), "b");
-        let gif = parse_map_local(r"^https://a\.com/gif data-type=tiny-gif", nowhere).unwrap();
+        let gif = local(r"^https://a\.com/gif data-type=tiny-gif", nowhere).unwrap();
         assert_eq!(gif.header.get("content-type").unwrap(), "image/gif");
         assert!(!gif.body.is_empty());
-        let encoded = parse_map_local(
+        let encoded = local(
             r#"^https://a\.com/b data-type=base64 data="dGVzdA==" header=WC1COiBj"#,
             nowhere,
         )
@@ -733,7 +812,7 @@ mod tests {
             r"^https://a\.com/x data-type=base64 data=%%%",
             r"^https://a\.com/x novalue",
         ] {
-            assert!(parse_map_local(line, nowhere).is_err(), "{line}");
+            assert!(local(line, nowhere).is_err(), "{line}");
         }
     }
 
@@ -749,10 +828,10 @@ mod tests {
         std::os::unix::fs::symlink(home.path().join("secret.txt"), resources.join("link.txt"))
             .unwrap();
 
-        let rule = parse_map_local(r#"^https://a\.com/x data="a.json""#, &resources).unwrap();
+        let rule = local(r#"^https://a\.com/x data="a.json""#, &resources).unwrap();
         assert_eq!(rule.body, br#"{"ok":1}"#);
         assert_eq!(rule.header.get("content-type").unwrap(), "application/json");
-        let rule = parse_map_local(
+        let rule = local(
             r#"^https://a\.com/x data-type=file data="sub/b" header="Content-Type:text/x""#,
             &resources,
         )
@@ -771,10 +850,15 @@ mod tests {
             "",
         ] {
             let line = format!(r#"^https://a\.com/x data-type=file data="{data}""#);
-            let err = parse_map_local(&line, &resources).expect_err(data);
+            let err = local(&line, &resources).expect_err(data);
             assert!(
-                !err.contains(&resources.display().to_string()),
+                !err.message.contains(&resources.display().to_string()),
                 "{data}: {err}"
+            );
+            assert_eq!(
+                err.kind,
+                concord_config::mitm::IssueKind::Resource,
+                "{data}"
             );
         }
     }

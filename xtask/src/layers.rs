@@ -71,6 +71,7 @@ const LAYERS: &[(&str, Opt, &[&str])] = &[
             "concord-common",
             "concord-config",
             "concord-tls",
+            "concord-transport",
             "concord-platform",
         ],
     ),
@@ -134,7 +135,12 @@ const LAYERS: &[(&str, Opt, &[&str])] = &[
     (
         "concord-mitm",
         Opt::Inherit,
-        &["concord-common", "concord-platform", "concord-tls"],
+        &[
+            "concord-common",
+            "concord-config",
+            "concord-platform",
+            "concord-tls",
+        ],
     ),
     ("concord-proto", Opt::Inherit, &[]),
     (

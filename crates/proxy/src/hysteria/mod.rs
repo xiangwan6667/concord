@@ -9,7 +9,6 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -20,19 +19,17 @@ use concord_config::proxy::{HysteriaOpts, ProxyDef};
 use quinn::congestion::ControllerFactory;
 use quinn::{IdleTimeout, SendStream, TransportConfig, VarInt};
 use tokio::io::AsyncWriteExt;
-use tokio::task::JoinHandle;
 
 use self::stream::FastOpen;
 use self::udp::{Hub, Hy1Packets};
 use self::wire::{client_hello, client_request, read_server_hello, read_server_response};
 use crate::ctx::{BuildCtx, BuildError};
-use crate::link::EnvSlot;
 use crate::node::{Egress, info_for};
 use crate::quic::{
-    Brutal, Hop, ObfsSpec, QuicConn, QuicLink, QuicStream, SwitchFactory, io_error, quic_crypto,
+    Brutal, Hop, ObfsSpec, QuicConn, QuicLink, QuicStream, SharedConn, SwitchFactory, io_error,
+    node_crypto,
 };
-use crate::session_slot::{SessionSlot, overtaken};
-use crate::tlsmap::{TlsSpec, tls_options};
+use crate::session_slot::SessionSlot;
 use crate::util::{parse_bps, parse_ports};
 
 const DEFAULT_STREAM_WINDOW: u64 = 15_728_640;
@@ -53,22 +50,17 @@ const CLOSE_PROTOCOL: u32 = 1;
 const CLOSE_AUTH: u32 = 2;
 
 struct Hy1Conn {
-    quic: QuicConn,
-    hub: Arc<Hub>,
-    reader: JoinHandle<()>,
+    shared: SharedConn<Hub>,
     _control: QuicStream,
-}
-
-impl Drop for Hy1Conn {
-    fn drop(&mut self) {
-        self.reader.abort();
-        self.hub.close_all();
-    }
 }
 
 impl Hy1Conn {
     fn alive(&self) -> bool {
-        self.quic.conn.close_reason().is_none()
+        self.shared.alive()
+    }
+
+    fn close(&self) {
+        self.shared.close();
     }
 }
 
@@ -121,39 +113,21 @@ impl Hysteria {
                 return Err(err);
             }
         };
-        let hub = Arc::new(Hub::default());
-        let reader = {
-            let (conn, hub) = (quic.conn.clone(), hub.clone());
-            tokio::spawn(async move {
-                while let Ok(datagram) = conn.read_datagram().await {
-                    hub.dispatch(&datagram);
-                }
-                hub.close_all();
-            })
-        };
         Ok(Arc::new(Hy1Conn {
-            quic,
-            hub,
-            reader,
+            shared: SharedConn::new(quic, Hub::default()),
             _control: control,
         }))
     }
 
     async fn offer(&self, cx: &DialCx<'_>) -> io::Result<Arc<Hy1Conn>> {
-        if let (Some(conn), _) = self.current.get(Hy1Conn::alive) {
-            return Ok(conn);
-        }
-        let _turn = self.connecting.lock().await;
-        let (held, ticket) = self.current.get(Hy1Conn::alive);
-        if let Some(conn) = held {
-            return Ok(conn);
-        }
-        let conn = self.establish(cx).await?;
-        if !self.current.keep(ticket, &conn) {
-            conn.quic.conn.close(VarInt::from_u32(0), b"");
-            return Err(overtaken());
-        }
-        Ok(conn)
+        self.current
+            .offer(
+                &self.connecting,
+                Hy1Conn::alive,
+                || self.establish(cx),
+                |conn| conn.close(),
+            )
+            .await
     }
 
     fn forget(&self, conn: &Arc<Hy1Conn>) {
@@ -169,7 +143,7 @@ impl Hysteria {
         let mut last = None;
         for _ in 0..2 {
             let conn = self.offer(cx).await?;
-            match conn.quic.conn.open_bi().await {
+            match conn.shared.quic.conn.open_bi().await {
                 Ok((send, recv)) => return Ok((conn, send, recv)),
                 Err(err) => {
                     self.forget(&conn);
@@ -231,17 +205,18 @@ impl Outbound for Hysteria {
             )));
         }
         Ok(Arc::new(Hy1Packets::new(
-            conn.quic.conn.clone(),
-            conn.hub.clone(),
+            conn.shared.quic.conn.clone(),
+            conn.shared.hub.clone(),
             response.session,
             stream,
             conn,
+            &self.link.tasks,
         )))
     }
 
     fn reset_sessions(&self) {
         if let Some(conn) = self.current.reset() {
-            conn.quic.conn.close(VarInt::from_u32(0), b"");
+            conn.close();
         }
     }
 }
@@ -355,28 +330,7 @@ pub(crate) fn build(
             max: every,
         }
     });
-    let server_name = if opts.tls.server_name.is_empty() {
-        opts.server.clone()
-    } else {
-        opts.tls.server_name.clone()
-    };
-    let alpn = if opts.tls.alpn.is_empty() {
-        vec!["hysteria".to_string()]
-    } else {
-        opts.tls.alpn.clone()
-    };
-    let env_slot: EnvSlot = Arc::new(ArcSwapOption::empty());
-    let tls_opts = tls_options(
-        &opts.tls,
-        TlsSpec {
-            sni: server_name.clone(),
-            alpn: alpn.clone(),
-        },
-        ctx,
-        Some(&env_slot),
-    )?;
-    let alpn_refs: Vec<&str> = alpn.iter().map(String::as_str).collect();
-    let tls = quic_crypto(&tls_opts, ctx.trust.clone(), &alpn_refs, env_slot)?;
+    let (server_name, tls) = node_crypto(&opts.tls, &opts.server, "hysteria", ctx)?;
     let initial: Arc<dyn ControllerFactory + Send + Sync> = Arc::new(crate::quic::cubic());
     let controllers = SwitchFactory::new(initial);
     let port = if opts.port == 0 {
@@ -393,6 +347,7 @@ pub(crate) fn build(
         obfs,
         hop,
         datagram_frame: Some(DATAGRAM_FRAME),
+        tasks: ctx.tasks.clone(),
     };
     Ok(Arc::new(Hysteria {
         info: info_for(def, OutboundKind::Hysteria, &opts.server, opts.port, true),

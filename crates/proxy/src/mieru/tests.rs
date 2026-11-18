@@ -254,7 +254,14 @@ fn client(pattern: &str, factor: usize) -> (Arc<Underlay>, Server) {
     let (near, far) = tokio::io::duplex(1 << 20);
     let pattern = Arc::new(Pattern::parse(pattern).unwrap());
     let server = Server::new(far, &pattern);
-    let underlay = Underlay::start(Box::new(near), &key(), USER, pattern, factor);
+    let underlay = Underlay::start(
+        Box::new(near),
+        &key(),
+        USER,
+        pattern,
+        factor,
+        &Default::default(),
+    );
     (underlay, server)
 }
 

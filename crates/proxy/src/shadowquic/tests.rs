@@ -22,11 +22,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
 use super::wire::{control_entry, datagram, read_control_entry, split_datagram};
-use super::{Settings, ShadowQuic, controller};
+use super::{Settings, ShadowQuic, Shared, controller};
 use crate::addr_codec::SOCKS;
 use crate::ctx::BuildCtx;
 use crate::node::Egress;
-use crate::quic::{BbrProfile, Crypto, ObfsSpec, QuicLink, SwitchFactory};
+use crate::quic::{BbrProfile, Crypto, DatagramHub, ObfsSpec, QuicLink, SwitchFactory};
 use crate::testing::{HeldLookup, quic_server, test_env};
 
 type Routes = Arc<Mutex<HashMap<u16, (Arc<UdpSocket>, SocketAddr)>>>;
@@ -233,6 +233,7 @@ fn client_link(port: u16) -> QuicLink {
         .unwrap();
     let controllers = SwitchFactory::new(controller("", 32, BbrProfile::Standard));
     let mut link = QuicLink {
+        tasks: Default::default(),
         egress: Egress::new("sq", &Default::default()),
         server: Address::new("127.0.0.1", port),
         server_name: Some("localhost".to_string()),
@@ -394,6 +395,109 @@ async fn datagram_mode_keeps_one_id_per_destination() {
 #[tokio::test]
 async fn stream_mode_carries_packets_both_ways() {
     udp_session(true, Quirks::default()).await;
+}
+
+#[tokio::test]
+async fn peer_disconnect_wakes_udp_receivers() {
+    for over_stream in [false, true] {
+        let (port, _seen, server) = running(Quirks::default()).await;
+        let target = udp_echo().await;
+        let env = test_env();
+        let cx = DialCx::new(&env, Initiator::Direct, None);
+        let node = outbound(
+            port,
+            Settings {
+                over_stream,
+                ..plain()
+            },
+        );
+        let active = node.associate(&cx, &address(target)).await.unwrap();
+        let idle = node.associate(&cx, &address(target)).await.unwrap();
+        exchange(&*active, target, 10).await;
+
+        let receive = async { tokio::join!(recv_packet(&*active), recv_packet(&*idle)) };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(biased; receive, async {
+                server.close(0u32.into(), b"peer disconnected");
+            })
+        })
+        .await
+        .expect("UDP receivers stayed pending after the QUIC peer closed");
+        for result in [result.0, result.1] {
+            assert_eq!(result.err().unwrap().kind(), std::io::ErrorKind::BrokenPipe);
+        }
+    }
+}
+
+#[tokio::test]
+async fn control_eof_wakes_udp_receiver_with_an_open_uni_stream() {
+    let (server, port) = quic_server(b"h3", |socket| socket);
+    let node = outbound(
+        port,
+        Settings {
+            over_stream: true,
+            ..plain()
+        },
+    );
+    let env = test_env();
+    let cx = DialCx::new(&env, Initiator::Direct, None);
+    let target = Address::new("127.0.0.1", 53);
+    let (session, (peer, mut control, mut request)) =
+        tokio::join!(node.associate(&cx, &target), async {
+            let peer = server.accept().await.unwrap().await.unwrap();
+            let (control, mut request) = peer.accept_bi().await.unwrap();
+            assert_eq!(request.read_u8().await.unwrap(), super::ASSOCIATE_STREAM);
+            assert_eq!(
+                SOCKS.read(&mut request).await.unwrap(),
+                super::unspecified()
+            );
+            (peer, control, request)
+        });
+    let session = session.unwrap();
+    let id = 42;
+    control
+        .write_all(&control_entry(&target, id).unwrap())
+        .await
+        .unwrap();
+    let mut reply = peer.open_uni().await.unwrap();
+    reply.write_u16(id).await.unwrap();
+    reply.write_u16(4).await.unwrap();
+    reply.write_all(b"echo").await.unwrap();
+
+    let limit = Duration::from_secs(2);
+    let (data, from) = tokio::time::timeout(limit, recv_packet(&*session))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(data.as_slice(), b"echo");
+    assert_eq!(from, target);
+
+    let (result, ()) = tokio::time::timeout(limit, async {
+        tokio::join!(biased; recv_packet(&*session), async {
+            control.finish().unwrap();
+        })
+    })
+    .await
+    .expect("UDP receiver stayed pending after control EOF");
+    assert_eq!(result.err().unwrap().kind(), std::io::ErrorKind::BrokenPipe);
+    let request_end = tokio::time::timeout(limit, request.read(&mut [0]))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(request_end, None);
+    assert!(peer.close_reason().is_none());
+    drop(reply);
+}
+
+#[tokio::test]
+async fn connection_close_wakes_a_stream_waiting_for_its_udp_id() {
+    let hub = Shared::default();
+    let waiting = tokio::time::timeout(Duration::from_secs(2), hub.target(42));
+    let (result, ()) = tokio::join!(biased; waiting, async { hub.close_all() });
+    assert_eq!(
+        result.unwrap().err().unwrap().kind(),
+        std::io::ErrorKind::BrokenPipe
+    );
 }
 
 #[tokio::test]

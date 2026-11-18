@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use granit_parser::{Event, Options, Parser, ScalarStyle, Tag};
 use serde_json::{Number, Value};
@@ -17,6 +17,8 @@ pub struct SourceLines {
     pub proxies: Vec<u32>,
     pub proxy_groups: Vec<u32>,
     pub rules: Vec<u32>,
+    /// By list name, the lines of the `mitm` section's list items.
+    pub mitm: BTreeMap<String, Vec<u32>>,
 }
 
 #[derive(Debug, Default)]
@@ -349,21 +351,24 @@ impl Builder {
     }
 
     fn record_line(&mut self, line: usize) {
-        if self.frames.len() != 2 {
-            return;
-        }
-        let (Some(Frame::Map { key: Some(key), .. }), Some(Frame::Seq { .. })) =
-            (self.frames.first(), self.frames.get(1))
-        else {
-            return;
-        };
-        let target = match key.as_str() {
-            "proxies" => &mut self.lines.proxies,
-            "proxy-groups" => &mut self.lines.proxy_groups,
-            "rules" => &mut self.lines.rules,
+        let line = u32::try_from(line).unwrap_or(u32::MAX);
+        let target = match self.frames.as_slice() {
+            [Frame::Map { key: Some(key), .. }, Frame::Seq { .. }] => match key.as_str() {
+                "proxies" => &mut self.lines.proxies,
+                "proxy-groups" => &mut self.lines.proxy_groups,
+                "rules" => &mut self.lines.rules,
+                _ => return,
+            },
+            [
+                Frame::Map { key: Some(top), .. },
+                Frame::Map {
+                    key: Some(list), ..
+                },
+                Frame::Seq { .. },
+            ] if top == "mitm" => self.lines.mitm.entry(list.clone()).or_default(),
             _ => return,
         };
-        target.push(u32::try_from(line).unwrap_or(u32::MAX));
+        target.push(line);
     }
 
     fn scalar(

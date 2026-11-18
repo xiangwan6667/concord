@@ -1,7 +1,9 @@
 mod h2mux;
 mod inbox;
 mod padding;
+mod single;
 mod smux;
+pub(crate) use single::smux_stream;
 #[cfg(test)]
 mod tests;
 mod wire;
@@ -11,7 +13,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use concord_common::{Address, BoxStream};
+use concord_common::{Address, BoxStream, Tasks};
 use futures_util::future::BoxFuture;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -104,10 +106,11 @@ pub struct SingMuxClient {
     opts: SingMuxOptions,
     dial: MuxDialFn,
     sessions: tokio::sync::Mutex<Vec<Arc<dyn MuxSession>>>,
+    tasks: Tasks,
 }
 
 impl SingMuxClient {
-    pub fn new(mut opts: SingMuxOptions, dial: MuxDialFn) -> Arc<Self> {
+    pub fn new(mut opts: SingMuxOptions, dial: MuxDialFn, tasks: Tasks) -> Arc<Self> {
         if opts.max_streams == 0 && opts.max_connections == 0 {
             opts.min_streams = 8;
         }
@@ -118,6 +121,7 @@ impl SingMuxClient {
             opts,
             dial,
             sessions: tokio::sync::Mutex::new(Vec::new()),
+            tasks,
         })
     }
 
@@ -222,9 +226,9 @@ impl SingMuxClient {
             conn = padding_conn(conn);
         }
         let session: Arc<dyn MuxSession> = match self.opts.protocol {
-            MuxProtocol::Smux => Arc::new(SmuxSession::new(conn)),
-            MuxProtocol::Yamux => Arc::new(YamuxSession::new(conn)),
-            MuxProtocol::H2Mux => Arc::new(H2MuxSession::new(conn).await?),
+            MuxProtocol::Smux => Arc::new(SmuxSession::new(conn, &self.tasks)),
+            MuxProtocol::Yamux => Arc::new(YamuxSession::new(conn, &self.tasks)),
+            MuxProtocol::H2Mux => Arc::new(H2MuxSession::new(conn, &self.tasks).await?),
         };
         if let Some(brutal) = self.opts.brutal
             && let Err(err) = brutal_exchange(session.as_ref(), brutal.receive_bps).await

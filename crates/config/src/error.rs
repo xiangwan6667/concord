@@ -32,6 +32,16 @@ impl ConfigError {
         self.message = format!("{prefix}{}", self.message);
         self
     }
+
+    /// Names the section unless the message already names one of its keys.
+    pub fn within(self, section: &str) -> Self {
+        let named = self.message.trim_start_matches('\'');
+        if named.starts_with(&format!("{section}.")) || named.starts_with(&format!("{section}[")) {
+            self
+        } else {
+            self.prefixed(&format!("{section}: "))
+        }
+    }
 }
 
 impl fmt::Display for ConfigError {

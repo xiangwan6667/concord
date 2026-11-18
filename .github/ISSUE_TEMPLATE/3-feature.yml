@@ -1,0 +1,41 @@
+name: Feature request
+description: Something mihomo or sing-box has that Concord lacks.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Concord implements what mihomo and sing-box implement, within the scope of `docs/compatibility.md`. A request
+        without a reference implementation, or outside that scope, is closed.
+  - type: textarea
+    id: request
+    attributes:
+      label: Request
+    validations:
+      required: true
+  - type: input
+    id: reference
+    attributes:
+      label: Reference
+      description: >-
+        A link to the implementation or documentation in mihomo or sing-box: github.com/MetaCubeX/mihomo,
+        wiki.metacubex.one, github.com/SagerNet/sing-box or sing-box.sagernet.org.
+    validations:
+      required: true
+  - type: textarea
+    id: use
+    attributes:
+      label: What it is for
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: The request is within the scope of `docs/compatibility.md`, and I understand one outside it is closed.
+          required: true
+        - label: I searched the existing issues, open and closed.
+          required: true
+        - label: This issue asks for one thing.
+          required: true

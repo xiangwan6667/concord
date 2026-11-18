@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
-use concord_common::{BoxRead, BoxStream, BoxWrite};
+use concord_common::{BoxRead, BoxStream, BoxWrite, Tasks};
 use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -86,6 +86,7 @@ pub(super) struct Underlay {
     idle_limit: Duration,
     volume_limit: u64,
     bytes: AtomicU64,
+    tasks: Tasks,
 }
 
 struct Writer {
@@ -185,16 +186,18 @@ impl Underlay {
         user: &str,
         pattern: Arc<Pattern>,
         factor: usize,
+        tasks: &Tasks,
     ) -> Arc<Underlay> {
         let (out, queue) = mpsc::channel(OUT_QUEUE);
         let underlay = Arc::new(Underlay {
             out,
             sessions: Mutex::new(HashMap::new()),
-            die: CancellationToken::new(),
+            die: tasks.child_token(),
             last_used: Mutex::new(Instant::now()),
             idle_limit: IDLE_BASE + Duration::from_secs(rand::rng().random_range(0..61)),
             volume_limit: (512u64 << 20) << factor.min(8),
             bytes: AtomicU64::new(0),
+            tasks: tasks.clone(),
         });
         let (source, sink) = conn.into_split();
         let writer = Writer {
@@ -203,8 +206,8 @@ impl Underlay {
             pattern,
             seqs: HashMap::new(),
         };
-        tokio::spawn(write_loop(underlay.clone(), sink, queue, writer));
-        tokio::spawn(read_loop(underlay.clone(), source, *key));
+        tasks.spawn(write_loop(underlay.clone(), sink, queue, writer));
+        tasks.spawn(read_loop(underlay.clone(), source, *key));
         underlay
     }
 
@@ -253,11 +256,9 @@ impl Underlay {
     }
 
     pub(super) fn queue(&self, out: Out) {
-        if let Err(mpsc::error::TrySendError::Full(out)) = self.out.try_send(out)
-            && let Ok(handle) = tokio::runtime::Handle::try_current()
-        {
+        if let Err(mpsc::error::TrySendError::Full(out)) = self.out.try_send(out) {
             let sender = self.out.clone();
-            handle.spawn(async move {
+            self.tasks.spawn_detached(async move {
                 let _ = sender.send(out).await;
             });
         }

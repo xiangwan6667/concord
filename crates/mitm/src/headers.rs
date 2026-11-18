@@ -1,7 +1,8 @@
+use concord_config::mitm::text::canonical_header;
 use http::header::{HeaderMap, HeaderName, HeaderValue};
+use http::{StatusCode, Version};
 
 use crate::script::HeaderList;
-use crate::text::canonical_header;
 
 pub(crate) fn to_list(map: &HeaderMap) -> HeaderList {
     let mut list = HeaderList::new();
@@ -48,6 +49,70 @@ pub(crate) fn script_header(list: &HeaderList) -> HeaderMap {
         map.remove(name);
     }
     map
+}
+
+/// The head of a request as Quantumult X's `url-and-header` reads it: the request line, the
+/// host, then every header as `Name: value`, each line ending in CRLF, and the blank line.
+pub(crate) fn request_head(parts: &http::request::Parts, host: &str, version: &str) -> String {
+    let target = parts.uri.path_and_query().map_or("/", |pq| pq.as_str());
+    head_text(
+        &format!("{} {target} {version}", parts.method),
+        host,
+        &parts.headers,
+    )
+}
+
+/// The head of a response in the same form: the status line, then every header.
+pub(crate) fn response_head(status: StatusCode, version: &str, headers: &HeaderMap) -> String {
+    let line = match status.canonical_reason() {
+        Some(reason) => format!("{version} {} {reason}", status.as_u16()),
+        None => format!("{version} {}", status.as_u16()),
+    };
+    head_text(&line, "", headers)
+}
+
+pub(crate) fn head_text(first_line: &str, host: &str, headers: &HeaderMap) -> String {
+    let mut head = format!("{first_line}\r\n");
+    if !host.is_empty() {
+        head.push_str(&format!("Host: {host}\r\n"));
+    }
+    for (name, value) in headers {
+        if name == http::header::HOST {
+            continue;
+        }
+        head.push_str(&canonical_header(name.as_str()));
+        head.push_str(": ");
+        head.push_str(&String::from_utf8_lossy(value.as_bytes()));
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
+    head
+}
+
+/// A head [head_text] wrote and a rule then rewrote: its first line and its headers, or
+/// nothing when a line is not `Name: value` or names what cannot be put on the wire.
+pub(crate) fn parse_head(text: &str) -> Option<(String, HeaderMap)> {
+    let mut lines = text.split("\r\n");
+    let first = lines.next().filter(|line| !line.trim().is_empty())?;
+    let mut headers = HeaderMap::new();
+    for line in lines.take_while(|line| !line.is_empty()) {
+        let (name, value) = line.split_once(':')?;
+        headers.append(
+            HeaderName::from_bytes(name.trim().as_bytes()).ok()?,
+            HeaderValue::from_str(value.trim()).ok()?,
+        );
+    }
+    Some((first.to_string(), headers))
+}
+
+pub(crate) fn version_text(version: Version) -> &'static str {
+    match version {
+        Version::HTTP_09 => "HTTP/0.9",
+        Version::HTTP_10 => "HTTP/1.0",
+        Version::HTTP_2 => "HTTP/2.0",
+        Version::HTTP_3 => "HTTP/3.0",
+        _ => "HTTP/1.1",
+    }
 }
 
 pub(crate) fn text(map: &HeaderMap, name: impl http::header::AsHeaderName) -> &str {
@@ -111,6 +176,24 @@ pub(crate) fn remove_hop_by_hop(map: &mut HeaderMap, keep_upgrade: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_head_reads_back_as_it_was_written() {
+        let mut map = HeaderMap::new();
+        map.append("cache-control", "max-age=60".parse().unwrap());
+        map.append("set-cookie", "a=1".parse().unwrap());
+        map.append("set-cookie", "b=2".parse().unwrap());
+        let head = response_head(StatusCode::NOT_FOUND, "HTTP/1.1", &map);
+        assert_eq!(
+            head,
+            "HTTP/1.1 404 Not Found\r\nCache-Control: max-age=60\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\n"
+        );
+        let (line, read) = parse_head(&head).unwrap();
+        assert_eq!((line.as_str(), read), ("HTTP/1.1 404 Not Found", map));
+        assert!(parse_head("HTTP/1.1 200 OK\r\nNo colon\r\n\r\n").is_none());
+        assert!(parse_head("HTTP/1.1 200 OK\r\nBad Name: x\r\n\r\n").is_none());
+        assert!(parse_head("\r\n").is_none());
+    }
 
     #[test]
     fn lists_use_canonical_names_and_keep_every_value() {

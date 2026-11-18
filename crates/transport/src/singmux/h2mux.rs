@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use concord_common::BoxStream;
+use concord_common::{BoxStream, Tasks};
 use futures_util::future::BoxFuture;
 use h2::client::SendRequest;
 use http::{Method, Request, Uri};
@@ -37,14 +37,14 @@ pub(super) struct H2MuxSession {
 }
 
 impl H2MuxSession {
-    pub async fn new(io: BoxStream) -> io::Result<Self> {
+    pub async fn new(io: BoxStream, tasks: &Tasks) -> io::Result<Self> {
         let (sender, conn) = client_builder()
             .handshake::<_, Bytes>(io)
             .await
             .map_err(h2_io_error)?;
         let activity = Activity::new();
         activity.touch();
-        spawn_connection(conn, Some(IDLE_TIMEOUT), activity.clone());
+        spawn_connection(tasks, conn, Some(IDLE_TIMEOUT), activity.clone());
         Ok(H2MuxSession {
             sender: Mutex::new(sender),
             activity,

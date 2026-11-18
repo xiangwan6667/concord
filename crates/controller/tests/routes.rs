@@ -226,7 +226,7 @@ async fn the_secret_guards_every_route_and_a_websocket_may_pass_it_as_a_token() 
     assert_eq!(open.status, 401);
     assert_eq!(open.json(), json!({ "message": "Unauthorized" }));
     let hello = rig.call("GET", "/", None).await;
-    assert_eq!(hello.json(), json!({ "hello": "mihomo" }));
+    assert_eq!(hello.json(), json!({ "hello": "concord" }));
     let version = rig.call("GET", "/version", None).await.json();
     assert_eq!(version["meta"], true);
     assert!(version["version"].as_str().unwrap().starts_with('v'));
@@ -265,6 +265,80 @@ async fn a_preflight_needs_no_secret_and_gets_mihomos_cors() {
     assert!(reply.head.contains("access-control-allow-methods: put"));
     let actual = raw(rig.port, "GET", "/", &[("Origin", "http://board")], None).await;
     assert!(actual.head.contains("access-control-allow-origin: *"));
+    rig.control.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_that_lists_origins_lets_only_those_call_from_a_browser() {
+    let rig = Rig::new(false).await;
+    // A settings change drops the listener with every connection it accepted and binds again,
+    // so once this one ends, the next connection can only reach the new listener.
+    let mut held = TcpStream::connect(("127.0.0.1", rig.port)).await.unwrap();
+    rig.control
+        .config_patch(ConfigPatchParams {
+            external_controller_cors: Some(ControllerCorsPatch {
+                allow_origins: Some(vec!["http://board".into()]),
+                allow_private_network: None,
+            }),
+            ..ConfigPatchParams::default()
+        })
+        .await
+        .unwrap();
+    let ended = timeout(PATIENCE, held.read(&mut [0; 1]))
+        .await
+        .expect("the old listener stayed up");
+    assert!(!matches!(ended, Ok(1..)), "{ended:?}");
+    rig.wait_open(rig.port).await;
+    let listed = from_origin(&rig, "http://board").await;
+    assert!(
+        listed
+            .head
+            .contains("access-control-allow-origin: http://board")
+    );
+    let other = from_origin(&rig, "http://other").await;
+    assert!(!other.head.contains("access-control-allow-origin"));
+    rig.control.shutdown().await;
+}
+
+const LISTED_CORS: &str =
+    "external-controller-cors: {allow-origins: ['http://board'], allow-private-network: false}\n";
+
+async fn from_origin(rig: &Rig, origin: &str) -> Reply {
+    raw(rig.port, "GET", "/", &[("Origin", origin)], None).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_core_on_its_own_takes_the_allowed_origins_from_its_profile() {
+    let rig = Rig::with_profile(true, &format!("{PROFILE}{LISTED_CORS}")).await;
+    let listed = from_origin(&rig, "http://board").await;
+    assert!(
+        listed
+            .head
+            .contains("access-control-allow-origin: http://board")
+    );
+    let other = from_origin(&rig, "http://other").await;
+    assert!(!other.head.contains("access-control-allow-origin"));
+    rig.control.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_embedded_core_ignores_the_profiles_allowed_origins_with_a_warning() {
+    let rig = Rig::with_profile(false, &format!("{PROFILE}{LISTED_CORS}")).await;
+    let applied = rig
+        .control
+        .config_apply(ConfigApplyParams::default())
+        .await
+        .unwrap();
+    assert!(
+        applied.warnings.iter().any(|warning| {
+            warning.code.as_deref() == Some("host_owned_key")
+                && warning.path == "external-controller-cors"
+        }),
+        "{:?}",
+        applied.warnings
+    );
+    let other = from_origin(&rig, "http://other").await;
+    assert!(other.head.contains("access-control-allow-origin: *"));
     rig.control.shutdown().await;
 }
 

@@ -7,8 +7,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use concord_common::{CoreError, SockOpts, SocketFactory, io_error, ip4p_target};
 use concord_platform::{
-    Platform, bind_to_interface, enable_tfo, grow_udp_buffers, is_global_unicast, mptcp_protocol,
-    prepare_udp_socket, raw_socket_of, set_routing_mark,
+    IcmpSocket, Platform, bind_to_interface, enable_tfo, grow_udp_buffers, icmp_echo_socket,
+    is_global_unicast, mptcp_protocol, prepare_udp_socket, raw_socket_of, set_routing_mark,
 };
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
@@ -79,7 +79,6 @@ impl Sockets {
 
     /// Sends one ICMP echo request to `dst` from a direct socket and waits for its reply. The
     /// request is `message`: an ICMP echo request without its IP header.
-    #[cfg(any(unix, windows))]
     pub async fn ping(
         &self,
         dst: IpAddr,
@@ -95,7 +94,10 @@ impl Sockets {
         } else {
             Protocol::ICMPV4
         };
-        let (socket, datagram) = Self::new_icmp_socket(domain_of(dst), protocol)?;
+        let IcmpSocket {
+            socket,
+            keeps_identifier,
+        } = icmp_echo_socket(domain_of(dst), protocol)?;
         self.route(&socket, opts, dst)?;
         let any = match dst {
             IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
@@ -105,8 +107,6 @@ impl Sockets {
         socket.connect(&SocketAddr::new(dst, 0).into())?;
         socket.set_nonblocking(true)?;
         let socket = UdpSocket::from_std(socket.into())?;
-        // Linux gives a datagram ICMP socket its own identifier and rewrites the request's.
-        let identifier_kept = !(datagram && cfg!(any(target_os = "linux", target_os = "android")));
         socket.send(message).await?;
         let mut buf = [0u8; 2048];
         tokio::time::timeout(wait, async {
@@ -114,7 +114,7 @@ impl Sockets {
                 let len = socket.recv(&mut buf).await?;
                 if buf
                     .get(..len)
-                    .is_some_and(|reply| echo.is_answered_by(reply, identifier_kept))
+                    .is_some_and(|reply| echo.is_answered_by(reply, keeps_identifier))
                 {
                     return Ok(());
                 }
@@ -122,26 +122,6 @@ impl Sockets {
         })
         .await
         .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
-    }
-
-    /// Windows has no datagram ICMP socket; a raw one needs the privilege the TUN device needs.
-    #[cfg(windows)]
-    fn new_icmp_socket(domain: Domain, protocol: Protocol) -> io::Result<(Socket, bool)> {
-        Ok((Socket::new(domain, Type::RAW, Some(protocol))?, false))
-    }
-
-    #[cfg(unix)]
-    fn new_icmp_socket(domain: Domain, protocol: Protocol) -> io::Result<(Socket, bool)> {
-        match Socket::new(domain, Type::DGRAM, Some(protocol)) {
-            Ok(socket) => Ok((socket, true)),
-            Err(err)
-                if err.kind() == io::ErrorKind::PermissionDenied
-                    && cfg!(any(target_os = "linux", target_os = "android")) =>
-            {
-                Ok((Socket::new(domain, Type::RAW, Some(protocol))?, false))
-            }
-            Err(err) => Err(err),
-        }
     }
 
     fn check_pressure(&self) -> io::Result<()> {
@@ -219,14 +199,12 @@ impl Sockets {
     }
 }
 
-#[cfg(any(unix, windows))]
 struct EchoRequest {
     v6: bool,
     identifier: u16,
     sequence: u16,
 }
 
-#[cfg(any(unix, windows))]
 impl EchoRequest {
     fn parse(message: &[u8], v6: bool) -> Option<Self> {
         let [kind, 0, _, _, id0, id1, seq0, seq1, ..] = *message else {

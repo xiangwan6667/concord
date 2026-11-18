@@ -1,11 +1,11 @@
-//! mihomo's REST and WebSocket API (the "external controller") for dashboards.
+//! The Clash REST and WebSocket API (the "external controller") for dashboards.
 //! Every route calls the same `concord_api::Control` a host calls and converts
-//! the answer to mihomo's JSON; the controller keeps no state beyond its
-//! listener and the sessions on it.
+//! the answer to the JSON mihomo's controller writes; the controller keeps no
+//! state beyond its listener and the sessions on it.
 
 mod http;
-mod mihomo;
 mod routes;
+mod shapes;
 mod stream;
 
 use std::convert::Infallible;
@@ -13,7 +13,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use concord_api::{Control, ControllerSettings};
+use concord_api::{Control, ControllerCors, ControllerSettings};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
@@ -82,6 +82,7 @@ async fn run(control: Arc<Control>, listener: TcpListener, settings: &Controller
         stop: stop.clone(),
     });
     let secret: Arc<str> = Arc::from(settings.secret.as_str());
+    let cors = Arc::new(settings.cors.clone());
     let mut backoff = Duration::ZERO;
     loop {
         let (socket, _) = match listener.accept().await {
@@ -95,11 +96,12 @@ async fn run(control: Arc<Control>, listener: TcpListener, settings: &Controller
             }
         };
         backoff = Duration::ZERO;
-        let (routes, secret, stop) = (routes.clone(), secret.clone(), stop.clone());
+        let (routes, secret, cors, stop) =
+            (routes.clone(), secret.clone(), cors.clone(), stop.clone());
         tokio::spawn(async move {
             let service = service_fn(move |request| {
-                let (routes, secret) = (routes.clone(), secret.clone());
-                async move { Ok::<_, Infallible>(answer(&routes, &secret, request).await) }
+                let (routes, secret, cors) = (routes.clone(), secret.clone(), cors.clone());
+                async move { Ok::<_, Infallible>(answer(&routes, &secret, &cors, request).await) }
             });
             // mihomo's and sing-box's controllers set no ReadHeaderTimeout; hyper's default is 30 s.
             let connection = http1::Builder::new()
@@ -126,18 +128,19 @@ fn connection_error(err: &io::Error) -> bool {
 async fn answer(
     routes: &Routes,
     secret: &str,
+    cors: &ControllerCors,
     request: ::http::Request<hyper::body::Incoming>,
 ) -> ::http::Response<http::Body> {
     let method = request.method().clone();
     let headers = request.headers().clone();
     if http::is_preflight(&method, &headers) {
-        return http::preflight(&headers);
+        return http::preflight(&headers, cors);
     }
     let mut response = if http::authorized(secret, &headers, request.uri()) {
         routes.handle(request).await
     } else {
         http::unauthorized()
     };
-    http::cors(&headers, &method, &mut response);
+    http::cors(&headers, &method, cors, &mut response);
     response
 }

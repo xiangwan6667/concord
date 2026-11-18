@@ -399,7 +399,7 @@ fn harness(opts: SingMuxOptions) -> Harness {
         })
     };
     Harness {
-        client: SingMuxClient::new(opts, dial),
+        client: SingMuxClient::new(opts, dial, Default::default()),
         log,
         dials,
         servers,

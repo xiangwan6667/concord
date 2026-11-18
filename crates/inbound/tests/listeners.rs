@@ -119,7 +119,7 @@ async fn a_bind_conflict_is_reported_and_the_other_ports_stay_up() {
         ..Default::default()
     };
     let fake = Fake::echo();
-    let errors = listeners.reconcile(&spec, fake.clone()).await;
+    let errors = open(&listeners, &spec, fake.clone()).await;
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert_eq!(errors[0].kind, ListenerKind::Http);
     assert_eq!(errors[0].source.kind(), io::ErrorKind::AddrInUse);
@@ -129,7 +129,7 @@ async fn a_bind_conflict_is_reported_and_the_other_ports_stay_up() {
     assert_eq!(kinds, [ListenerKind::Mixed, ListenerKind::Socks]);
 
     drop(taken);
-    assert!(listeners.reconcile(&spec, fake).await.is_empty());
+    assert!(open(&listeners, &spec, fake).await.is_empty());
     assert_eq!(listeners.bound().await.len(), 3);
 }
 

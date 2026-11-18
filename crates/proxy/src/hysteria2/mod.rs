@@ -7,31 +7,27 @@ use std::io;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use concord_common::{
     Address, BoxStream, DialCx, DialEnv, Initiator, Outbound, OutboundInfo, OutboundKind,
-    PacketSession,
+    PacketSession, Tasks,
 };
 use concord_config::proxy::{Hysteria2Opts, ProxyDef};
 use quinn::congestion::ControllerFactory;
 use quinn::{IdleTimeout, TransportConfig, VarInt};
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
 
 use self::realm::Realm;
 use self::stream::Hy2Stream;
 use self::udp::{Hub, Hy2Packets};
 use crate::ctx::{BuildCtx, BuildError};
 use crate::lazy::{HeadFirst, Kick};
-use crate::link::EnvSlot;
 use crate::node::{Egress, info_for};
 use crate::quic::{
-    BbrProfile, Brutal, Hop, ObfsSpec, QuicConn, QuicLink, QuicStream, SwitchFactory, bbr_factory,
-    io_error, quic_crypto,
+    BbrProfile, Brutal, Hop, ObfsSpec, QuicLink, QuicStream, SharedConn, SwitchFactory,
+    bbr_factory, io_error, node_crypto,
 };
-use crate::session_slot::{SessionSlot, Ticket, overtaken};
-use crate::tlsmap::{TlsSpec, tls_options};
+use crate::session_slot::{SessionSlot, Ticket};
 use crate::util::{lock, parse_bps, parse_ports};
 
 /// quic-go's MaxDatagramSize, the `max_datagram_frame_size` a Hysteria2 server sees from
@@ -48,22 +44,17 @@ const AUTH_OK: u16 = 233;
 const DEFAULT_CWND: u32 = 32;
 
 struct Hy2Conn {
-    quic: QuicConn,
-    hub: Arc<Hub>,
+    shared: SharedConn<Hub>,
     udp: bool,
-    reader: JoinHandle<()>,
-}
-
-impl Drop for Hy2Conn {
-    fn drop(&mut self) {
-        self.reader.abort();
-        self.hub.close_all();
-    }
 }
 
 impl Hy2Conn {
     fn alive(&self) -> bool {
-        self.quic.conn.close_reason().is_none()
+        self.shared.alive()
+    }
+
+    fn close(&self) {
+        self.shared.close();
     }
 }
 
@@ -108,11 +99,16 @@ struct AuthReply {
     rx_auto: bool,
 }
 
-async fn authenticate(conn: &quinn::Connection, password: &str, rx: u64) -> io::Result<AuthReply> {
+async fn authenticate(
+    conn: &quinn::Connection,
+    password: &str,
+    rx: u64,
+    tasks: &Tasks,
+) -> io::Result<AuthReply> {
     let (mut driver, mut requests) = h3::client::new(h3_quinn::Connection::new(conn.clone()))
         .await
         .map_err(io_error)?;
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let _ = driver.wait_idle().await;
     });
     let request = http::Request::builder()
@@ -127,7 +123,7 @@ async fn authenticate(conn: &quinn::Connection, password: &str, rx: u64) -> io::
     exchange.finish().await.map_err(io_error)?;
     let response = exchange.recv_response().await.map_err(io_error)?;
     let held = conn.clone();
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let _requests = requests;
         held.closed().await;
     });
@@ -165,7 +161,7 @@ impl Hysteria2 {
             }
             None => self.link.connect_any(cx).await?,
         };
-        let reply = authenticate(&quic.conn, &self.password, self.down).await?;
+        let reply = authenticate(&quic.conn, &self.password, self.down, &quic.tasks).await?;
         let mut rate = reply.rx;
         if rate == 0 || rate > self.up {
             rate = self.up;
@@ -176,46 +172,29 @@ impl Hysteria2 {
         {
             switch.replace_brutal(Brutal::hysteria2(rate, quic.conn.rtt(), Instant::now()));
         }
-        let hub = Arc::new(Hub::default());
-        let reader = {
-            let (conn, hub) = (quic.conn.clone(), hub.clone());
-            tokio::spawn(async move {
-                while let Ok(datagram) = conn.read_datagram().await {
-                    hub.dispatch(&datagram);
-                }
-                hub.close_all();
-            })
-        };
         Ok(Arc::new(Hy2Conn {
-            quic,
-            hub,
+            shared: SharedConn::new(quic, Hub::default()),
             udp: reply.udp,
-            reader,
         }))
     }
 
-    fn live(&self) -> Option<Arc<Hy2Conn>> {
-        self.current.get(Hy2Conn::alive).0
-    }
-
     async fn offer(&self, cx: &DialCx<'_>) -> io::Result<Arc<Hy2Conn>> {
-        if let Some(conn) = self.live() {
-            return Ok(conn);
+        match self.handshake_timeout {
+            None => {
+                self.current
+                    .offer(
+                        &self.connecting,
+                        Hy2Conn::alive,
+                        || self.establish(cx),
+                        |conn| conn.close(),
+                    )
+                    .await
+            }
+            Some(limit) => match self.current.get(Hy2Conn::alive) {
+                (Some(conn), _) => Ok(conn),
+                (None, _) => self.shared_offer(cx, limit).await,
+            },
         }
-        if let Some(limit) = self.handshake_timeout {
-            return self.shared_offer(cx, limit).await;
-        }
-        let _turn = self.connecting.lock().await;
-        let (held, ticket) = self.current.get(Hy2Conn::alive);
-        if let Some(conn) = held {
-            return Ok(conn);
-        }
-        let conn = self.establish(cx).await?;
-        if !self.current.keep(ticket, &conn) {
-            conn.quic.conn.close(VarInt::from_u32(0), b"");
-            return Err(overtaken());
-        }
-        Ok(conn)
     }
 
     /// sing-quic's offer with a handshake timeout: the handshake runs on its own under
@@ -255,7 +234,7 @@ impl Hysteria2 {
         let (done, offer) = watch::channel(None);
         let me = self.me.clone();
         let mine = offer.clone();
-        tokio::spawn(async move {
+        self.link.tasks.spawn(async move {
             let Some(me) = me.upgrade() else {
                 return;
             };
@@ -263,14 +242,9 @@ impl Hysteria2 {
             let result = tokio::time::timeout(limit, me.establish(&cx))
                 .await
                 .unwrap_or_else(|_| Err(io::Error::from(io::ErrorKind::TimedOut)));
-            let outcome = match result {
-                Ok(conn) if me.current.keep(ticket, &conn) => Ok(conn),
-                Ok(conn) => {
-                    conn.quic.conn.close(VarInt::from_u32(0), b"");
-                    Err(Arc::new(overtaken()))
-                }
-                Err(err) => Err(Arc::new(err)),
-            };
+            let outcome = result
+                .and_then(|conn| me.current.adopt(ticket, conn, |conn| conn.close()))
+                .map_err(Arc::new);
             {
                 let mut pending = lock(&me.pending);
                 if pending
@@ -294,7 +268,7 @@ impl Outbound for Hysteria2 {
 
     async fn connect(&self, cx: &DialCx<'_>, dst: &Address) -> io::Result<BoxStream> {
         let conn = self.offer(cx).await?;
-        let (send, recv) = conn.quic.conn.open_bi().await.map_err(io_error)?;
+        let (send, recv) = conn.shared.quic.conn.open_bi().await.map_err(io_error)?;
         let head = wire::tcp_request(&dst.to_string());
         let stream = HeadFirst::new(QuicStream::new(send, recv, Box::new(conn)), head);
         Ok(Box::new(Kick::new(Hy2Stream::new(stream))))
@@ -310,8 +284,8 @@ impl Outbound for Hysteria2 {
             return Err(io::Error::other("UDP disabled by server"));
         }
         Ok(Arc::new(Hy2Packets::new(
-            conn.quic.conn.clone(),
-            conn.hub.clone(),
+            conn.shared.quic.conn.clone(),
+            conn.shared.hub.clone(),
             self.udp_mtu,
             conn,
         )))
@@ -320,7 +294,7 @@ impl Outbound for Hysteria2 {
     fn reset_sessions(&self) {
         *lock(&self.pending) = None;
         if let Some(conn) = self.current.reset() {
-            conn.quic.conn.close(VarInt::from_u32(0), b"");
+            conn.close();
         }
     }
 }
@@ -439,28 +413,7 @@ fn build_hy2(
         let (min, max) = hop_interval(&opts.hop_interval)?;
         Some(Hop { ports, min, max })
     };
-    let server_name = if opts.tls.server_name.is_empty() {
-        opts.server.clone()
-    } else {
-        opts.tls.server_name.clone()
-    };
-    let alpn = if opts.tls.alpn.is_empty() {
-        vec!["h3".to_string()]
-    } else {
-        opts.tls.alpn.clone()
-    };
-    let env_slot: EnvSlot = Arc::new(ArcSwapOption::empty());
-    let tls_opts = tls_options(
-        &opts.tls,
-        TlsSpec {
-            sni: server_name.clone(),
-            alpn: alpn.clone(),
-        },
-        ctx,
-        Some(&env_slot),
-    )?;
-    let alpn_refs: Vec<&str> = alpn.iter().map(String::as_str).collect();
-    let tls = quic_crypto(&tls_opts, ctx.trust.clone(), &alpn_refs, env_slot)?;
+    let (server_name, tls) = node_crypto(&opts.tls, &opts.server, "h3", ctx)?;
     let controllers = SwitchFactory::new(initial_controller(opts));
     let port = if opts.port == 0 {
         hop.as_ref()
@@ -478,6 +431,7 @@ fn build_hy2(
         obfs: obfs_spec(opts)?,
         hop,
         datagram_frame: Some(DATAGRAM_FRAME),
+        tasks: ctx.tasks.clone(),
     };
     Ok(Arc::new_cyclic(|me| Hysteria2 {
         me: me.clone(),
@@ -594,7 +548,9 @@ mod tests {
     }
 
     /// A server that lets every client in and counts the connections it accepts.
-    fn accepting_server() -> (u16, Arc<std::sync::atomic::AtomicUsize>, quinn::Endpoint) {
+    fn accepting_server(
+        on_auth: impl Fn(quinn::Connection) + Clone + Send + 'static,
+    ) -> (u16, Arc<std::sync::atomic::AtomicUsize>, quinn::Endpoint) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let (endpoint, port) = crate::testing::quic_server(b"h3", |socket| socket);
         let accepted = Arc::new(AtomicUsize::new(0));
@@ -602,6 +558,7 @@ mod tests {
         tokio::spawn(async move {
             while let Some(incoming) = listening.accept().await {
                 counted.fetch_add(1, Ordering::SeqCst);
+                let on_auth = on_auth.clone();
                 tokio::spawn(async move {
                     let Ok(conn) = incoming.await else {
                         return;
@@ -616,9 +573,14 @@ mod tests {
                     if let Ok(Some(request)) = server.accept().await
                         && let Ok((_, mut stream)) = request.resolve_request().await
                     {
-                        let reply = http::Response::builder().status(AUTH_OK).body(()).unwrap();
+                        let reply = http::Response::builder()
+                            .status(AUTH_OK)
+                            .header("Hysteria-UDP", "false")
+                            .body(())
+                            .unwrap();
                         let _ = stream.send_response(reply).await;
                         let _ = stream.finish().await;
+                        on_auth(conn.clone());
                     }
                     conn.closed().await;
                     drop(server);
@@ -626,6 +588,63 @@ mod tests {
             }
         });
         (port, accepted, endpoint)
+    }
+
+    #[tokio::test]
+    async fn server_udp_refusal_keeps_the_datagram_reader_running() {
+        use concord_config::{Capabilities, ProxyParse, parse_proxy};
+        let (authenticated, mut peers) = tokio::sync::mpsc::unbounded_channel();
+        let (port, _, _server) = accepting_server(move |peer| {
+            let _ = authenticated.send(peer);
+        });
+        let node = serde_json::json!({
+            "name": "n", "type": "hysteria2", "server": "127.0.0.1", "port": port,
+            "password": "pw", "sni": "localhost", "skip-cert-verify": true,
+        });
+        let Ok(ProxyParse::Ok(def)) = parse_proxy(node.as_object().unwrap(), &Capabilities::full())
+        else {
+            panic!("does not parse");
+        };
+        let concord_config::proxy::ProxyKind::Hysteria2(opts) = &def.kind else {
+            panic!("not hysteria2");
+        };
+        let ctx = BuildCtx::new(concord_tls::TrustStore::new(b"", Vec::new()));
+        let built = build_hy2(&def, opts, &ctx).unwrap();
+        assert!(built.info().udp);
+        let env = crate::testing::test_env();
+        let cx = DialCx::new(&env, Initiator::Other, None);
+        let from = "127.0.0.1:53";
+        let target = Address::parse(from).unwrap();
+        let err = built.associate(&cx, &target).await.err().unwrap();
+        assert_eq!(err.to_string(), "UDP disabled by server");
+
+        let conn = built.offer(&cx).await.unwrap();
+        let (session, mut packets) = conn.shared.hub.register();
+        let limit = Duration::from_secs(2);
+        let peer = tokio::time::timeout(limit, peers.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut data = Vec::new();
+        wire::put_udp_header(
+            &mut data,
+            &wire::UdpHeader {
+                session,
+                packet: 0,
+                fragment: 0,
+                fragments: 1,
+                addr: from,
+            },
+        );
+        data.extend_from_slice(b"reader");
+        peer.send_datagram(bytes::Bytes::from(data)).unwrap();
+
+        let (addr, payload) = tokio::time::timeout(limit, packets.recv())
+            .await
+            .expect("the datagram reader did not dispatch")
+            .unwrap();
+        assert_eq!(addr, target);
+        assert_eq!(payload.as_ref(), b"reader");
     }
 
     #[tokio::test]
@@ -637,7 +656,7 @@ mod tests {
             serde_json::json!({}),
             serde_json::json!({"handshake-timeout": 5}),
         ] {
-            let (port, accepted, _server) = accepting_server();
+            let (port, accepted, _server) = accepting_server(|_| {});
             let mut node = serde_json::json!({
                 "name": "n", "type": "hysteria2", "server": "localhost", "port": port,
                 "password": "pw", "sni": "localhost", "skip-cert-verify": true,
@@ -679,6 +698,60 @@ mod tests {
             );
             assert!(outcome.is_err(), "{extra}");
         }
+    }
+
+    fn tracked_hy2(port: u16, tracked: &crate::testing::Tracked) -> Arc<Hysteria2> {
+        use concord_config::{Capabilities, ProxyParse, parse_proxy};
+        let node = serde_json::json!({
+            "name": "n", "type": "hysteria2", "server": "localhost", "port": port,
+            "password": "pw", "sni": "localhost", "skip-cert-verify": true,
+        });
+        let Ok(ProxyParse::Ok(def)) = parse_proxy(node.as_object().unwrap(), &Capabilities::full())
+        else {
+            panic!("does not parse");
+        };
+        let concord_config::proxy::ProxyKind::Hysteria2(opts) = &def.kind else {
+            panic!("not hysteria2");
+        };
+        build_hy2(&def, opts, &tracked.ctx()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_stop_ends_a_connection_s_tasks_once_the_outbound_is_gone() {
+        let (authenticated, mut peers) = tokio::sync::mpsc::unbounded_channel();
+        let (port, _, _server) = accepting_server(move |peer| {
+            let _ = authenticated.send(peer);
+        });
+        let tracked = crate::testing::Tracked::new();
+        let built = tracked_hy2(port, &tracked);
+        let env = crate::testing::test_env();
+        built
+            .offer(&DialCx::new(&env, Initiator::Other, None))
+            .await
+            .unwrap();
+        let peer = peers.recv().await.unwrap();
+        assert!(tracked.running() > 0, "the connection is not tracked");
+        tracked.stop();
+        tokio::time::timeout(Duration::from_secs(5), peer.closed())
+            .await
+            .expect("the server never learned the connection closed");
+        drop(built);
+        assert!(tracked.ended_within(Duration::from_secs(5)).await);
+    }
+
+    #[tokio::test]
+    async fn a_connection_s_tasks_end_when_its_outbound_is_dropped() {
+        let (port, _, _server) = accepting_server(|_| {});
+        let tracked = crate::testing::Tracked::new();
+        let built = tracked_hy2(port, &tracked);
+        let env = crate::testing::test_env();
+        built
+            .offer(&DialCx::new(&env, Initiator::Other, None))
+            .await
+            .unwrap();
+        assert!(tracked.running() > 0, "the connection is not tracked");
+        drop(built);
+        assert!(tracked.ended_within(Duration::from_secs(5)).await);
     }
 
     #[tokio::test]

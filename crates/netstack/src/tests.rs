@@ -106,6 +106,7 @@ struct Wire {
     /// Takes payloads in place and completes checksums as an offloading device does.
     in_place: bool,
     placed: usize,
+    mtu: Option<usize>,
 }
 
 impl Egress for Wire {
@@ -113,14 +114,19 @@ impl Egress for Wire {
         if self.limit.is_some_and(|limit| self.packets.len() >= limit) {
             return false;
         }
-        let mut buf = vec![0u8; 2048];
-        if let Some(n) = build(&mut buf) {
-            buf.truncate(n);
-            if self.in_place {
-                buf = complete(buf);
-            }
-            self.packets.push(buf);
+        let mut buf = vec![0u8; self.mtu.unwrap_or(2048)];
+        let Some(n) = build(&mut buf) else {
+            assert!(
+                self.mtu.is_none(),
+                "the stack built a packet larger than the MTU"
+            );
+            return true;
+        };
+        buf.truncate(n);
+        if self.in_place {
+            buf = complete(buf);
         }
+        self.packets.push(buf);
         true
     }
 
@@ -495,6 +501,15 @@ async fn transfer_survives_reordering() {
 #[tokio::test(flavor = "current_thread")]
 async fn transfer_survives_loss_and_reordering() {
     transfer(20, 20, 1 << 20).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_lost_segment_resent_while_its_sender_holds_out_of_order_data_fits_the_mtu() {
+    let mut link = Link::new(20, 20);
+    let mtu = StackConfig::default().tcp.mtu;
+    link.to_server.mtu = Some(mtu);
+    link.to_client.mtu = Some(mtu);
+    transfer_with(link, 1 << 20).await;
 }
 
 #[tokio::test(flavor = "current_thread")]

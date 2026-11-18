@@ -27,7 +27,7 @@ uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
 concord-test-support = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
 
 [lints]
 workspace = true

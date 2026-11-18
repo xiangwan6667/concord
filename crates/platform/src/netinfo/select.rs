@@ -1,5 +1,12 @@
 use std::net::IpAddr;
 
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "android",
+    windows,
+    test
+))]
 pub struct Candidate {
     pub name: String,
     pub metric: u32,
@@ -8,6 +15,13 @@ pub struct Candidate {
 
 /// Unscoped routes win over per-interface scoped fallbacks, then the lowest metric,
 /// then table order. Excluded names (the TUN device) and loopback never qualify.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "android",
+    windows,
+    test
+))]
 pub fn pick<'a>(candidates: &'a [Candidate], excluded: &[String]) -> Option<&'a Candidate> {
     candidates
         .iter()

@@ -18,12 +18,12 @@ pub struct SelectionStore {
 }
 
 /// Marks a group's new pick as under test until dropped.
-pub struct Probing<'s> {
-    store: &'s SelectionStore,
+pub struct Probing {
+    store: Arc<SelectionStore>,
     group: Arc<str>,
 }
 
-impl Drop for Probing<'_> {
+impl Drop for Probing {
     fn drop(&mut self) {
         {
             let mut probing = lock(&self.store.probing);
@@ -84,13 +84,13 @@ impl SelectionStore {
 
     /// While the guard lives, routing steers around the group's pick if its node
     /// is dead but keeps it, so the test decides.
-    pub fn probing(&self, group: &Arc<str>) -> Probing<'_> {
+    pub fn probing(self: &Arc<Self>, group: &Arc<str>) -> Probing {
         {
             let mut probing = lock(&self.probing);
             probing.insert(group.clone());
         }
         Probing {
-            store: self,
+            store: Arc::clone(self),
             group: group.clone(),
         }
     }
@@ -147,7 +147,7 @@ mod tests {
 
     #[test]
     fn a_probe_ends_after_a_holder_poisoned_the_set() {
-        let store = SelectionStore::new();
+        let store = Arc::new(SelectionStore::new());
         let group: Arc<str> = Arc::from("g");
         let probing = store.probing(&group);
         concord_test_support::poison(&store.probing);

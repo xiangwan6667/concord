@@ -114,7 +114,9 @@ impl SnifferConfig {
                 if let serde_json::Value::Object(entry) = value {
                     if let Some(list) = entry.get("ports") {
                         for text in value_to_strings(list) {
-                            ports.extend(parse_port_ranges(&text)?);
+                            ports.extend(parse_port_ranges(&text).map_err(|err| {
+                                err.prefixed(&format!("sniffer.sniff.{name}.ports: "))
+                            })?);
                         }
                     }
                     if let Some(flag) = entry.get("override-destination").and_then(to_bool) {

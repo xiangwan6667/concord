@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::engine::{Core, MitmEngine};
 use crate::script::{
-    EVENT_ENGINE_STARTED, Script, ScriptDial, ScriptError, ScriptEvent, ScriptInvocation,
-    ScriptKind, ScriptResult,
+    EVENT_ENGINE_STARTED, ScriptDial, ScriptError, ScriptEvent, ScriptInvocation, ScriptKind,
+    ScriptResult,
 };
 
 /// The schedule reads the wall clock at least this often, because timers run
@@ -305,9 +305,6 @@ impl Drop for Release {
         lock(&self.tasks.inner).running.remove(&self.index);
     }
 }
-
-#[allow(dead_code, reason = "named in the type of the schedule")]
-fn _script_is_used(_: &Script) {}
 
 #[cfg(test)]
 mod tests {

@@ -1,5 +1,7 @@
 use serde::Serialize;
 
+use crate::lenient::Ignored;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Level {
@@ -23,6 +25,12 @@ pub struct LoadReport {
 }
 
 impl LoadReport {
+    pub fn warn_ignored(&mut self, prefix: &str, notes: &[Ignored]) {
+        for note in notes {
+            self.warn(note.code, format!("{prefix}{}", note.key), note.to_string());
+        }
+    }
+
     pub fn warn(
         &mut self,
         code: &'static str,

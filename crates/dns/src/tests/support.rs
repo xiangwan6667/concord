@@ -370,6 +370,81 @@ impl UpstreamDialer for NodeDialer {
     }
 }
 
+/// Outbounds named `names` that carry UDP over a local socket, as DIRECT does; each
+/// session it opens is kept as (outbound, target).
+pub struct UdpDialer {
+    pub names: &'static [&'static str],
+    pub asked: Mutex<Vec<(String, concord_common::Address)>>,
+}
+
+impl UdpDialer {
+    pub fn new(names: &'static [&'static str]) -> Arc<Self> {
+        Arc::new(UdpDialer {
+            names,
+            asked: Mutex::new(Vec::new()),
+        })
+    }
+
+    pub fn asked(&self) -> Vec<(String, concord_common::Address)> {
+        lock(&self.asked).clone()
+    }
+}
+
+struct NoNames;
+
+#[async_trait::async_trait]
+impl HostResolver for NoNames {
+    async fn lookup(
+        &self,
+        host: &str,
+        _version: IpVersion,
+        _initiator: Initiator,
+    ) -> std::io::Result<concord_common::LookupIps> {
+        Err(std::io::Error::other(format!(
+            "no lookup of {host} in tests"
+        )))
+    }
+}
+
+#[async_trait::async_trait]
+impl UpstreamDialer for UdpDialer {
+    fn knows(&self, via: &str) -> bool {
+        self.names.contains(&via)
+    }
+
+    async fn connect(
+        &self,
+        via: &str,
+        _target: &concord_common::Address,
+    ) -> std::io::Result<concord_common::BoxStream> {
+        Err(std::io::Error::other(format!("no tcp through {via}")))
+    }
+
+    async fn bind_udp(
+        &self,
+        via: &str,
+        target: &concord_common::Address,
+    ) -> std::io::Result<Arc<dyn concord_common::PacketSession>> {
+        lock(&self.asked).push((via.to_string(), target.clone()));
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        Ok(Arc::new(concord_net::DirectPacketSession::new(
+            socket,
+            Arc::new(NoNames),
+            Initiator::Other,
+            IpVersion::Ipv4,
+            false,
+            Default::default(),
+        )))
+    }
+}
+
+pub fn build_over(config: &DnsConfig, dialer: &Arc<UdpDialer>) -> Arc<Resolver> {
+    let sink = Arc::new(Sink::default());
+    let mut deps = deps(&sink);
+    deps.dialer = Arc::downgrade(dialer) as Weak<dyn UpstreamDialer>;
+    Resolver::new(config, &HostsConfig::default(), deps).unwrap()
+}
+
 pub fn build_through(config: &DnsConfig, dialer: &Arc<NodeDialer>) -> Arc<Resolver> {
     let sink = Arc::new(Sink::default());
     let mut deps = deps(&sink);

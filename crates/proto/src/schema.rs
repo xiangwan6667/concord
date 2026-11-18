@@ -1,5 +1,5 @@
-use schemars::SchemaGenerator;
 use schemars::generate::SchemaSettings;
+use schemars::{Schema, SchemaGenerator};
 use serde_json::{Map, Value, json};
 
 use crate::error::ErrorObject;
@@ -8,7 +8,30 @@ use crate::{
     DEFAULT_BATCH_MS, DEFAULT_CREDIT, ERROR_KINDS, MAX_BATCH_BYTES, MAX_MESSAGE, PROTOCOL_VERSION,
 };
 
-fn value(schema: schemars::Schema) -> Value {
+type SchemaOf = fn(&mut SchemaGenerator) -> Schema;
+
+/// A method's parameters, result (for a stream, the snapshot) and event. Kept out of
+/// `METHODS`: the dispatcher links that table, and with these in it every binary would
+/// carry the schema code of every API type.
+struct MethodSchemas {
+    params: SchemaOf,
+    result: SchemaOf,
+    event: SchemaOf,
+}
+
+macro_rules! schema_table {
+    ($({ kind: $kind:ident, fun: $fun:ident, name: $name:literal, exec: $exec:ident, params: $params:ty, result: $result:ty, event: $event:ty, policy: $policy:ident, cap: $cap:ident })*) => {
+        const SCHEMAS: &[MethodSchemas] = &[$(MethodSchemas {
+            params: |generator| generator.subschema_for::<$params>(),
+            result: |generator| generator.subschema_for::<$result>(),
+            event: |generator| generator.subschema_for::<$event>(),
+        },)*];
+    };
+}
+
+crate::with_methods!(schema_table);
+
+fn value(schema: Schema) -> Value {
     serde_json::to_value(schema).unwrap_or(Value::Null)
 }
 
@@ -18,7 +41,8 @@ pub fn api_schema() -> Value {
     let mut generator = SchemaGenerator::new(SchemaSettings::draft2020_12());
     let methods: Vec<Value> = METHODS
         .iter()
-        .map(|spec| {
+        .zip(SCHEMAS)
+        .map(|(spec, schemas)| {
             let mut entry = Map::new();
             entry.insert("name".into(), json!(spec.name));
             entry.insert(
@@ -33,7 +57,7 @@ pub fn api_schema() -> Value {
             if let Some(capability) = spec.capability.name() {
                 entry.insert("capability".into(), json!(capability));
             }
-            entry.insert("params".into(), value((spec.params)(&mut generator)));
+            entry.insert("params".into(), value((schemas.params)(&mut generator)));
             entry.insert(
                 if spec.kind == Kind::Stream {
                     "snapshot"
@@ -41,14 +65,14 @@ pub fn api_schema() -> Value {
                     "result"
                 }
                 .into(),
-                value((spec.result)(&mut generator)),
+                value((schemas.result)(&mut generator)),
             );
             if let Some(policy) = spec.policy {
                 entry.insert(
                     "stream".into(),
                     json!({
                         "policy": policy.name(),
-                        "event": value((spec.event)(&mut generator)),
+                        "event": value((schemas.event)(&mut generator)),
                     }),
                 );
             }

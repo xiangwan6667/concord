@@ -1,8 +1,10 @@
 //! `concord`: the core process of the desktop app. It reads the session token
 //! from its standard input, dials the socket the app listens on, proves both ends
 //! hold the token, then speaks length-prefixed JSON frames until that connection ends.
-//! `concord run` runs a profile without an app; see `standalone`.
+//! `concord run` runs a profile without an app; see `standalone`. `concord -t` checks one; see
+//! `check`.
 
+mod check;
 mod standalone;
 
 use std::io::BufRead;
@@ -27,6 +29,15 @@ fn main() -> ExitCode {
         eprintln!("Arguments error");
         return ExitCode::FAILURE;
     };
+    if first == "-t" {
+        return match check::parse(args) {
+            Ok(options) => block_on(|| check::run(options)),
+            Err(message) => {
+                eprint!("[ERROR] {message}\n\n{}", check::USAGE);
+                ExitCode::FAILURE
+            }
+        };
+    }
     if first == "run" {
         return match standalone::parse(args) {
             Ok(standalone::Command::Run(options)) => block_on(|| async {

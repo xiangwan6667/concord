@@ -176,7 +176,12 @@ impl Session {
                 .or_else(|| upstream.held.as_ref().map(|held| Arc::from(held.id())));
             *lock(&self.held) = upstream.held;
             let tls = self
-                .tls_connect(upstream.stream, &self.host, &[ALPN_H2, ALPN_HTTP1])
+                .tls_connect(
+                    upstream.stream,
+                    &self.host,
+                    self.flow.port,
+                    &[ALPN_H2, ALPN_HTTP1],
+                )
                 .await?;
             *lock(&self.ready) = Some(Ready {
                 tls,
@@ -220,9 +225,10 @@ impl Session {
         &self,
         stream: BoxStream,
         host: &str,
+        port: u16,
         protocols: &[&str],
     ) -> io::Result<tokio_rustls::client::TlsStream<BoxStream>> {
-        let config = self.core.client_config(protocols)?;
+        let config = self.core.client_config(protocols, host, port)?;
         let name = ServerName::try_from(host.to_string()).map_err(io::Error::other)?;
         tokio::time::timeout(
             HANDSHAKE_TIMEOUT,
@@ -307,7 +313,9 @@ impl Session {
             } else {
                 &[ALPN_H2, ALPN_HTTP1]
             };
-            let tls = self.tls_connect(stream, &key.host, protocols).await?;
+            let tls = self
+                .tls_connect(stream, &key.host, key.port, protocols)
+                .await?;
             let h2 = tls.get_ref().1.alpn_protocol() == Some(ALPN_H2.as_bytes());
             self.start(tls, h2, id).await?
         } else {

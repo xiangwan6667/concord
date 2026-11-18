@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use concord_config::mitm::text::canonical_header;
 use concord_tls::TrustStore;
 use http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, HOST};
 use http::{HeaderName, HeaderValue, Method, Request};
@@ -14,7 +15,6 @@ use tokio_rustls::TlsConnector;
 use url::Url;
 
 use crate::script::ScriptDial;
-use crate::text::canonical_header;
 
 const MAX_REDIRECTS: usize = 10;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);

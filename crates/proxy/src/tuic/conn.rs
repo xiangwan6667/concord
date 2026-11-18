@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use concord_common::{Address, DialCx};
+use concord_common::{Address, DialCx, Tasks};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -122,10 +122,10 @@ async fn read_datagrams(version: Version, conn: quinn::Connection, hub: Arc<Hub>
     conn.close(quinn::VarInt::from_u32(0), b"");
 }
 
-async fn read_streams(version: Version, conn: quinn::Connection, hub: Arc<Hub>) {
+async fn read_streams(version: Version, conn: quinn::Connection, hub: Arc<Hub>, tasks: Tasks) {
     while let Ok(mut stream) = conn.accept_uni().await {
         let hub = hub.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let Ok(data) = stream.read_to_end(MAX_STREAM_PACKET).await else {
                 return;
             };
@@ -144,16 +144,17 @@ impl Live {
         let mut tasks = Vec::new();
         if udp {
             if shared.native {
-                tasks.push(tokio::spawn(read_datagrams(
+                tasks.push(quic.tasks.spawn(read_datagrams(
                     shared.version,
                     quic.conn.clone(),
                     hub.clone(),
                 )));
             } else {
-                tasks.push(tokio::spawn(read_streams(
+                tasks.push(quic.tasks.spawn(read_streams(
                     shared.version,
                     quic.conn.clone(),
                     hub.clone(),
+                    quic.tasks.clone(),
                 )));
             }
         }

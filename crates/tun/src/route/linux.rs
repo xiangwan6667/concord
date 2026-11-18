@@ -5,20 +5,39 @@ use crate::options::{Prefix, TunOptions};
 /// Policy-routing plan of sing-tun on Linux: default routes in a private table, selected by
 /// rules that keep loopback, the interface itself, excluded uids, ports and interfaces out.
 pub fn plan_linux(options: &TunOptions, iface: &IfaceInfo) -> Plan {
+    plan(options, iface, false)
+}
+
+/// The same plan for a device a privileged process opens on Android. There is no resolvectl: DNS
+/// reaches the device by route like any other traffic.
+pub fn plan_android(options: &TunOptions, iface: &IfaceInfo) -> Plan {
+    plan(options, iface, true)
+}
+
+fn plan(options: &TunOptions, iface: &IfaceInfo, android: bool) -> Plan {
     let start = options.iproute2_rule_index;
     let mut plan = Plan {
         stale_rule_priorities: Some((start, start + 10)),
         ..Plan::default()
     };
     if !options.auto_route {
-        plan.steps
-            .extend(rules_for(options, &iface.name).into_iter().map(Step::Rule));
+        plan.steps.extend(
+            rules(options, &iface.name, android)
+                .into_iter()
+                .map(Step::Rule),
+        );
         return plan;
     }
     plan.steps.push(Step::RpFilter {
         ifname: iface.name.clone(),
     });
-    let gateway = |addresses: &[Prefix]| addresses.first().and_then(Prefix::next_host);
+    // sing-tun's `Inet4GatewayAddr`/`Inet6GatewayAddr` give no gateway on Android, where netd's tables
+    // cannot resolve one for table 2022.
+    let gateway = |addresses: &[Prefix]| {
+        (!android)
+            .then(|| addresses.first().and_then(Prefix::next_host))
+            .flatten()
+    };
     for dest in auto_route_ranges(options, false) {
         let gateway = if dest.is_ipv4() {
             gateway(&options.inet4_address)
@@ -32,13 +51,31 @@ pub fn plan_linux(options: &TunOptions, iface: &IfaceInfo) -> Plan {
             table: Some(options.iproute2_table_index),
         }));
     }
-    plan.steps
-        .extend(rules_for(options, &iface.name).into_iter().map(Step::Rule));
+    let p4 = !options.inet4_address.is_empty();
+    if android && (p4 || !options.inet6_address.is_empty()) {
+        let defaults = ["0.0.0.0/0", "::/0"]
+            .into_iter()
+            .filter(|dest| p4 || dest.contains(':'))
+            .filter_map(Prefix::parse);
+        for dest in defaults {
+            plan.steps.push(Step::Route(RouteSpec {
+                dest,
+                gateway: None,
+                if_index: iface.index,
+                table: Some(dns_table(options)),
+            }));
+        }
+    }
+    plan.steps.extend(
+        rules(options, &iface.name, android)
+            .into_iter()
+            .map(Step::Rule),
+    );
     let servers: Vec<_> = [&options.inet4_address, &options.inet6_address]
         .into_iter()
-        .filter_map(|addresses| gateway(addresses))
+        .filter_map(|addresses| addresses.first().and_then(Prefix::next_host))
         .collect();
-    if !servers.is_empty() {
+    if !servers.is_empty() && !android {
         plan.steps.push(Step::Dns {
             ifname: iface.name.clone(),
             servers,
@@ -94,7 +131,33 @@ impl Cursor {
     }
 }
 
+/// Android's system resolver usually sits on the LAN, which a route address that leaves private
+/// ranges out keeps off the private table: queries leave the device unhijacked and come back with
+/// addresses the core never handed out. sing-tun keeps DNS off `main` with the rule this chain
+/// skips; here port 53 gets a table of its own that only holds the device, in both families
+/// even when the device has no IPv6 address, as a `VpnService` takes every system query.
+pub(crate) fn dns_table(options: &TunOptions) -> u32 {
+    options.iproute2_table_index + 1
+}
+
+/// The routing tables a privileged Android device fills.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn android_tables(options: &TunOptions) -> [u32; 2] {
+    [options.iproute2_table_index, dns_table(options)]
+}
+
 pub fn rules_for(options: &TunOptions, name: &str) -> Vec<RuleSpec> {
+    rules(options, name, false)
+}
+
+/// sing-tun's chain under `runtime.GOOS == "android"`: without the rules ahead of the loopback ones,
+/// since Android routes through netd's per-network tables and leaves `main` nearly empty, and with
+/// an IPv6 rule for the unspecified source like the IPv4 one.
+pub fn rules_for_android(options: &TunOptions, name: &str) -> Vec<RuleSpec> {
+    rules(options, name, true)
+}
+
+fn rules(options: &TunOptions, name: &str, android: bool) -> Vec<RuleSpec> {
     let table = options.iproute2_table_index;
     let (p4, p6) = (
         !options.inet4_address.is_empty(),
@@ -115,10 +178,11 @@ pub fn rules_for(options: &TunOptions, name: &str) -> Vec<RuleSpec> {
     if !p4 && !p6 {
         return Vec::new();
     }
+    let dns6 = android && !p6;
     let start = options.iproute2_rule_index;
     let mut cur = Cursor {
         p4,
-        p6,
+        p6: p6 || dns6,
         v4: start,
         v6: start,
         nop: start + 10,
@@ -195,36 +259,23 @@ pub fn rules_for(options: &TunOptions, name: &str) -> Vec<RuleSpec> {
         }
     }
 
-    if p4 {
-        for address in &options.inet4_address {
-            cur.push(Family::V4, RuleAction::Table(table), |rule| {
-                rule.dst = Some(address.masked());
-            });
-        }
-        cur.v4 += 1;
-        cur.push(Family::V4, RuleAction::Table(table), |rule| {
-            rule.suppress_prefixlen = Some(0);
-        });
-        cur.v4 += 1;
+    if !android {
+        main_table_rules(&mut cur, options, table);
     }
-    if p6 {
-        cur.push(Family::V6, RuleAction::Table(table), |rule| {
-            rule.suppress_prefixlen = Some(0);
-        });
-        cur.v6 += 1;
-    }
-    cur.both(RuleAction::Table(254), |rule| {
-        rule.invert = true;
-        rule.dport = Some((53, 53));
-        rule.suppress_prefixlen = Some(0);
-    });
 
     let loopback = |rule: &mut RuleSpec| rule.iif = Some("lo".to_owned());
+    let dns = |rule: &mut RuleSpec| {
+        loopback(rule);
+        rule.dport = Some((53, 53));
+    };
     if p4 {
         cur.push(Family::V4, RuleAction::Goto(nop), |rule| {
             rule.iif = Some(name.to_owned());
         });
         cur.v4 += 1;
+        if android {
+            cur.push(Family::V4, RuleAction::Table(dns_table(options)), dns);
+        }
         cur.push(Family::V4, RuleAction::Table(table), |rule| {
             rule.invert = true;
             loopback(rule);
@@ -245,10 +296,21 @@ pub fn rules_for(options: &TunOptions, name: &str) -> Vec<RuleSpec> {
             rule.iif = Some(name.to_owned());
         });
         cur.v6 += 1;
+        if android {
+            cur.push(Family::V6, RuleAction::Table(dns_table(options)), dns);
+        }
         for address in &options.inet6_address {
             cur.push(Family::V6, RuleAction::Table(table), |rule| {
                 loopback(rule);
                 rule.src = Some(address.masked());
+            });
+        }
+        // sing-tun relies on the skipped suppress rule for an unbound socket's lookup, which on
+        // Android would let every local IPv6 connection fall past the halves below to netd.
+        if android {
+            cur.push(Family::V6, RuleAction::Table(table), |rule| {
+                loopback(rule);
+                rule.src = Prefix::parse("::/128");
             });
         }
         cur.v6 += 1;
@@ -260,22 +322,54 @@ pub fn rules_for(options: &TunOptions, name: &str) -> Vec<RuleSpec> {
         }
         cur.v6 += 1;
         cur.push(Family::V6, RuleAction::Table(table), |_| {});
+    } else if dns6 {
+        cur.push(Family::V6, RuleAction::Goto(nop), |rule| {
+            rule.iif = Some(name.to_owned());
+        });
+        cur.v6 += 1;
+        cur.push(Family::V6, RuleAction::Table(dns_table(options)), dns);
     }
     if p4 {
         cur.rules
             .push(RuleSpec::new(Family::V4, nop, RuleAction::Nop));
     }
-    if p6 {
+    if p6 || dns6 {
         cur.rules
             .push(RuleSpec::new(Family::V6, nop, RuleAction::Nop));
     }
     cur.rules
 }
 
-#[cfg(target_os = "linux")]
+fn main_table_rules(cur: &mut Cursor, options: &TunOptions, table: u32) {
+    if cur.p4 {
+        for address in &options.inet4_address {
+            cur.push(Family::V4, RuleAction::Table(table), |rule| {
+                rule.dst = Some(address.masked());
+            });
+        }
+        cur.v4 += 1;
+        cur.push(Family::V4, RuleAction::Table(table), |rule| {
+            rule.suppress_prefixlen = Some(0);
+        });
+        cur.v4 += 1;
+    }
+    if cur.p6 {
+        cur.push(Family::V6, RuleAction::Table(table), |rule| {
+            rule.suppress_prefixlen = Some(0);
+        });
+        cur.v6 += 1;
+    }
+    cur.both(RuleAction::Table(254), |rule| {
+        rule.invert = true;
+        rule.dport = Some((53, 53));
+        rule.suppress_prefixlen = Some(0);
+    });
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use netlink::NetlinkBackend;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod netlink {
     use std::io;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -283,6 +377,7 @@ mod netlink {
     use async_trait::async_trait;
     use futures_util::TryStreamExt;
     use rtnetlink::packet_route::AddressFamily;
+    use rtnetlink::packet_route::route::{RouteAttribute, RouteMessage};
     use rtnetlink::packet_route::rule::{
         RuleAction as NlAction, RuleAttribute, RuleFlags, RuleMessage, RulePortRange, RuleUidRange,
     };
@@ -303,6 +398,87 @@ mod netlink {
                 handle,
                 connection: tokio::spawn(connection),
             })
+        }
+    }
+
+    impl NetlinkBackend {
+        /// Gives a device its MTU and addresses and brings it up, as sing-tun's `configure`.
+        pub async fn bring_up(
+            &self,
+            index: u32,
+            mtu: u32,
+            addresses: &[(IpAddr, u8)],
+        ) -> io::Result<()> {
+            let link = || rtnetlink::LinkUnspec::new_with_index(index);
+            self.handle
+                .link()
+                .set(link().mtu(mtu).build())
+                .execute()
+                .await
+                .map_err(nl_error)?;
+            for &(address, length) in addresses {
+                match self
+                    .handle
+                    .address()
+                    .add(index, address, length)
+                    .execute()
+                    .await
+                {
+                    Err(rtnetlink::Error::NetlinkError(message))
+                        if message.raw_code().abs() == libc::EEXIST => {}
+                    other => other.map_err(nl_error)?,
+                }
+            }
+            self.handle
+                .link()
+                .set(link().up().build())
+                .execute()
+                .await
+                .map_err(nl_error)
+        }
+
+        /// Deletes every route in `tables`, in both families; the count of deleted routes.
+        pub async fn flush_tables(&self, tables: &[u32]) -> io::Result<usize> {
+            let mut removed = 0;
+            let dumps = [
+                RouteMessageBuilder::<Ipv4Addr>::new().build(),
+                RouteMessageBuilder::<Ipv6Addr>::new().build(),
+            ];
+            for dump in dumps {
+                let routes: Vec<RouteMessage> = self
+                    .handle
+                    .route()
+                    .get(dump)
+                    .execute()
+                    .try_collect()
+                    .await
+                    .map_err(nl_error)?;
+                for route in routes {
+                    let table = route
+                        .attributes
+                        .iter()
+                        .find_map(|attribute| match attribute {
+                            RouteAttribute::Table(table) => Some(*table),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| u32::from(route.header.table));
+                    if tables.contains(&table)
+                        && self.handle.route().del(route).execute().await.is_ok()
+                    {
+                        removed += 1;
+                    }
+                }
+            }
+            Ok(removed)
+        }
+
+        pub async fn delete_link(&self, index: u32) -> io::Result<()> {
+            self.handle
+                .link()
+                .del(index)
+                .execute()
+                .await
+                .map_err(nl_error)
         }
     }
 
@@ -382,7 +558,7 @@ mod netlink {
         message
     }
 
-    fn route_message(spec: &RouteSpec) -> rtnetlink::packet_route::route::RouteMessage {
+    fn route_message(spec: &RouteSpec) -> RouteMessage {
         let prefix = spec.dest;
         match prefix.addr() {
             IpAddr::V4(dest) => {
@@ -656,6 +832,172 @@ mod tests {
         );
         assert_eq!(v6[4].src, Some(p("::/1")));
         assert_eq!(v6[5].src, Some(p("8000::/1")));
+    }
+
+    #[test]
+    fn android_chain_matches_sing_tun_without_the_main_table_rules() {
+        let rules = rules_for_android(&options(), "tun0");
+        let summary = |family| -> Vec<_> {
+            of(&rules, family)
+                .iter()
+                .map(|rule| (rule.priority, rule.action, rule.invert))
+                .collect()
+        };
+        assert_eq!(
+            summary(Family::V4),
+            [
+                (9000, RuleAction::Goto(9010), false),
+                (9001, RuleAction::Table(2023), false),
+                (9001, RuleAction::Table(2022), true),
+                (9001, RuleAction::Table(2022), false),
+                (9001, RuleAction::Table(2022), false),
+                (9010, RuleAction::Nop, false),
+            ]
+        );
+        assert_eq!(
+            summary(Family::V6),
+            [
+                (9000, RuleAction::Goto(9010), false),
+                (9001, RuleAction::Table(2023), false),
+                (9001, RuleAction::Table(2022), false),
+                (9001, RuleAction::Table(2022), false),
+                (9002, RuleAction::Goto(9010), false),
+                (9002, RuleAction::Goto(9010), false),
+                (9003, RuleAction::Table(2022), false),
+                (9010, RuleAction::Nop, false),
+            ]
+        );
+        assert_eq!(of(&rules, Family::V6)[3].src, Some(p("::/128")));
+        assert!(rules.iter().all(|rule| rule.suppress_prefixlen.is_none()
+            && rule.dst.is_none()
+            && (rule.dport.is_none() || rule.action == RuleAction::Table(2023))));
+    }
+
+    #[test]
+    fn android_without_ipv6_still_takes_ipv6_dns_past_the_excluded_uids() {
+        let mut o = options();
+        o.inet6_address.clear();
+        o.exclude_uid = vec![IdRange::single(10_123)];
+        let plan = plan_android(&o, &iface());
+        let rules: Vec<_> = plan
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Rule(rule) if rule.family == Family::V6 => Some(rule),
+                _ => None,
+            })
+            .collect();
+        let summary: Vec<_> = rules
+            .iter()
+            .map(|rule| (rule.priority, rule.action, rule.dport, rule.uid_range))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (9000, RuleAction::Goto(9010), None, Some((10_123, 10_123))),
+                (9001, RuleAction::Goto(9010), None, None),
+                (9002, RuleAction::Table(2023), Some((53, 53)), None),
+                (9010, RuleAction::Nop, None, None),
+            ]
+        );
+        assert!(plan.steps.iter().any(|step| matches!(
+            step,
+            Step::Route(route) if route.table == Some(2023) && route.dest == p("::/0")
+        )));
+        assert!(
+            !plan
+                .steps
+                .iter()
+                .any(|step| matches!(step, Step::Route(route) if route.table == Some(2022) && !route.dest.is_ipv4()))
+        );
+    }
+
+    #[test]
+    fn android_sends_local_dns_to_a_table_of_the_device_alone() {
+        let mut o = options();
+        o.exclude_uid = vec![IdRange::single(10_123)];
+        o.route_address = vec![p("1.0.0.0/8"), p("2000::/3")];
+        let plan = plan_android(&o, &iface());
+        let dns_rules: Vec<_> = plan
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Rule(rule) if rule.dport.is_some() => Some(rule),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dns_rules.len(), 2);
+        for rule in &dns_rules {
+            assert_eq!(rule.dport, Some((53, 53)));
+            assert_eq!(rule.iif.as_deref(), Some("lo"));
+            assert_eq!(rule.action, RuleAction::Table(2023));
+            assert!(rule.priority > 9000, "after the excluded uids");
+        }
+        let dns_routes: Vec<_> = plan
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Route(route) if route.table == Some(2023) => Some(route.dest),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dns_routes, [p("0.0.0.0/0"), p("::/0")]);
+        assert!(
+            rules_for(&o, "tun0")
+                .iter()
+                .all(|rule| rule.action != RuleAction::Table(2023))
+        );
+    }
+
+    #[test]
+    fn only_strict_route_with_a_missing_family_leaves_a_terminal_rule() {
+        let terminal = |o: &TunOptions| -> Vec<Family> {
+            rules_for_android(o, "tun0")
+                .into_iter()
+                .filter(|rule| rule.action == RuleAction::Unreachable)
+                .map(|rule| rule.family)
+                .collect()
+        };
+        let mut o = options();
+        o.exclude_uid = vec![IdRange::single(10_123)];
+        assert!(terminal(&o).is_empty());
+        o.inet6_address.clear();
+        assert!(terminal(&o).is_empty());
+        o.strict_route = true;
+        assert_eq!(terminal(&o), [Family::V6]);
+    }
+
+    #[test]
+    fn android_plan_routes_the_private_table_without_a_resolver_step() {
+        let mut o = options();
+        o.exclude_uid = vec![IdRange::single(10_123)];
+        let plan = plan_android(&o, &iface());
+        assert_eq!(plan.stale_rule_priorities, Some((9000, 9010)));
+        assert!(matches!(plan.steps.first(), Some(Step::RpFilter { .. })));
+        assert!(
+            !plan
+                .steps
+                .iter()
+                .any(|step| matches!(step, Step::Dns { .. }))
+        );
+        let first_rule = plan.steps.iter().find_map(|step| match step {
+            Step::Rule(rule) => Some(rule),
+            _ => None,
+        });
+        assert_eq!(
+            first_rule.and_then(|rule| rule.uid_range),
+            Some((10_123, 10_123))
+        );
+        assert_eq!(
+            plan.steps
+                .iter()
+                .filter(
+                    |step| matches!(step, Step::Route(route) if route.table == Some(2022)
+                    && route.gateway.is_none())
+                )
+                .count(),
+            2
+        );
     }
 
     #[test]

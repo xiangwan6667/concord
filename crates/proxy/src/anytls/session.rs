@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use concord_common::stream_buffer::StreamBuffer;
-use concord_common::{BoxRead, BoxStream, BoxWrite};
+use concord_common::{BoxRead, BoxStream, BoxWrite, Tasks};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -56,6 +56,7 @@ pub(super) struct Session {
     synack_watch: Mutex<Option<JoinHandle<()>>>,
     pool: Weak<Pool>,
     padding: Arc<ArcSwap<Padding>>,
+    tasks: Tasks,
 }
 
 impl Session {
@@ -72,12 +73,13 @@ impl Session {
             out,
             streams: Mutex::new(HashMap::new()),
             next_sid: AtomicU32::new(0),
-            die: CancellationToken::new(),
+            die: pool.tasks.child_token(),
             peer_version: AtomicU8::new(0),
             idle_since: Mutex::new(Instant::now()),
             synack_watch: Mutex::new(None),
             pool: Arc::downgrade(pool),
             padding: padding.clone(),
+            tasks: pool.tasks.clone(),
         });
         let settings = format!(
             "v=2\nclient={client_metadata}\npadding-md5={}",
@@ -92,8 +94,9 @@ impl Session {
             counter: 0,
             padding,
         };
-        tokio::spawn(write_loop(session.clone(), sink, queue, framer));
-        tokio::spawn(read_loop(session.clone(), source));
+        pool.tasks
+            .spawn(write_loop(session.clone(), sink, queue, framer));
+        pool.tasks.spawn(read_loop(session.clone(), source));
         session
     }
 
@@ -118,11 +121,9 @@ impl Session {
     /// Queues without waiting; a full queue is retried from a task so that a
     /// drop never blocks.
     pub(super) fn queue(&self, out: Out) {
-        if let Err(mpsc::error::TrySendError::Full(out)) = self.out.try_send(out)
-            && let Ok(handle) = tokio::runtime::Handle::try_current()
-        {
+        if let Err(mpsc::error::TrySendError::Full(out)) = self.out.try_send(out) {
             let sender = self.out.clone();
-            handle.spawn(async move {
+            self.tasks.spawn_detached(async move {
                 let _ = sender.send(out).await;
             });
         }
@@ -141,7 +142,7 @@ impl Session {
         let done = Arc::new(AtomicBool::new(false));
         if sid >= 2 && self.peer_version.load(Ordering::Acquire) >= 2 {
             let session = self.clone();
-            let watch = tokio::spawn(async move {
+            let watch = self.tasks.spawn(async move {
                 tokio::time::sleep(SYNACK_DEADLINE).await;
                 session.close();
             });
@@ -361,6 +362,7 @@ mod tests {
             synack_watch: Mutex::new(None),
             pool: Weak::new(),
             padding: Arc::new(ArcSwap::from_pointee(Padding::default_scheme())),
+            tasks: Tasks::default(),
         });
         let (_, chunks) = mpsc::channel(1);
         let done = Arc::new(AtomicBool::new(false));
@@ -529,7 +531,7 @@ mod tests {
 
     async fn wire_frames(scheme: &str, writes: &[(bool, Vec<u8>)]) -> Vec<(u8, u32, Vec<u8>)> {
         let (near, mut far) = tokio::io::duplex(1 << 20);
-        let pool = Pool::new(false, 0);
+        let pool = Pool::new(false, 0, Tasks::default());
         let padding = Arc::new(ArcSwap::from_pointee(
             Padding::parse(scheme.as_bytes()).unwrap(),
         ));
@@ -590,7 +592,7 @@ mod tests {
     #[tokio::test]
     async fn a_stream_opens_with_settings_syn_and_data_then_reuses_the_session() {
         let (near, mut far) = tokio::io::duplex(1 << 16);
-        let pool = Pool::new(false, 0);
+        let pool = Pool::new(false, 0, Tasks::default());
         let padding = Arc::new(ArcSwap::from_pointee(Padding::parse(b"stop=0").unwrap()));
         let session = Session::start(Box::new(near), 1, &pool, padding, "meta");
         assert!(pool.register(session.clone(), pool.ticket()));
@@ -629,7 +631,7 @@ mod tests {
             (OUT_QUEUE + 1) * MAX_FRAME + 37,
         ] {
             let (near, mut far) = tokio::io::duplex(1024);
-            let pool = Pool::new(false, 0);
+            let pool = Pool::new(false, 0, Tasks::default());
             let padding = Arc::new(ArcSwap::from_pointee(Padding::parse(b"stop=0").unwrap()));
             let session = Session::start(Box::new(near), 1, &pool, padding, "");
             assert!(pool.register(session.clone(), pool.ticket()));
@@ -660,7 +662,7 @@ mod tests {
     #[tokio::test]
     async fn the_halves_work_at_once_and_the_stream_ends_with_the_last_one() {
         let (near, mut far) = tokio::io::duplex(1 << 16);
-        let pool = Pool::new(false, 0);
+        let pool = Pool::new(false, 0, Tasks::default());
         let padding = Arc::new(ArcSwap::from_pointee(Padding::parse(b"stop=0").unwrap()));
         let session = Session::start(Box::new(near), 1, &pool, padding, "meta");
         assert!(pool.register(session.clone(), pool.ticket()));
@@ -692,7 +694,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_stream_reports_the_servers_message() {
         let (near, mut far) = tokio::io::duplex(1 << 16);
-        let pool = Pool::new(false, 0);
+        let pool = Pool::new(false, 0, Tasks::default());
         let padding = Arc::new(ArcSwap::from_pointee(Padding::default_scheme()));
         let session = Session::start(Box::new(near), 1, &pool, padding, "");
         let mut stream = session.open_stream().await.unwrap();
@@ -706,7 +708,7 @@ mod tests {
     #[tokio::test]
     async fn a_closed_connection_ends_the_session_and_its_streams() {
         let (near, far) = tokio::io::duplex(1 << 16);
-        let pool = Pool::new(false, 0);
+        let pool = Pool::new(false, 0, Tasks::default());
         let padding = Arc::new(ArcSwap::from_pointee(Padding::default_scheme()));
         let session = Session::start(Box::new(near), 1, &pool, padding, "");
         let mut stream = session.open_stream().await.unwrap();

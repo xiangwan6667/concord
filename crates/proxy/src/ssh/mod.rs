@@ -3,13 +3,16 @@ mod rsa_key;
 mod tests;
 
 use std::borrow::Cow;
+use std::future::Future;
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine;
 use concord_common::{
     Address, BoxStream, CoreError, DialCx, Outbound, OutboundInfo, OutboundKind, PacketSession,
+    Tasks,
 };
 use concord_config::proxy::{ProxyDef, SshOpts};
 use russh::client::{self, Handle, Handler};
@@ -21,19 +24,24 @@ use russh::keys::{
     decode_secret_key,
 };
 use russh::{Preferred, SshId};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 
 use self::rsa_key::{RsaSigner, Sign};
 use crate::ctx::{BuildCtx, BuildError};
 use crate::node::{Link, info_for};
-use crate::session_slot::{SessionSlot, overtaken};
+use crate::session_slot::SessionSlot;
 
 enum Key {
     Plain(Arc<PrivateKey>),
     Rsa(Box<RsaSigner>),
 }
 
-struct HostKeys(Vec<Vec<u8>>);
+/// russh runs the session in a task of its own and drops the handler when that task ends, so
+/// `ended` closing is how the engine waits for it.
+struct HostKeys {
+    keys: Vec<Vec<u8>>,
+    _ended: oneshot::Sender<()>,
+}
 
 impl Handler for HostKeys {
     type Error = russh::Error;
@@ -42,7 +50,7 @@ impl Handler for HostKeys {
         &mut self,
         key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        if self.0.is_empty() {
+        if self.keys.is_empty() {
             return Ok(true);
         }
         let (algorithm, offered) = match key {
@@ -50,7 +58,7 @@ impl Handler for HostKeys {
             PublicKeyOrCertificate::Certificate(cert) => (cert.algorithm(), cert.to_bytes()),
         };
         let offered = offered.unwrap_or_default();
-        if self.0.contains(&offered) {
+        if self.keys.contains(&offered) {
             return Ok(true);
         }
         Err(russh::Error::IO(io::Error::other(format!(
@@ -71,28 +79,54 @@ struct Ssh {
     config: Arc<client::Config>,
     session: SessionSlot<Handle<HostKeys>>,
     connecting: Mutex<()>,
+    tasks: Tasks,
 }
 
 fn auth_error(err: russh::Error) -> io::Error {
     io::Error::other(format!("ssh: {err}"))
 }
 
+/// mihomo dials a node, SSH's session included, under the tunnel's DefaultTCPTimeout; a
+/// DISCONNECT that cannot be queued in that time is dropped with the session.
+const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn bounded(teardown: impl Future<Output = ()>) {
+    let _ = tokio::time::timeout(DISCONNECT_TIMEOUT, teardown).await;
+}
+
 impl Ssh {
+    fn disconnect_later(&self, handle: Arc<Handle<HostKeys>>) {
+        self.tasks.spawn_detached(bounded(async move {
+            let _ = handle
+                .disconnect(russh::Disconnect::ByApplication, "", "")
+                .await;
+        }));
+    }
+
     async fn handle(&self, cx: &DialCx<'_>) -> io::Result<Arc<Handle<HostKeys>>> {
-        let open = |handle: &Handle<HostKeys>| !handle.is_closed();
-        if let (Some(handle), _) = self.session.get(open) {
-            return Ok(handle);
-        }
-        let _turn = self.connecting.lock().await;
-        let (held, ticket) = self.session.get(open);
-        if let Some(handle) = held {
-            return Ok(handle);
-        }
+        self.session
+            .offer(
+                &self.connecting,
+                |handle| !handle.is_closed(),
+                || self.establish(cx),
+                |handle| self.disconnect_later(handle),
+            )
+            .await
+    }
+
+    async fn establish(&self, cx: &DialCx<'_>) -> io::Result<Arc<Handle<HostKeys>>> {
         let raw = self.link.open(cx).await?;
-        let mut handle =
-            client::connect_stream(self.config.clone(), raw, HostKeys(self.host_keys.clone()))
-                .await
-                .map_err(auth_error)?;
+        let (ended, session_ended) = oneshot::channel();
+        self.tasks.spawn_to_end(async move {
+            let _ = session_ended.await;
+        });
+        let keys = HostKeys {
+            keys: self.host_keys.clone(),
+            _ended: ended,
+        };
+        let mut handle = client::connect_stream(self.config.clone(), raw, keys)
+            .await
+            .map_err(auth_error)?;
         // Go's client opens with a "none" request, so a server that needs no credentials
         // lets a mihomo node in without a key or password.
         let mut authenticated = handle
@@ -147,14 +181,7 @@ impl Ssh {
                 "ssh: unable to authenticate",
             ));
         }
-        let handle = Arc::new(handle);
-        if !self.session.keep(ticket, &handle) {
-            let _ = handle
-                .disconnect(russh::Disconnect::ByApplication, "", "")
-                .await;
-            return Err(overtaken());
-        }
-        Ok(handle)
+        Ok(Arc::new(handle))
     }
 }
 
@@ -376,7 +403,7 @@ pub(crate) fn build(
         nodelay: true,
         ..client::Config::default()
     };
-    let link = Link::plain(def, &opts.server, opts.port);
+    let link = Link::plain(def, &opts.server, opts.port, &ctx.tasks);
     Ok(Arc::new(Ssh {
         info: info_for(def, OutboundKind::Ssh, &opts.server, opts.port, false),
         link,
@@ -387,5 +414,6 @@ pub(crate) fn build(
         config: Arc::new(config),
         session: SessionSlot::default(),
         connecting: Mutex::new(()),
+        tasks: ctx.tasks.clone(),
     }))
 }

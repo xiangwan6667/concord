@@ -77,7 +77,7 @@ fn the_first_v4_frame_is_padded_and_later_ones_are_not() {
     assert_eq!(second.len(), 23 + 1 + 16);
 }
 
-fn build(extra: Value) -> Result<(), crate::ctx::BuildError> {
+pub(super) fn build(extra: Value) -> Result<(), crate::ctx::BuildError> {
     let mut proxy =
         json!({"name": "s", "type": "snell", "server": "127.0.0.1", "port": 1, "psk": "p"});
     if let (Some(base), Some(more)) = (proxy.as_object_mut(), extra.as_object()) {
@@ -101,9 +101,21 @@ fn options_follow_the_go_adapter() {
     assert!(build(json!({"version": 1, "udp": true})).is_err());
     assert!(build(json!({"version": 2, "udp": true})).is_err());
     assert!(build(json!({"version": 6})).is_err());
-    for mode in ["restls", "jls"] {
-        let unsupported = build(json!({"obfs-opts": {"mode": mode}})).err().unwrap();
-        assert!(unsupported.is_unsupported(), "{mode}");
+    assert!(build(json!({"version": 6, "psk": "snell-v6-test-psk-0123456789"})).is_ok());
+    assert!(build(json!({"version": 7})).is_err());
+    let unsupported = build(json!({"obfs-opts": {"mode": "restls"}}))
+        .err()
+        .unwrap();
+    assert!(unsupported.is_unsupported());
+    for version in [1, 4, 6] {
+        assert!(
+            build(
+                json!({"version": version, "psk": "snell-jls-psk", "obfs-opts": {
+                    "mode": "jls", "host": "a.test", "username": "name", "password": "secret"
+                }})
+            )
+            .is_ok()
+        );
     }
     for version in 1..=3 {
         let shadow = json!({"obfs-opts": {
@@ -142,11 +154,12 @@ fn shadow_tls_options_are_read_as_the_ss_plugin_reads_them() {
 
     let wrong = json!({"name": "s", "type": "snell", "server": "h", "port": 1, "psk": "p",
         "obfs-opts": {"mode": "shadow-tls", "host": "a.test", "version": 4}});
-    let err = parse_proxy(wrong.as_object().unwrap(), &Capabilities::full()).unwrap_err();
-    assert!(
-        err.to_string().contains("shadow-tls version error: 4"),
-        "{err}"
-    );
+    let Ok(ProxyParse::Quarantined { reason, .. }) =
+        parse_proxy(wrong.as_object().unwrap(), &Capabilities::full())
+    else {
+        panic!("a shadow-tls version mihomo checks only when dialing sets the node aside");
+    };
+    assert!(reason.contains("shadow-tls version error: 4"), "{reason}");
 }
 
 async fn read_after_close_with(scheme: Scheme, wire: Vec<u8>) -> std::io::Result<Vec<u8>> {

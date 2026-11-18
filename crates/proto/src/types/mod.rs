@@ -14,6 +14,7 @@ macro_rules! dto {
 mod common;
 mod config;
 mod live;
+mod mitm;
 mod probe;
 mod proxy;
 mod state;
@@ -21,6 +22,7 @@ mod state;
 pub use common::*;
 pub use config::*;
 pub use live::*;
+pub use mitm::*;
 pub use probe::*;
 pub use proxy::*;
 pub use state::*;

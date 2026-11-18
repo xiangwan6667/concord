@@ -9,6 +9,8 @@ use crate::report::LoadReport;
 pub enum HostValue {
     Ips(Vec<IpAddr>),
     Domain(String),
+    /// The host's own addresses, read when the profile is applied.
+    Lan,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,12 +69,9 @@ pub fn parse_hosts(map: &Map, report: &mut LoadReport) -> Result<HostsConfig> {
     };
     for (domain, value) in map {
         let items = value_to_strings(value);
-        if items.len() == 1 && items.first().is_some_and(|item| item == "lan") {
-            return Err(ConfigError::new(format!(
-                "hosts[{domain}]: the special value `lan` is not supported by this core"
-            )));
-        }
-        let parsed = if items.len() == 1
+        let parsed = if items.len() == 1 && items.first().is_some_and(|item| item == "lan") {
+            HostValue::Lan
+        } else if items.len() == 1
             && items
                 .first()
                 .is_some_and(|item| item.parse::<IpAddr>().is_err())
@@ -81,13 +80,14 @@ pub fn parse_hosts(map: &Map, report: &mut LoadReport) -> Result<HostsConfig> {
         } else {
             let mut ips = Vec::with_capacity(items.len());
             for item in &items {
-                ips.push(
-                    item.parse::<IpAddr>()
-                        .map_err(|_| ConfigError::new(format!("{value} is not a valid value")))?,
-                );
+                ips.push(item.parse::<IpAddr>().map_err(|_| {
+                    ConfigError::new(format!("hosts[{domain}]: {value} is not a valid value"))
+                })?);
             }
             if ips.is_empty() {
-                return Err(ConfigError::new(format!("{value} is not a valid value")));
+                return Err(ConfigError::new(format!(
+                    "hosts[{domain}]: {value} is not a valid value"
+                )));
             }
             HostValue::Ips(ips)
         };
@@ -100,11 +100,16 @@ pub fn parse_hosts(map: &Map, report: &mut LoadReport) -> Result<HostsConfig> {
             continue;
         }
         if let HostValue::Domain(target) = &parsed {
+            if target.eq_ignore_ascii_case(domain) {
+                report.warn(
+                    "invalid_host",
+                    format!("hosts.{domain}"),
+                    "the entry maps the name to itself and is skipped, so the name is resolved by DNS",
+                );
+                continue;
+            }
             let cycle =
                 || ConfigError::new(format!("{domain}, there is a cycle in domain name mapping"));
-            if target.eq_ignore_ascii_case(domain) {
-                return Err(cycle());
-            }
             let mut hops = 0;
             let mut current = config.lookup(target);
             while let Some(entry) = current {
@@ -158,6 +163,22 @@ mod tests {
     }
 
     #[test]
+    fn a_name_mapped_to_itself_is_skipped_with_a_warning() {
+        let map: Map =
+            serde_json::from_value(json!({"a.example": "A.example", "b.example": "a.example"}))
+                .unwrap();
+        let mut report = LoadReport::default();
+        let hosts = parse_hosts(&map, &mut report).unwrap();
+        assert!(hosts.lookup("a.example").is_none());
+        assert!(
+            matches!(&hosts.lookup("b.example").unwrap().value, HostValue::Domain(d) if d == "a.example")
+        );
+        assert_eq!(report.warnings.len(), 1);
+        assert_eq!(report.warnings[0].code, "invalid_host");
+        assert_eq!(report.warnings[0].path, "hosts.a.example");
+    }
+
+    #[test]
     fn domain_cycles_are_rejected() {
         let err = parse(
             json!({"a.example": "b.example", "b.example": "c.example", "c.example": "a.example"}),
@@ -167,12 +188,12 @@ mod tests {
             err.message.contains("cycle in domain name mapping"),
             "{err}"
         );
-        assert!(parse(json!({"a.example": "a.example"})).is_err());
         assert!(parse(json!({"a.example": "b.example", "b.example": "9.9.9.9"})).is_ok());
     }
 
     #[test]
-    fn lan_is_refused() {
-        assert!(parse(json!({"router.lan": "lan"})).is_err());
+    fn lan_stands_for_the_hosts_own_addresses() {
+        let hosts = parse(json!({"router.lan": "lan"})).unwrap();
+        assert_eq!(hosts.lookup("router.lan").unwrap().value, HostValue::Lan);
     }
 }

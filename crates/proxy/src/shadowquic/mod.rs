@@ -28,10 +28,10 @@ use self::wire::{
 use crate::ctx::{BuildCtx, BuildError};
 use crate::node::{Egress, info_for};
 use crate::quic::{
-    BbrProfile, Brutal, Crypto, ObfsSpec, QuicConn, QuicLink, QuicStream, SwitchFactory,
+    BbrProfile, Brutal, Crypto, ObfsSpec, QuicLink, QuicStream, SharedConn, SwitchFactory,
     bbr_factory, io_error,
 };
-use crate::session_slot::{SessionSlot, overtaken};
+use crate::session_slot::SessionSlot;
 use crate::util::parse_bps;
 
 const DEFAULT_STREAM_WINDOW: u64 = 15_728_640;
@@ -44,8 +44,7 @@ const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(10);
 const BRUTAL_MTU: u16 = 1200;
 
 struct SqConn {
-    quic: QuicConn,
-    shared: Arc<Shared>,
+    shared: SharedConn<Shared>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -59,7 +58,7 @@ impl Drop for SqConn {
 
 impl SqConn {
     fn alive(&self) -> bool {
-        self.quic.conn.close_reason().is_none()
+        self.shared.alive()
     }
 }
 
@@ -83,7 +82,7 @@ struct ShadowQuic {
 
 async fn read_uni(stream: &mut quinn::RecvStream, shared: &Shared) -> io::Result<()> {
     let id = stream.read_u16().await?;
-    let (inbox, addr) = shared.target(id).await;
+    let (inbox, addr) = shared.target(id).await?;
     loop {
         let len = usize::from(stream.read_u16().await?);
         let mut payload = vec![0u8; len];
@@ -91,7 +90,8 @@ async fn read_uni(stream: &mut quinn::RecvStream, shared: &Shared) -> io::Result
             .read_exact(&mut payload)
             .await
             .map_err(io::Error::other)?;
-        let _ = inbox.try_send((addr.clone(), payload));
+        let sender = inbox.upgrade().ok_or(io::ErrorKind::BrokenPipe)?;
+        let _ = sender.try_send((addr.clone(), payload));
     }
 }
 
@@ -136,23 +136,16 @@ async fn negotiate(
 impl ShadowQuic {
     async fn establish(&self, cx: &DialCx<'_>) -> io::Result<Arc<SqConn>> {
         let quic = self.link.connect_any(cx).await?;
-        let shared = Arc::new(Shared::default());
+        let shared = SharedConn::new(quic, Shared::default());
         let mut tasks = Vec::new();
         {
-            let (conn, shared) = (quic.conn.clone(), shared.clone());
-            tasks.push(tokio::spawn(async move {
-                while let Ok(message) = conn.read_datagram().await {
-                    shared.dispatch(&message);
-                }
-            }));
-        }
-        {
-            let (conn, shared) = (quic.conn.clone(), shared.clone());
-            tasks.push(tokio::spawn(async move {
+            let (conn, hub) = (shared.quic.conn.clone(), shared.hub.clone());
+            let spawner = shared.quic.tasks.clone();
+            tasks.push(shared.quic.tasks.spawn(async move {
                 while let Ok(mut stream) = conn.accept_uni().await {
-                    let shared = shared.clone();
-                    tokio::spawn(async move {
-                        let _ = read_uni(&mut stream, &shared).await;
+                    let hub = hub.clone();
+                    spawner.spawn(async move {
+                        let _ = read_uni(&mut stream, &hub).await;
                     });
                 }
             }));
@@ -160,34 +153,24 @@ impl ShadowQuic {
         let Settings { up, down, .. } = self.settings;
         if up > 0 || down > 0 {
             let settings = Arc::new(self.settings);
-            tasks.push(tokio::spawn(negotiate(
-                quic.conn.clone(),
+            tasks.push(shared.quic.tasks.spawn(negotiate(
+                shared.quic.conn.clone(),
                 self.controllers.clone(),
                 settings,
             )));
         }
-        Ok(Arc::new(SqConn {
-            quic,
-            shared,
-            tasks,
-        }))
+        Ok(Arc::new(SqConn { shared, tasks }))
     }
 
     async fn offer(&self, cx: &DialCx<'_>) -> io::Result<Arc<SqConn>> {
-        if let (Some(conn), _) = self.current.get(SqConn::alive) {
-            return Ok(conn);
-        }
-        let _turn = self.connecting.lock().await;
-        let (held, ticket) = self.current.get(SqConn::alive);
-        if let Some(conn) = held {
-            return Ok(conn);
-        }
-        let conn = self.establish(cx).await?;
-        if !self.current.keep(ticket, &conn) {
-            conn.quic.conn.close(VarInt::from_u32(0), b"");
-            return Err(overtaken());
-        }
-        Ok(conn)
+        self.current
+            .offer(
+                &self.connecting,
+                SqConn::alive,
+                || self.establish(cx),
+                |conn| conn.shared.close(),
+            )
+            .await
     }
 
     fn forget(&self, conn: &Arc<SqConn>) {
@@ -203,7 +186,7 @@ impl ShadowQuic {
         let mut last = None;
         for _ in 0..2 {
             let conn = self.offer(cx).await?;
-            match conn.quic.conn.open_bi().await {
+            match conn.shared.quic.conn.open_bi().await {
                 Ok((send, recv)) => {
                     let mut stream = QuicStream::new(send, recv, Box::new(conn.clone()));
                     stream.write_all(&request(command, target)?).await?;
@@ -243,17 +226,21 @@ impl Outbound for ShadowQuic {
         };
         let (conn, stream) = self.open(cx, command, &unspecified()).await?;
         Ok(Arc::new(ShadowPackets::new(
-            conn.quic.conn.clone(),
-            conn.shared.clone(),
+            conn.shared.quic.conn.clone(),
+            conn.shared.hub.clone(),
             stream,
             over_stream,
             conn,
+            &self.link.tasks,
         )))
     }
 
     fn reset_sessions(&self) {
         if let Some(conn) = self.current.reset() {
-            conn.quic.conn.close(VarInt::from_u32(0), b"client closed");
+            conn.shared
+                .quic
+                .conn
+                .close(VarInt::from_u32(0), b"client closed");
         }
     }
 }
@@ -339,7 +326,7 @@ fn offers_version_one(versions: &[String]) -> Result<bool, BuildError> {
 pub(crate) fn build(
     def: &ProxyDef,
     opts: &ShadowQuicOpts,
-    _ctx: &BuildCtx,
+    ctx: &BuildCtx,
 ) -> Result<Arc<dyn Outbound>, BuildError> {
     if !offers_version_one(&opts.quic_versions)? {
         return Err(BuildError::unsupported(
@@ -380,6 +367,7 @@ pub(crate) fn build(
         obfs: ObfsSpec::None,
         hop: None,
         datagram_frame: Some(datagram_frame(opts)),
+        tasks: ctx.tasks.clone(),
     };
     Ok(Arc::new(ShadowQuic {
         info: info_for(def, OutboundKind::ShadowQuic, &opts.server, opts.port, true),

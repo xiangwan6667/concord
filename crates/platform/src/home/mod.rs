@@ -24,6 +24,17 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message.to_string())
 }
 
+#[cfg(unix)]
+fn restrict_to_owner(file: &File) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_file: &File) -> io::Result<()> {
+    Ok(())
+}
+
 fn normalize(path: &Path) -> Option<PathBuf> {
     let mut out = PathBuf::new();
     for component in path.components() {
@@ -41,6 +52,10 @@ fn normalize(path: &Path) -> Option<PathBuf> {
 }
 
 impl HomeDir {
+    /// Whether a file a profile names must pass [`confine`](Self::confine); mihomo's Android
+    /// build lets it lie anywhere (`constant/path.go::IsSafePath`).
+    pub const CONFINES_PROFILE_FILES: bool = !cfg!(target_os = "android");
+
     pub fn new(root: impl Into<PathBuf>) -> Self {
         HomeDir {
             root: root.into(),
@@ -166,6 +181,15 @@ impl HomeDir {
         self.write_atomic_with(path, |file| file.write_all(bytes))
     }
 
+    /// [`write_atomic`](Self::write_atomic) for a file only its owner may read, where the
+    /// platform has file modes.
+    pub fn write_private(&self, path: impl AsRef<Path>, bytes: &[u8]) -> io::Result<()> {
+        self.write_atomic_with(path, |file| {
+            restrict_to_owner(file)?;
+            file.write_all(bytes)
+        })
+    }
+
     /// Streams into a temporary file beside the target, then renames it over the
     /// target, so a reader sees the old file or the whole new one.
     pub fn write_atomic_with(
@@ -215,13 +239,14 @@ impl HomeDir {
     }
 
     /// Hands foreign-owned entries under the home directory back to the real user,
-    /// which only matters for files an earlier elevated core left behind.
-    #[cfg(unix)]
+    /// which only matters for files an earlier elevated core left behind; Unix alone has
+    /// such owners.
     pub fn reclaim(&self) -> usize {
-        match self.owner {
-            Some(owner) => reclaim::reclaim_home(&self.root, owner.uid, owner.gid),
-            None => 0,
+        #[cfg(unix)]
+        if let Some(owner) = self.owner {
+            return reclaim::reclaim_home(&self.root, owner.uid, owner.gid);
         }
+        0
     }
 }
 

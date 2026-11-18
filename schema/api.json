@@ -1375,6 +1375,33 @@
             "null"
           ]
         },
+        "bindAddress": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "`*` binds every address; read only while the LAN is allowed."
+        },
+        "lanAllowedIps": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "CIDR prefixes admitted to the mixed, HTTP and SOCKS listeners."
+        },
+        "lanDisallowedIps": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "CIDR prefixes refused there even when the allowed list admits them."
+        },
         "mixedPort": {
           "type": [
             "integer",
@@ -1428,6 +1455,16 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "externalControllerCors": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ControllerCorsPatch"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "unifiedDelay": {
@@ -1518,6 +1555,27 @@
         "silent"
       ]
     },
+    "ControllerCorsPatch": {
+      "type": "object",
+      "properties": {
+        "allowOrigins": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "allowPrivateNetwork": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "description": "Which browser origins may call the external controller. An absent field takes mihomo's\ndefault: every origin, and private-network preflights allowed. No origin refuses them all."
+    },
     "ChangeSeq": {
       "type": "object",
       "properties": {
@@ -1572,6 +1630,21 @@
         },
         "allowLan": {
           "type": "boolean"
+        },
+        "bindAddress": {
+          "type": "string"
+        },
+        "lanAllowedIps": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "lanDisallowedIps": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "authentication": {
           "type": "array",
@@ -1665,6 +1738,9 @@
         "tproxyPort",
         "mixedPort",
         "allowLan",
+        "bindAddress",
+        "lanAllowedIps",
+        "lanDisallowedIps",
         "authentication",
         "skipAuthPrefixes",
         "mode",
@@ -2432,7 +2508,7 @@
           ],
           "format": "uint32",
           "minimum": 0,
-          "description": "Tests running at once. Default: every proxy at once, as mihomo tests a group."
+          "description": "Tests running at once. Default: every proxy at once, as the Clash API tests a group."
         },
         "expected": {
           "type": [
@@ -3161,6 +3237,12 @@
           ]
         },
         "destinationAsn": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rematchName": {
           "type": [
             "string",
             "null"
@@ -4416,11 +4498,577 @@
     "MitmValidateResult": {
       "type": "object",
       "properties": {
-        "issues": true
+        "issues": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/MitmIssue"
+            }
+          }
+        },
+        "views": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/MitmLineEntry"
+            }
+          },
+          "default": {}
+        }
       },
       "required": [
         "issues"
+      ],
+      "description": "Both keyed by list, as the section names it (`hostname`, `url-rewrite`, ...), in\nline order. A line in force has a view; one that cannot be read has an issue; a\n`hostname` or `client-source-address` line some of whose items apply has both."
+    },
+    "MitmIssue": {
+      "type": "object",
+      "properties": {
+        "index": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "kind": {
+          "$ref": "#/$defs/MitmIssueKind"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "index",
+        "kind",
+        "message"
+      ],
+      "description": "A line of a list that cannot be read, or of whose items some cannot. `index` is\nthe line's place in its list, blank lines and comments counted."
+    },
+    "MitmIssueKind": {
+      "type": "string",
+      "enum": [
+        "syntax",
+        "missing",
+        "unknown",
+        "unsupported",
+        "invalid",
+        "pattern",
+        "jq",
+        "resource",
+        "script"
       ]
+    },
+    "MitmLineEntry": {
+      "type": "object",
+      "properties": {
+        "index": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "view": {
+          "$ref": "#/$defs/MitmLineView"
+        }
+      },
+      "required": [
+        "index",
+        "view"
+      ]
+    },
+    "MitmLineView": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/MitmUrlRewrite",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "urlRewrite"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "$ref": "#/$defs/MitmHeaderRewrite",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "headerRewrite"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "$ref": "#/$defs/MitmBodyRewrite",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "bodyRewrite"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "$ref": "#/$defs/MitmMapLocal",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "mapLocal"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "$ref": "#/$defs/MitmScript",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "script"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "$ref": "#/$defs/MitmHosts",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "hosts"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "$ref": "#/$defs/MitmSources",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "sources"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        }
+      ],
+      "description": "One per list: `url-rewrite`, `header-rewrite`, `body-rewrite`, `map-local` (also\n`request-body-mock`), `script`, `hosts` (`hostname` and\n`skip-server-cert-verify-hostname`) and `sources` (`client-source-address`)."
+    },
+    "MitmUrlAction": {
+      "type": "string",
+      "enum": [
+        "header",
+        "302",
+        "307",
+        "reject",
+        "reject-200",
+        "reject-img",
+        "reject-dict",
+        "reject-array"
+      ]
+    },
+    "MitmUrlRewrite": {
+      "type": "object",
+      "properties": {
+        "pattern": {
+          "type": "string"
+        },
+        "action": {
+          "$ref": "#/$defs/MitmUrlAction"
+        },
+        "replacement": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Absent for the reject actions."
+        },
+        "requestHead": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The request-head pattern of Quantumult X's `url-and-header`."
+        }
+      },
+      "required": [
+        "pattern",
+        "action"
+      ]
+    },
+    "MitmPhase": {
+      "type": "string",
+      "enum": [
+        "request",
+        "response"
+      ]
+    },
+    "MitmHeaderAction": {
+      "type": "string",
+      "enum": [
+        "header-add",
+        "header-del",
+        "header-replace",
+        "header-replace-regex",
+        "header-text-replace"
+      ]
+    },
+    "MitmHeaderRewrite": {
+      "type": "object",
+      "properties": {
+        "phase": {
+          "$ref": "#/$defs/MitmPhase"
+        },
+        "pattern": {
+          "type": "string"
+        },
+        "requestHead": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "responseHead": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "action": {
+          "$ref": "#/$defs/MitmHeaderAction"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "In canonical case; absent for `header-text-replace`, which rewrites the whole head."
+        },
+        "value": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "regex": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "replacement": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "phase",
+        "pattern",
+        "action"
+      ]
+    },
+    "MitmBodyReplacement": {
+      "type": "object",
+      "properties": {
+        "regex": {
+          "type": "string"
+        },
+        "replacement": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "regex",
+        "replacement"
+      ]
+    },
+    "MitmBodyRewrite": {
+      "type": "object",
+      "properties": {
+        "phase": {
+          "$ref": "#/$defs/MitmPhase"
+        },
+        "pattern": {
+          "type": "string"
+        },
+        "requestHead": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "responseHead": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "replacements": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MitmBodyReplacement"
+          }
+        },
+        "jq": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The expression as compiled, without the quotes around it."
+        }
+      },
+      "required": [
+        "phase",
+        "pattern",
+        "replacements"
+      ]
+    },
+    "MitmDataType": {
+      "type": "string",
+      "enum": [
+        "text",
+        "tiny-gif",
+        "base64",
+        "file"
+      ],
+      "description": "A line without `data-type` reads a file."
+    },
+    "MitmHeader": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "value"
+      ]
+    },
+    "MitmMapLocal": {
+      "type": "object",
+      "properties": {
+        "pattern": {
+          "type": "string"
+        },
+        "requestHead": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dataType": {
+          "$ref": "#/$defs/MitmDataType"
+        },
+        "data": {
+          "type": "string",
+          "description": "The `data` parameter as written: a file name, text or base64; empty for `tiny-gif`."
+        },
+        "status": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "Present for `map-local` only, 200 unless the line sets it."
+        },
+        "headers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MitmHeader"
+          }
+        },
+        "contentType": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "pattern",
+        "dataType",
+        "data",
+        "headers",
+        "contentType"
+      ]
+    },
+    "MitmScriptKind": {
+      "type": "string",
+      "enum": [
+        "httpRequest",
+        "httpResponse",
+        "cron",
+        "event",
+        "generic"
+      ],
+      "description": "Loon's `network-changed` script is an `event` one."
+    },
+    "MitmScript": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "The name `mitm.runScript` takes; the file name when the line gives none."
+        },
+        "kind": {
+          "$ref": "#/$defs/MitmScriptKind"
+        },
+        "path": {
+          "type": "string"
+        },
+        "pattern": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requestHead": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "responseHead": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cronexp": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "event": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requiresBody": {
+          "type": "boolean"
+        },
+        "binaryBody": {
+          "type": "boolean"
+        },
+        "maxSize": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "The timeout in force, capped as the core caps it."
+        }
+      },
+      "required": [
+        "name",
+        "kind",
+        "path",
+        "requiresBody",
+        "binaryBody",
+        "timeoutMs"
+      ]
+    },
+    "MitmHostEntry": {
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string",
+          "description": "Lower case, without a trailing dot or IPv6 brackets; may hold `*` and `?`."
+        },
+        "port": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "Absent when the entry names none, which covers 443 and 80."
+        },
+        "exclude": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "host",
+        "exclude"
+      ]
+    },
+    "MitmHosts": {
+      "type": "object",
+      "properties": {
+        "entries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MitmHostEntry"
+          }
+        }
+      },
+      "required": [
+        "entries"
+      ],
+      "description": "The entries of a line in force, without those that could not be read."
+    },
+    "MitmSourceEntry": {
+      "type": "object",
+      "properties": {
+        "network": {
+          "type": "string",
+          "description": "A CIDR; a single address has its full prefix length."
+        },
+        "exclude": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "network",
+        "exclude"
+      ]
+    },
+    "MitmSources": {
+      "type": "object",
+      "properties": {
+        "entries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MitmSourceEntry"
+          }
+        }
+      },
+      "required": [
+        "entries"
+      ],
+      "description": "The entries of a line in force: those before the first that could not be read."
     },
     "MitmIssueParams": {
       "type": "object",

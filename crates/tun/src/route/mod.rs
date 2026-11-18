@@ -1,5 +1,6 @@
 mod desktop;
 mod linux;
+pub mod packages;
 mod ranges;
 mod strict;
 #[cfg(target_os = "macos")]
@@ -19,11 +20,13 @@ use concord_common::sync::lock;
 use crate::options::{Prefix, TunOptions};
 
 pub use desktop::{ManagerBackend, plan_desktop};
-pub use linux::{plan_linux, rules_for};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) use linux::android_tables;
+pub use linux::{plan_android, plan_linux, rules_for, rules_for_android};
 pub use ranges::{excluded_uids, subtract};
 pub use strict::{Cond, FilterSpec, Layer, StrictRoute, Verdict};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use linux::NetlinkBackend;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -248,6 +251,10 @@ impl<B: RouteBackend> RouteSession<B> {
         &self.applied
     }
 
+    pub fn forget(&mut self, gone: impl Fn(&Step) -> bool) {
+        self.applied.retain(|step| !gone(step));
+    }
+
     pub fn into_parts(mut self) -> (B, Vec<Step>) {
         let applied = std::mem::take(&mut self.applied);
         (self.backend, applied)
@@ -372,6 +379,26 @@ mod tests {
         let (session, notes) = RouteSession::install(backend, &plan).await.unwrap();
         assert_eq!(session.applied().len(), 2);
         assert!(notes.iter().any(|note| note.starts_with("dns on tun0")));
+    }
+
+    #[tokio::test]
+    async fn forgotten_steps_are_not_removed() {
+        let backend = Recorder::default();
+        let log = backend.log.clone();
+        let (mut session, _) =
+            RouteSession::install(backend, &plan_of(&["10.0.0.0/8", "20.0.0.0/8"]))
+                .await
+                .unwrap();
+        session.forget(
+            |step| matches!(step, Step::Route(route) if route.dest.to_string() == "10.0.0.0/8"),
+        );
+        assert!(session.teardown().await.is_empty());
+        let deleted: Vec<_> = lock(&log)
+            .iter()
+            .filter(|(op, _)| *op == Op::Delete)
+            .map(|(_, step)| step.clone())
+            .collect();
+        assert_eq!(deleted, ["route 20.0.0.0/8"]);
     }
 
     #[tokio::test]

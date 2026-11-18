@@ -125,6 +125,19 @@ impl Default for Hosts {
     }
 }
 
+/// mihomo's `lan`: the host's addresses that are neither loopback nor link-local.
+fn lan_addrs() -> Vec<IpAddr> {
+    let mut addrs = concord_platform::interface_addrs();
+    addrs.retain(|addr| {
+        !addr.is_loopback()
+            && match addr {
+                IpAddr::V4(v4) => !v4.is_link_local(),
+                IpAddr::V6(v6) => !v6.is_unicast_link_local(),
+            }
+    });
+    addrs
+}
+
 impl Hosts {
     pub fn from_config(config: &HostsConfig, use_system_hosts: bool) -> Result<Self, DnsError> {
         let mut hosts = Hosts {
@@ -135,6 +148,7 @@ impl Hosts {
             let value = match &entry.value {
                 ConfigValue::Ips(ips) => HostValue::from_ips(ips.clone()),
                 ConfigValue::Domain(domain) => HostValue::from_domain(domain),
+                ConfigValue::Lan => HostValue::from_ips(lan_addrs()),
             }
             .ok_or_else(|| DnsError::config(format!("hosts[{}]: invalid value", entry.domain)))?;
             hosts
@@ -215,6 +229,22 @@ mod tests {
             )
             .unwrap();
         hosts
+    }
+
+    #[test]
+    fn lan_takes_the_addresses_that_are_neither_loopback_nor_link_local() {
+        let config = HostsConfig {
+            entries: vec![concord_config::hosts::HostEntry {
+                domain: "router.lan".into(),
+                value: ConfigValue::Lan,
+            }],
+        };
+        let expected = lan_addrs();
+        assert!(expected.iter().all(|ip| !ip.is_loopback()));
+        match Hosts::from_config(&config, false) {
+            Ok(hosts) => assert_eq!(hosts.lookup_ips("router.lan").unwrap().to_vec(), expected),
+            Err(err) => assert!(expected.is_empty(), "{err}"),
+        }
     }
 
     #[test]

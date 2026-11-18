@@ -44,6 +44,7 @@ impl PacketUp {
         session: String,
         max_bytes: usize,
         interval: Range,
+        tasks: &concord_common::Tasks,
     ) -> PacketUp {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
@@ -51,7 +52,7 @@ impl PacketUp {
             space: AtomicWaker::new(),
             max_bytes,
         });
-        tokio::spawn(upload_loop(
+        tasks.spawn(upload_loop(
             shared.clone(),
             factory,
             transport,

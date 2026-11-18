@@ -16,7 +16,7 @@ use futures_util::StreamExt;
 pub const USAGE: &str = "\
 Usage: concord run [-c <file>] [-d <directory>]
 
-  -c, --config <file>         The Clash/mihomo profile to run [default: <directory>/config.yaml]
+  -c, --config <file>         The Clash profile to run [default: <directory>/config.yaml]
   -d, --directory <directory> Home of the working config, geo data and provider caches
                               [default: ~/.config/concord]
   -h, --help                  Print this help

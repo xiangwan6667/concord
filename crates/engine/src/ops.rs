@@ -1,15 +1,18 @@
 use std::any::Any;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use concord_config::proxy::ProxyParse;
-use concord_config::{Map, crypt, filter, parse_proxy, parse_raw, share_link};
+use concord_config::{
+    LoadOptions, Map, crypt, filter, load_raw, parse_proxy, parse_raw, share_link,
+};
 use concord_platform::HomeDir;
 use serde_json::Value;
 
+use crate::apply;
 use crate::error::Failure;
-use crate::views::ValidationIssue;
+use crate::views::{ValidationIssue, WarningView};
 
 const PARSE_STACK_BYTES: usize = 32 * 1024 * 1024;
 
@@ -30,6 +33,26 @@ pub(crate) async fn on_parse_stack<T: Send + 'static>(
         Ok(Err(panic)) => resume_unwind(panic),
         Err(_) => Err(Failure::core("the parse thread ended without an answer")),
     }
+}
+
+pub(crate) enum RuleSetSource {
+    Downloaded(Vec<u8>),
+    Local(PathBuf),
+}
+
+pub(crate) async fn compile_rule_set(
+    source: RuleSetSource,
+) -> Result<(Vec<u8>, concord_rules::CompiledRuleSet), Failure> {
+    on_parse_stack(move || {
+        let (bytes, allow_empty) = match source {
+            RuleSetSource::Downloaded(bytes) => (bytes, false),
+            RuleSetSource::Local(path) => (std::fs::read(path).map_err(Failure::from)?, true),
+        };
+        let compiled = concord_rules::compile_rule_set(&bytes, allow_empty)
+            .map_err(|err| Failure::new(err.code(), err.to_string()))?;
+        Ok((bytes, compiled))
+    })
+    .await?
 }
 
 pub(crate) fn read_file(path: &str) -> Result<Vec<u8>, Failure> {
@@ -54,6 +77,22 @@ pub async fn validate_config(path: String) -> Result<Option<String>, Failure> {
         parse_raw(&bytes).err().map(|err| err.to_string())
     })
     .await
+}
+
+/// Loads the profile at `path` as an apply would and returns what that apply would warn about,
+/// without running anything.
+pub async fn check_config(path: String, android: bool) -> Result<Vec<WarningView>, Failure> {
+    on_parse_stack(move || {
+        let raw = parse_raw(&read_file(&path)?).map_err(config_failure)?;
+        let options = LoadOptions {
+            capabilities: apply::capabilities(),
+            android,
+            age_secret_key: None,
+        };
+        let profile = load_raw(raw, &options).map_err(config_failure)?;
+        Ok(apply::warning_views(&profile, android))
+    })
+    .await?
 }
 
 pub async fn read_config(path: String) -> Result<Value, Failure> {
@@ -204,6 +243,30 @@ mod tests {
             }
         }
         assert_eq!(on_parse_stack(|| depth(50_000)).await.unwrap(), 50_000);
+    }
+
+    #[tokio::test]
+    async fn a_check_reports_the_load_and_the_engine_warnings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "geodata-mode: true\ntun: {enable: true, congestion-controller: bbr}\n",
+        )
+        .unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let codes = |warnings: Vec<WarningView>| -> Vec<(String, &'static str)> {
+            warnings.into_iter().map(|w| (w.path, w.code)).collect()
+        };
+        let desktop = codes(check_config(path.clone(), false).await.unwrap());
+        assert!(desktop.contains(&("geodata-mode".into(), "unsupported_key")));
+        assert!(desktop.contains(&("tun.congestion-controller".into(), "not_applied")));
+        let android = codes(check_config(path, true).await.unwrap());
+        assert!(!android.iter().any(|(path, _)| path.starts_with("tun.")));
+
+        std::fs::write(dir.path().join("bad.yaml"), "mode: sideways\n").unwrap();
+        let bad = dir.path().join("bad.yaml").to_string_lossy().into_owned();
+        assert!(check_config(bad, false).await.is_err());
     }
 
     #[test]

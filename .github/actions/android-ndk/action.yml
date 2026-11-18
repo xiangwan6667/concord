@@ -1,0 +1,52 @@
+name: android-ndk
+description: >-
+  Installs the NDK FlClash's `cargoCore` builds `libconcord.so` with and sets the variables it sets for one target.
+
+inputs:
+  target:
+    description: The Rust target, such as aarch64-linux-android
+    required: true
+  clang:
+    description: The NDK clang prefix for it, such as armv7a-linux-androideabi
+    required: true
+  abi:
+    description: The Android ABI for CMake, such as arm64-v8a
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install the NDK
+      shell: bash
+      env:
+        NDK_VERSION: 28.2.13676358
+      run: |
+        "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null
+        echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+    - name: Point cargo at the NDK
+      shell: bash
+      env:
+        API: 24
+        TARGET: ${{ inputs.target }}
+        CLANG: ${{ inputs.clang }}
+        ABI: ${{ inputs.abi }}
+      run: |
+        ndk=$ANDROID_NDK_ROOT
+        host=$(ls -d "$ndk"/toolchains/llvm/prebuilt/*/)
+        clang=${host}bin/$CLANG$API-clang
+        under=${TARGET//-/_}
+        upper=${under^^}
+        toolchain=$RUNNER_TEMP/android.toolchain.cmake
+        printf 'set(ANDROID_ABI "%s")\nset(ANDROID_PLATFORM "android-%s")\ninclude("%s")\n' \
+          "$ABI" "$API" "$ndk/build/cmake/android.toolchain.cmake" > "$toolchain"
+        {
+          echo "ANDROID_NDK_HOME=$ndk"
+          echo "CC_$under=$clang"
+          echo "CXX_$under=$clang++"
+          echo "AR_$under=${host}bin/llvm-ar"
+          echo "CARGO_TARGET_${upper}_LINKER=$clang"
+          echo "CMAKE_TOOLCHAIN_FILE_$under=$toolchain"
+          echo "BINDGEN_EXTRA_CLANG_ARGS_$under=--sysroot=${host}sysroot --target=$CLANG$API"
+          echo "BORING_BSSL_RUST_CPPLIB=c++_static"
+        } >> "$GITHUB_ENV"

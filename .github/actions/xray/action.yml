@@ -1,0 +1,39 @@
+name: xray
+description: >-
+  Fetches the Xray-core release the xhttp over HTTP/3 interop test uses (`.agents/commands.md`), pinned by hash per
+  architecture, and sets CONCORD_XRAY to it.
+
+runs:
+  using: composite
+  steps:
+    - name: Cache Xray
+      id: cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/xray-dl
+        key: xray-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/actions/xray/action.yml') }}
+
+    - name: Fetch Xray
+      shell: bash
+      env:
+        XRAY_VERSION: v26.11.9
+        XRAY_SHA256_X64: b651f7e1d9966ee2c1b1ee1bf8b52c72771824d3065dce96bbc8bcc19ed95f82
+        XRAY_SHA256_ARM64: 64ed6858982a7f5eb85d88b811089063bd4f17561f4c8f44e0f1dc8e6f6430be
+      run: |
+        case "$(uname -m)" in
+          x86_64) asset=Xray-linux-64.zip sum=$XRAY_SHA256_X64 ;;
+          aarch64) asset=Xray-linux-arm64-v8a.zip sum=$XRAY_SHA256_ARM64 ;;
+          *) echo "no pinned Xray for $(uname -m)" >&2; exit 1 ;;
+        esac
+        download=$RUNNER_TEMP/xray-dl/$asset
+        if [ ! -f "$download" ]; then
+          mkdir -p "$RUNNER_TEMP/xray-dl"
+          curl -fsSL --retry 3 -o "$download" \
+            "https://github.com/XTLS/Xray-core/releases/download/$XRAY_VERSION/$asset"
+        fi
+        echo "$sum  $download" | sha256sum -c -
+        dir=$RUNNER_TEMP/xray
+        mkdir -p "$dir"
+        unzip -o -q "$download" xray -d "$dir"
+        "$dir/xray" version
+        echo "CONCORD_XRAY=$dir/xray" >> "$GITHUB_ENV"

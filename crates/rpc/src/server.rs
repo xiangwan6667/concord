@@ -71,6 +71,10 @@ impl<S: ControlService> Server<S> {
         Server { service, config }
     }
 
+    pub fn service(&self) -> &S {
+        &self.service
+    }
+
     /// Serves one connection until the peer closes it or a write breaks it.
     /// Everything the connection started is stopped before this returns: running
     /// requests are dropped and every subscription leaves its topic.

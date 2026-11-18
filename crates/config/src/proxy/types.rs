@@ -37,7 +37,7 @@ pub struct CommonOpts {
     pub tfo: bool,
     pub mptcp: bool,
     pub interface_name: String,
-    pub routing_mark: i32,
+    pub routing_mark: u32,
     pub ip_version: IpVersionPref,
     pub dialer_proxy: String,
     pub udp: bool,
@@ -60,6 +60,19 @@ pub struct EchOpts {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JlsOpts {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JlsPlugin {
+    pub host: String,
+    pub auth: JlsOpts,
+    pub alpn: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TlsOpts {
     pub enabled: bool,
     pub server_name: String,
@@ -73,7 +86,17 @@ pub struct TlsOpts {
     pub name_cert_verify: String,
     pub client_fingerprint: String,
     pub reality: Option<RealityOpts>,
+    pub jls: Option<JlsOpts>,
     pub ech: Option<EchOpts>,
+    pub shadow_tls: Option<ShadowTlsLayer>,
+}
+
+/// `shadow-tls-opts`: the ShadowTLS handshake takes the place of the node's TLS, which supplies
+/// the decoy's name, certificate checks and fingerprint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShadowTlsLayer {
+    pub password: String,
+    pub version: u8,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -150,6 +173,7 @@ pub struct XhttpDownload {
     pub tls: Option<bool>,
     pub alpn: Option<Vec<String>>,
     pub reality: Option<RealityOpts>,
+    pub jls: Option<JlsOpts>,
     pub skip_cert_verify: Option<bool>,
     pub name_cert_verify: Option<String>,
     pub fingerprint: Option<String>,
@@ -158,6 +182,8 @@ pub struct XhttpDownload {
     pub server_name: Option<String>,
     pub client_fingerprint: Option<String>,
     pub ech: Option<EchOpts>,
+    /// `Some(None)` turns off the node's ShadowTLS for this side.
+    pub shadow_tls: Option<Option<ShadowTlsLayer>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -214,16 +240,32 @@ impl Transport {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GostRelayOpts {
+    pub server: String,
+    pub port: u16,
+    pub forward: bool,
+    pub mux: bool,
+    pub username: String,
+    pub password: String,
+    pub tls: TlsOpts,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DirectOpts;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RejectOpts;
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DnsOpts;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SsPlugin {
     Obfs { mode: String, host: String },
     V2ray(Box<V2rayPlugin>),
+    Gost(Box<V2rayPlugin>),
     ShadowTls(ShadowTlsOpts),
+    Jls(JlsPlugin),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -463,6 +505,29 @@ pub struct AmneziaWgOpts {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MasqueOpts {
+    pub server: String,
+    pub port: u16,
+    pub private_key: String,
+    pub public_key: String,
+    pub ip: String,
+    pub ipv6: String,
+    pub uri: String,
+    pub sni: String,
+    pub mtu: u32,
+    pub handshake_timeout: u64,
+    pub skip_cert_verify: bool,
+    pub network: String,
+    pub congestion_controller: String,
+    pub cwnd: u32,
+    pub bbr_profile: String,
+    pub ip_stack_mode: String,
+    pub ip_stack_congestion_controller: String,
+    pub remote_dns_resolve: bool,
+    pub dns: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WireGuardOpts {
     pub ip: String,
     pub ipv6: String,
@@ -515,6 +580,8 @@ pub struct SsrOpts {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SnellOpts {
+    pub mode: String,
+    pub userkey: String,
     pub server: String,
     pub port: u16,
     pub psk: String,
@@ -523,6 +590,7 @@ pub struct SnellOpts {
     pub obfs_mode: String,
     pub obfs_host: String,
     pub shadow_tls: Option<ShadowTlsOpts>,
+    pub jls: Option<JlsPlugin>,
     pub client_fingerprint: String,
 }
 
@@ -576,9 +644,17 @@ pub struct ShadowQuicOpts {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RematchOpts {
+    pub target_rematch_name: Option<String>,
+    pub target_sub_rule: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProxyKind {
     Direct(DirectOpts),
     Reject(RejectOpts),
+    Dns(DnsOpts),
+    Rematch(RematchOpts),
     Ss(SsOpts),
     Vmess(Box<VmessOpts>),
     Vless(Box<VlessOpts>),
@@ -588,8 +664,10 @@ pub enum ProxyKind {
     AnyTls(Box<AnyTlsOpts>),
     Miu(Box<MiuOpts>),
     Socks5(Socks5Opts),
+    GostRelay(Box<GostRelayOpts>),
     Http(HttpProxyOpts),
     WireGuard(Box<WireGuardOpts>),
+    Masque(Box<MasqueOpts>),
     Hysteria(Box<HysteriaOpts>),
     Ssr(SsrOpts),
     Snell(SnellOpts),
@@ -603,6 +681,8 @@ impl ProxyKind {
         match self {
             ProxyKind::Direct(_) => "direct",
             ProxyKind::Reject(_) => "reject",
+            ProxyKind::Dns(_) => "dns",
+            ProxyKind::Rematch(_) => "rematch",
             ProxyKind::Ss(_) => "ss",
             ProxyKind::Vmess(_) => "vmess",
             ProxyKind::Vless(_) => "vless",
@@ -612,8 +692,10 @@ impl ProxyKind {
             ProxyKind::AnyTls(_) => "anytls",
             ProxyKind::Miu(_) => "miu",
             ProxyKind::Socks5(_) => "socks5",
+            ProxyKind::GostRelay(_) => "gost-relay",
             ProxyKind::Http(_) => "http",
             ProxyKind::WireGuard(_) => "wireguard",
+            ProxyKind::Masque(_) => "masque",
             ProxyKind::Hysteria(_) => "hysteria",
             ProxyKind::Ssr(_) => "ssr",
             ProxyKind::Snell(_) => "snell",
@@ -625,7 +707,13 @@ impl ProxyKind {
 
     pub fn server(&self) -> Option<(&str, u16)> {
         match self {
-            ProxyKind::Direct(_) | ProxyKind::Reject(_) | ProxyKind::WireGuard(_) => None,
+            ProxyKind::Direct(_)
+            | ProxyKind::Reject(_)
+            | ProxyKind::Dns(_)
+            | ProxyKind::Rematch(_)
+            | ProxyKind::WireGuard(_) => None,
+            ProxyKind::Masque(o) => Some((&o.server, o.port)),
+
             ProxyKind::Ss(o) => Some((&o.server, o.port)),
             ProxyKind::Vmess(o) => Some((&o.server, o.port)),
             ProxyKind::Vless(o) => Some((&o.server, o.port)),
@@ -635,6 +723,7 @@ impl ProxyKind {
             ProxyKind::AnyTls(o) => Some((&o.server, o.port)),
             ProxyKind::Miu(o) => Some((&o.server, o.port)),
             ProxyKind::Socks5(o) => Some((&o.server, o.port)),
+            ProxyKind::GostRelay(o) => Some((&o.server, o.port)),
             ProxyKind::Http(o) => Some((&o.server, o.port)),
             ProxyKind::Hysteria(o) => Some((&o.server, o.port)),
             ProxyKind::Ssr(o) => Some((&o.server, o.port)),
@@ -652,6 +741,8 @@ pub struct ProxyDef {
     pub common: CommonOpts,
     pub kind: ProxyKind,
     pub smux: Option<SmuxOpts>,
+    /// Keys read past with a reason, reported as warnings.
+    pub ignored: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

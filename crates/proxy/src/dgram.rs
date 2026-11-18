@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker, ready};
 
-use concord_common::{Address, BoxRead, BoxStream, BoxWrite, PacketBuf, PacketSession};
+use concord_common::{Address, BoxRead, BoxStream, BoxWrite, PacketBuf, PacketSession, Tasks};
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 
 use crate::util::lock;
@@ -86,7 +86,13 @@ pub(crate) struct StreamSession<E, D> {
 const MAX_QUEUED: usize = 64 * 1024;
 
 impl<E: Encoder, D: Decoder> StreamSession<E, D> {
-    pub(crate) fn new(io: BoxStream, encoder: E, decoder: D, remote: Address) -> Self {
+    pub(crate) fn new(
+        io: BoxStream,
+        encoder: E,
+        decoder: D,
+        remote: Address,
+        tasks: &Tasks,
+    ) -> Self {
         let (read, write) = io.into_split();
         let headroom = encoder.headroom();
         let outbox = Arc::new(Mutex::new(Outbox {
@@ -97,7 +103,7 @@ impl<E: Encoder, D: Decoder> StreamSession<E, D> {
             sender: None,
             writer: None,
         }));
-        tokio::spawn(write_out(outbox.clone(), write));
+        tasks.spawn(write_out(outbox.clone(), write));
         StreamSession {
             headroom,
             outbox,
@@ -323,7 +329,13 @@ mod tests {
     #[tokio::test]
     async fn packets_round_trip_over_a_stream() {
         let (near, mut far) = duplex(64 * 1024);
-        let session = StreamSession::new(Box::new(near), LenPrefix, LenPrefix, remote());
+        let session = StreamSession::new(
+            Box::new(near),
+            LenPrefix,
+            LenPrefix,
+            remote(),
+            &Default::default(),
+        );
         let mut packet = PacketBuf::with_headroom(session.headroom());
         packet.extend_from_slice(b"hello");
         send_packet(&session, &mut packet, &remote()).await.unwrap();
@@ -345,7 +357,13 @@ mod tests {
     #[tokio::test]
     async fn a_stalled_stream_holds_sends_back_and_keeps_their_order() {
         let (near, mut far) = duplex(1024);
-        let session = StreamSession::new(Box::new(near), LenPrefix, LenPrefix, remote());
+        let session = StreamSession::new(
+            Box::new(near),
+            LenPrefix,
+            LenPrefix,
+            remote(),
+            &Default::default(),
+        );
         let target = remote();
         let mut sent = 0u32;
         loop {
@@ -375,7 +393,13 @@ mod tests {
     async fn the_writer_task_ends_with_its_session() {
         for close_first in [false, true] {
             let (near, mut far) = duplex(1024);
-            let session = StreamSession::new(Box::new(near), LenPrefix, LenPrefix, remote());
+            let session = StreamSession::new(
+                Box::new(near),
+                LenPrefix,
+                LenPrefix,
+                remote(),
+                &Default::default(),
+            );
             let mut packet = PacketBuf::with_headroom(2);
             packet.extend_from_slice(b"last");
             send_packet(&session, &mut packet, &remote()).await.unwrap();
@@ -400,7 +424,13 @@ mod tests {
     #[tokio::test]
     async fn a_send_still_leaves_when_its_session_drops_right_after() {
         let (near, mut far) = duplex(1024);
-        let session = StreamSession::new(Box::new(near), LenPrefix, LenPrefix, remote());
+        let session = StreamSession::new(
+            Box::new(near),
+            LenPrefix,
+            LenPrefix,
+            remote(),
+            &Default::default(),
+        );
         for payload in [&b"one"[..], b"two"] {
             let mut packet = PacketBuf::with_headroom(2);
             packet.extend_from_slice(payload);
@@ -431,6 +461,7 @@ mod tests {
                 LenPrefix,
                 LenPrefix,
                 remote(),
+                &Default::default(),
             ));
             fars.push(far);
         }
@@ -472,7 +503,8 @@ mod tests {
         let key = SsKey::new(kind, "secret").unwrap();
         let (near, far) = duplex(1 << 20);
         let carrier: BoxStream = Box::new(ClientStream::new(near, new_context(), &key, &remote()));
-        let session = StreamSession::new(carrier, LenPrefix, LenPrefix, remote());
+        let session =
+            StreamSession::new(carrier, LenPrefix, LenPrefix, remote(), &Default::default());
         let mut server = ProxyServerStream::from_stream(
             SsContext::new_shared(ServerType::Server),
             far,
@@ -504,6 +536,7 @@ mod tests {
             LenPrefix,
             LenPrefix,
             remote(),
+            &Default::default(),
         );
         let mut packet = PacketBuf::with_headroom(session.headroom());
         packet.extend_from_slice(b"query");

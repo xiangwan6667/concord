@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -11,7 +10,9 @@ use tokio::runtime::Handle;
 
 use crate::ca::{Authority, CaError, CertificateInfo};
 use crate::capture::{Body, CaptureStore, Exchange, ExchangeList};
-use crate::config::{Config, Issue, ParseEnv, RawConfig, check};
+use concord_config::mitm::MitmDef;
+
+use crate::config::{Config, ParseEnv, RawConfig, Validation, check};
 use crate::cron::LocalClock;
 use crate::engine::{MitmEngine, Shared};
 use crate::limits::Pressure;
@@ -137,7 +138,7 @@ impl Mitm {
         self.shared.authority.current()?.issue_pem(host)
     }
 
-    pub fn validate(&self, raw: &RawConfig) -> BTreeMap<String, Vec<Issue>> {
+    pub fn validate(&self, raw: &RawConfig) -> Validation {
         check(raw, &self.parse_env())
     }
 
@@ -145,9 +146,19 @@ impl Mitm {
     /// under way while the section stays the same. Returns the lines that could
     /// not be read.
     pub fn apply(&self, raw: Option<RawConfig>) -> Vec<String> {
+        self.apply_def(raw.map(|raw| MitmDef::read(&raw)), true)
+    }
+
+    /// As [Mitm::apply] for a profile's section, whose lines that cannot be read its load
+    /// reported: returns the lines that read but cannot be put in force.
+    pub fn apply_section(&self, def: Option<MitmDef>) -> Vec<String> {
+        self.apply_def(def, false)
+    }
+
+    fn apply_def(&self, def: Option<MitmDef>, unread: bool) -> Vec<String> {
         let state = lock(&self.state);
         let previous = self.current.load_full();
-        let Some(raw) = raw.filter(|raw| raw.enable) else {
+        let Some(def) = def.filter(|def| def.enable) else {
             self.current.store(None);
             self.shared.captures.clear();
             if let Some(previous) = previous {
@@ -155,7 +166,7 @@ impl Mitm {
             }
             return Vec::new();
         };
-        let (config, errors) = Config::parse(raw, &self.parse_env());
+        let (config, errors) = Config::compile(def, &self.parse_env(), unread);
         if let Some(previous) = &previous
             && previous.config().same(&config)
             && previous.trusts(&self.shared.trust.load())

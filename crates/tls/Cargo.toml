@@ -31,6 +31,7 @@ brotli-decompressor = { workspace = true }
 flate2 = { workspace = true }
 h2 = { workspace = true }
 http = { workspace = true }
+aes-gcm = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
@@ -41,7 +42,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 concord-test-support = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
 rcgen = { workspace = true }
 tempfile = { workspace = true }
 time = { workspace = true }

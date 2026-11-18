@@ -24,6 +24,7 @@ const CLOSED_PORT: i64 = 13;
 struct World {
     _runtime: Runtime,
     bus: Arc<EventBus>,
+    #[cfg(unix)]
     home: tempfile::TempDir,
 }
 
@@ -43,12 +44,13 @@ fn world() -> &'static World {
             platform: Arc::new(NativePlatform::new()),
         });
         let control = Control::new(engine, bus.clone(), ControlOptions::default());
-        let server = Arc::new(Server::new(control.clone()));
+        let server = Arc::new(Server::new(control));
         drop(entered);
-        assert!(install(Hub::new(runtime.handle().clone(), server, control)));
+        assert!(install(Hub::new(runtime.handle().clone(), server)));
         World {
             _runtime: runtime,
             bus,
+            #[cfg(unix)]
             home: tempfile::tempdir().unwrap(),
         }
     })

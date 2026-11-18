@@ -9,6 +9,7 @@ use concord_common::{Address, PacketBuf, PacketSession};
 use tokio::sync::mpsc;
 
 use super::wire::{Defrag, MAX_UDP, UdpHeader, parse_udp, put_udp_header, udp_header_len};
+use crate::quic::DatagramHub;
 use crate::util::lock;
 
 const QUEUE: usize = 64;
@@ -46,12 +47,14 @@ impl Hub {
     pub(crate) fn remove(&self, id: u32) {
         lock(&self.sessions).remove(&id);
     }
+}
 
-    pub(crate) fn close_all(&self) {
+impl DatagramHub for Hub {
+    fn close_all(&self) {
         lock(&self.sessions).clear();
     }
 
-    pub(crate) fn dispatch(&self, datagram: &Bytes) {
+    fn dispatch(&self, datagram: &Bytes) {
         let Ok(message) = parse_udp(datagram) else {
             return;
         };

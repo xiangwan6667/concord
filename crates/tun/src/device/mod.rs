@@ -233,6 +233,9 @@ pub struct TunDevice {
 }
 
 impl TunDevice {
+    /// Whether [`create`](Self::create) turns on offload where the kernel supports it.
+    pub const OFFLOADS: bool = cfg!(target_os = "linux");
+
     /// Creates the interface with the first address of each family; further addresses are
     /// not configured.
     #[cfg(not(target_os = "android"))]

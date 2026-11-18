@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
 use arc_swap::ArcSwap;
-use concord_common::backoff::provider_backoff as backoff;
+use concord_common::backoff::{Attempt, provider_backoff as backoff, retry_until_loaded};
 use concord_common::sync::lock;
 use concord_common::{CoreEvent, Fetch, Refresh, ResourceKind, ResourcePhase, ResourceUpdate};
 use concord_config::provider::{ProxyProviderDef, ProxySource, parse_provider_content};
@@ -163,7 +163,7 @@ impl ProxyProvider {
             shared
                 .home
                 .confine(path)
-                .map_err(|_| fail(format!("path is not subpath of home directory: {path}")))
+                .map_err(|err| fail(format!("{err}: {path}")))
         };
         let vehicle = match &def.source {
             ProxySource::File { path } => Vehicle::File {
@@ -195,12 +195,15 @@ impl ProxyProvider {
                 payload: payload.clone(),
             },
         };
-        let initial = match &vehicle {
-            Vehicle::Inline { payload } => {
-                items_from_maps(def, shared.factory.as_ref(), &name, payload.clone())
-                    .map_err(fail)?
-            }
-            _ => Vec::new(),
+        let payload = match &vehicle {
+            Vehicle::Inline { payload } => payload,
+            _ => &def.fallback,
+        };
+        let initial = if def.override_.expr || payload.is_empty() {
+            // Loading emptied an inline one with a warning: its nodes must not run without the expressions.
+            Vec::new()
+        } else {
+            items_from_maps(def, shared.factory.as_ref(), &name, payload.clone()).map_err(fail)?
         };
         let health = &def.health_check;
         let params = CheckParams {
@@ -586,7 +589,9 @@ impl ProxyProvider {
                 let (home, path) = (self.shared.home.clone(), path.clone());
                 match blocking(move || home.read(&path)).await? {
                     Ok(bytes) => Ok(bytes),
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        Err(self.def.fallback.clone())
+                    }
                     Err(err) => return Err(ProviderError::Io(err.to_string())),
                 }
             }
@@ -703,8 +708,23 @@ pub(crate) async fn run(
         }
         (loaded, strong.interval())
     };
-    if initial.is_err() && !retry_until_loaded(&provider, interval, &stop).await {
-        return;
+    if initial.is_err() {
+        let loaded = retry_until_loaded(interval, &stop, || async {
+            let Some(strong) = provider.upgrade() else {
+                return Attempt::Gone;
+            };
+            match strong.reported(strong.pull()).await {
+                Ok(_) => Attempt::Loaded,
+                Err(err) => {
+                    tracing::warn!("[Provider] {} pull error: {err}", strong.name);
+                    Attempt::Retry
+                }
+            }
+        })
+        .await;
+        if !loaded {
+            return;
+        }
     }
     if interval.is_zero() {
         return;
@@ -734,31 +754,6 @@ pub(crate) async fn run(
         };
         strong.update_with_log().await;
         delay = strong.pull_delay(interval);
-    }
-}
-
-async fn retry_until_loaded(
-    provider: &Weak<ProxyProvider>,
-    interval: Duration,
-    stop: &CancellationToken,
-) -> bool {
-    if interval.is_zero() {
-        return false;
-    }
-    let mut attempt = 0;
-    loop {
-        tokio::select! {
-            _ = stop.cancelled() => return false,
-            _ = tokio::time::sleep(backoff(attempt, interval)) => {}
-        }
-        let Some(strong) = provider.upgrade() else {
-            return false;
-        };
-        match strong.reported(strong.pull()).await {
-            Ok(_) => return true,
-            Err(err) => tracing::warn!("[Provider] {} pull error: {err}", strong.name),
-        }
-        attempt += 1;
     }
 }
 

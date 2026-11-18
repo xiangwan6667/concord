@@ -1,6 +1,7 @@
 use crate::Map;
 use crate::error::Result;
-use crate::lenient::Fields;
+use crate::keys::{default_number, ntp_defaults};
+use crate::lenient::{Fields, Ignored};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NtpConfig {
@@ -14,15 +15,22 @@ pub struct NtpConfig {
 
 impl NtpConfig {
     pub fn from_map(map: &Map) -> Result<NtpConfig> {
+        Ok(NtpConfig::read(map)?.0)
+    }
+
+    /// A number out of range takes its default, returned as a note.
+    pub fn read(map: &Map) -> Result<(NtpConfig, Vec<Ignored>)> {
+        let defaults = ntp_defaults();
         let mut f = Fields::new(map, "ntp", false);
-        Ok(NtpConfig {
+        let ntp = NtpConfig {
             enable: f.boolean("enable")?,
             server: f.string("server")?,
-            port: f.u16("port")?,
-            interval: f.u32("interval")?,
+            port: f.loose("port", default_number(&defaults, "port"))?,
+            interval: f.loose("interval", default_number(&defaults, "interval"))?,
             dialer_proxy: f.string("dialer-proxy")?,
             write_to_system: f.boolean("write-to-system")?,
-        })
+        };
+        Ok((ntp, f.take_ignored()))
     }
 }
 

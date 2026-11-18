@@ -357,7 +357,7 @@ async fn roundtrip(stack: &TransportStack, client: DuplexStream) {
 }
 
 fn stack(client: ShadowTlsClient) -> TransportStack {
-    TransportStack::new(vec![Layer::ShadowTls(Arc::new(client))])
+    TransportStack::new(vec![Layer::ShadowTls(Arc::new(client))], Default::default())
 }
 
 #[tokio::test]
@@ -521,7 +521,7 @@ async fn tls_layer_and_tls_dial_check_alpn() {
     );
     assert!(mismatch().await.is_err());
 
-    let stack = TransportStack::new(vec![Layer::Tls(connector(&["h2"]))]);
+    let stack = TransportStack::new(vec![Layer::Tls(connector(&["h2"]))], Default::default());
     let (near, far) = duplex(1 << 16);
     let acceptor = tokio_rustls::TlsAcceptor::from(decoy.config.clone());
     tokio::spawn(async move {

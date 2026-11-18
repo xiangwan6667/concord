@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use concord_config::mitm::text::canonical_header;
 use concord_tls::TrustStore;
 use rand::RngCore;
 use rquickjs::context::EvalOptions;
@@ -26,7 +27,6 @@ use super::store::Store;
 use crate::script::{
     ConsoleSink, HeaderList, ScriptError, ScriptInvocation, ScriptResponse, ScriptResult,
 };
-use crate::text::canonical_header;
 
 const POLYFILL: &str = include_str!("polyfill.js");
 const PRELUDE: &str = include_str!("prelude.js");

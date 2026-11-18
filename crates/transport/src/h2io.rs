@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes};
 use concord_common::stream_buffer::{self, StreamBuffer};
-use concord_common::{BoxRead, BoxStream, BoxWrite, Stream};
+use concord_common::{BoxRead, BoxStream, BoxWrite, Stream, Tasks};
 use h2::client::ResponseFuture;
 use h2::{RecvStream, SendStream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -31,7 +31,7 @@ pub(crate) fn h2_io_error(err: h2::Error) -> io::Error {
     io::Error::new(kind, err)
 }
 
-pub(crate) fn client_builder() -> h2::client::Builder {
+pub fn client_builder() -> h2::client::Builder {
     let mut builder = h2::client::Builder::new();
     builder
         .initial_window_size(STREAM_WINDOW)
@@ -42,7 +42,7 @@ pub(crate) fn client_builder() -> h2::client::Builder {
 
 /// Last time anything arrived on a connection, so a ping goes out only when it
 /// has been quiet.
-pub(crate) struct Activity {
+pub struct Activity {
     base: Instant,
     last_ms: AtomicU64,
     ended: AtomicBool,
@@ -72,12 +72,13 @@ impl Activity {
     }
 }
 
-pub(crate) fn spawn_connection(
+pub fn spawn_connection(
+    tasks: &Tasks,
     conn: h2::client::Connection<BoxStream, Bytes>,
     ping_interval: Option<Duration>,
     activity: Arc<Activity>,
 ) {
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         drive(conn, ping_interval, &activity).await;
         activity.ended.store(true, Ordering::Relaxed);
     });
@@ -116,7 +117,7 @@ async fn drive(
     }
 }
 
-pub(crate) enum Incoming {
+pub enum Incoming {
     Response(ResponseFuture),
     Body(RecvStream),
     Done,
@@ -302,7 +303,7 @@ impl Drop for DropHook {
 }
 
 /// A request stream as a byte stream in both directions.
-pub(crate) struct H2Body {
+pub struct H2Body {
     reader: H2Reader,
     writer: H2Writer,
     hook: Arc<DropHook>,

@@ -1,0 +1,28 @@
+name: ca-bundle
+description: >-
+  Puts the CA bundle the release core embeds at assets/ca-certificates.crt. It is pinned by hash, so a new bundle
+  from https://curl.se/docs/caextract.html is a reviewed bump.
+
+runs:
+  using: composite
+  steps:
+    - name: Cache CA certificates
+      id: cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/ca
+        key: ca-${{ hashFiles('.github/actions/ca-bundle/action.yml') }}
+
+    - name: Install CA certificates
+      shell: bash
+      env:
+        CA_BUNDLE: cacert-2026-09-25.pem
+        CA_BUNDLE_SHA256: a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505
+      run: |
+        bundle=$RUNNER_TEMP/ca/$CA_BUNDLE
+        if [ ! -f "$bundle" ]; then
+          mkdir -p "$RUNNER_TEMP/ca"
+          curl -fsSL --retry 3 -o "$bundle" "https://curl.se/ca/$CA_BUNDLE"
+        fi
+        echo "$CA_BUNDLE_SHA256  $bundle" | sha256sum -c -
+        cp "$bundle" assets/ca-certificates.crt

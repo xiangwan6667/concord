@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,12 +6,12 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use concord_common::Address;
-use concord_config::proxy::{WgPeer, WireGuardOpts};
+use concord_config::proxy::{WgPeer, WireGuardOpts, wireguard_dns};
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 
 use super::amnezia::Settings;
-use super::stack::Congestion;
 use crate::ctx::BuildError;
+use crate::stack::Congestion;
 
 const DEFAULT_MTU: usize = 1408;
 const MAX_MTU: usize = 65_495;
@@ -33,15 +33,15 @@ impl PeerConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum DnsTransport {
+pub(crate) enum DnsTransport {
     Udp,
     Tcp,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct DnsServer {
-    pub(super) addr: SocketAddr,
-    pub(super) transport: DnsTransport,
+pub(crate) struct DnsServer {
+    pub(crate) addr: SocketAddr,
+    pub(crate) transport: DnsTransport,
 }
 
 pub(super) struct WgConfig {
@@ -127,19 +127,13 @@ fn peer(index: usize, raw: &WgPeer, addrs: &[IpNetwork]) -> Result<PeerConfig, B
     })
 }
 
-fn dns_server(text: &str) -> Option<DnsServer> {
-    let (transport, rest) = match text.split_once("://") {
-        Some(("udp", rest)) => (DnsTransport::Udp, rest),
-        Some(("tcp", rest)) => (DnsTransport::Tcp, rest),
-        Some(_) => return None,
-        None => (DnsTransport::Udp, text),
+pub(crate) fn dns_server(text: &str) -> Option<DnsServer> {
+    let (addr, tcp) = wireguard_dns(text)?;
+    let transport = if tcp {
+        DnsTransport::Tcp
+    } else {
+        DnsTransport::Udp
     };
-    let rest = rest.split(['#', '?', '/']).next().unwrap_or(rest);
-    let addr = SocketAddr::from_str(rest).ok().or_else(|| {
-        IpAddr::from_str(rest.trim_matches(['[', ']']))
-            .ok()
-            .map(|ip| SocketAddr::new(ip, 53))
-    })?;
     Some(DnsServer { addr, transport })
 }
 

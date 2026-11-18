@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, ready};
 
 use concord_common::sync::lock;
-use concord_common::{BoxRead, BoxStream, BoxWrite, Stream};
+use concord_common::{BoxRead, BoxStream, BoxWrite, Stream, Tasks};
 use futures_util::task::AtomicWaker;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::task::JoinHandle;
@@ -15,6 +15,7 @@ struct Parts {
     io: BoxStream,
     opts: WsOptions,
     host: String,
+    tasks: Tasks,
 }
 
 #[derive(Default)]
@@ -83,9 +84,14 @@ enum Side {
 }
 
 impl LazyWs {
-    pub fn new(io: BoxStream, opts: WsOptions, host: String, max: usize) -> Self {
+    pub fn new(io: BoxStream, opts: WsOptions, host: String, max: usize, tasks: Tasks) -> Self {
         LazyWs {
-            state: State::Idle(Some(Parts { io, opts, host })),
+            state: State::Idle(Some(Parts {
+                io,
+                opts,
+                host,
+                tasks,
+            })),
             max,
             shared: Arc::new(Shared::default()),
         }
@@ -116,11 +122,17 @@ impl LazyWs {
         let State::Idle(parts) = &mut self.state else {
             return;
         };
-        let Some(Parts { io, opts, host }) = parts.take() else {
+        let Some(Parts {
+            io,
+            opts,
+            host,
+            tasks,
+        }) = parts.take()
+        else {
             return;
         };
         let shared = self.shared.clone();
-        let task = tokio::spawn(async move {
+        let task = tasks.spawn(async move {
             let outcome = connect(io, &opts, &host, Some(&early)).await;
             shared.slot().result = Some(outcome);
             shared.read.wake();
@@ -267,11 +279,17 @@ impl LazyWrite {
         let WriteState::Idle(parts) = &mut self.state else {
             return;
         };
-        let Some(Parts { io, opts, host }) = parts.take() else {
+        let Some(Parts {
+            io,
+            opts,
+            host,
+            tasks,
+        }) = parts.take()
+        else {
             return;
         };
         let shared = self.shared.clone();
-        let task = tokio::spawn(async move {
+        let task = tasks.spawn(async move {
             let outcome = connect(io, &opts, &host, Some(&early)).await;
             shared.slot().result = Some(outcome);
             shared.read.wake();

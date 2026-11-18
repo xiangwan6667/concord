@@ -1,7 +1,7 @@
 use concord_config::Capabilities;
 
 const TRANSPORTS: &[&str] = &["ws", "grpc", "h2", "http", "xhttp", "httpupgrade"];
-const SS_PLUGINS: &[&str] = &["obfs", "v2ray-plugin", "shadow-tls"];
+const SS_PLUGINS: &[&str] = &["obfs", "v2ray-plugin", "shadow-tls", "jls", "gost-plugin"];
 
 /// `proxy_types` and `rule_types` are the config crate's full lists: `build_outbound` matches
 /// every `ProxyKind`, and the rules crate decides the rule types.
@@ -35,6 +35,7 @@ mod tests {
     fn minimal(kind: &str) -> Value {
         let base = json!({"name": "n", "type": kind, "server": "127.0.0.1", "port": 1});
         let extra = match kind {
+            "rematch" => json!({"target-rematch-name": "next"}),
             "ss" => json!({"cipher": "aes-128-gcm", "password": "p"}),
             "vmess" => {
                 json!({"uuid": "b831381d-6324-4d53-ad4f-8cda48b30811", "cipher": "auto", "alterId": 0})
@@ -44,6 +45,9 @@ mod tests {
             "hysteria" => json!({"up": "10", "down": "10"}),
             "hysteria2" => json!({"password": "p"}),
             "tuic" => json!({"uuid": "b831381d-6324-4d53-ad4f-8cda48b30811", "password": "p"}),
+            "masque" => {
+                json!({"private-key": "invalid", "public-key": "invalid", "ip": "10.0.0.2"})
+            }
             "wireguard" => json!({
                 "private-key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
                 "public-key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",

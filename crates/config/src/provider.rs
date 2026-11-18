@@ -7,6 +7,7 @@ use crate::error::{ConfigError, Result};
 use crate::filter::{self, CompiledFilter};
 use crate::lenient::{Fields, scalar_text};
 use crate::net::parse_unsigned_ranges;
+use crate::report::LoadReport;
 use crate::{share_link, yaml};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,7 +55,7 @@ pub struct OverrideDef {
     pub skip_cert_verify: Option<bool>,
     pub name_cert_verify: Option<String>,
     pub interface_name: Option<String>,
-    pub routing_mark: Option<i32>,
+    pub routing_mark: Option<u32>,
     pub ip_version: Option<String>,
     pub additional_prefix: Option<String>,
     pub additional_suffix: Option<String>,
@@ -73,6 +74,8 @@ pub struct ProxyProviderDef {
     pub age_secret_key: String,
     pub health_check: HealthCheckDef,
     pub override_: OverrideDef,
+    /// `payload` of a file or http provider: its nodes until a load succeeds.
+    pub fallback: Vec<Map>,
     pub raw: Map,
 }
 
@@ -88,6 +91,8 @@ pub enum RuleFormat {
     Yaml,
     Text,
     Mrs,
+    /// Surge's DOMAIN-SET, text in which `.example.com` covers `example.com` too; Concord's own.
+    DomainSet,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,6 +111,8 @@ pub struct RuleProviderDef {
     pub interval: u32,
     /// `payload` of a file or http provider: its rules until a load succeeds.
     pub fallback: Vec<String>,
+    /// Where mihomo finds the provider in `BundleMRS.7z` when its local file is missing; never read.
+    pub path_in_bundle: String,
     pub raw: Map,
 }
 
@@ -140,7 +147,7 @@ fn parse_override(f: &mut Fields<'_>) -> Result<OverrideDef> {
         name_cert_verify: opt_override(&mut o, "name-cert-verify")?,
         interface_name: opt_override(&mut o, "interface-name")?,
         routing_mark: if o.has("routing-mark") {
-            Some(o.i32("routing-mark")?)
+            Some(o.mark("routing-mark")?)
         } else {
             None
         },
@@ -149,18 +156,21 @@ fn parse_override(f: &mut Fields<'_>) -> Result<OverrideDef> {
         additional_suffix: opt_override(&mut o, "additional-suffix")?,
         proxy_name: Vec::new(),
     };
-    if let Some(Value::Array(items)) = o.raw("proxy-name") {
-        for item in items {
-            let Value::Object(entry) = item else {
-                return Err(ConfigError::new("override.proxy-name entries must be maps"));
-            };
-            let mut e = Fields::new(entry, "override.proxy-name", false);
-            let pattern = e.req_string("pattern")?;
-            let target = e.req_string("target")?;
-            e.finish()?;
-            filter::compile_pattern(&pattern, false)?;
-            def.proxy_name.push(NameRewrite { pattern, target });
-        }
+    let rewrites = match o.raw("proxy-name") {
+        Some(Value::Array(items)) => items.as_slice(),
+        None | Some(Value::Null) => &[],
+        Some(_) => return Err(ConfigError::new("'override.proxy-name' is not a slice")),
+    };
+    for item in rewrites {
+        let Value::Object(entry) = item else {
+            return Err(ConfigError::new("override.proxy-name entries must be maps"));
+        };
+        let mut e = Fields::new(entry, "override.proxy-name", false);
+        let pattern = e.req_string("pattern")?;
+        let target = e.req_string("target")?;
+        e.finish()?;
+        filter::compile_pattern(&pattern, false)?;
+        def.proxy_name.push(NameRewrite { pattern, target });
     }
     Ok(def)
 }
@@ -202,23 +212,26 @@ pub fn parse_proxy_provider(name: &str, map: &Map) -> Result<ProxyProviderDef> {
     let dialer_proxy = f.string("dialer-proxy")?;
     let age_secret_key = f.string("age-secret-key")?;
     let override_ = parse_override(&mut f)?;
+    let mut fallback = Vec::new();
+    let payload = match f.raw("payload") {
+        Some(Value::Array(items)) => items.as_slice(),
+        None | Some(Value::Null) => &[],
+        Some(_) => return Err(ConfigError::new("'payload' is not a slice")),
+    };
+    for item in payload {
+        match item {
+            Value::Object(entry) => fallback.push(entry.clone()),
+            _ => return Err(ConfigError::new("payload entries must be maps")),
+        }
+    }
     let source = match type_name.as_str() {
         "file" => ProxySource::File {
             path: f.string("path")?,
         },
         "http" => ProxySource::Http(http_source(&mut f)?),
-        "inline" => {
-            let mut payload = Vec::new();
-            if let Some(Value::Array(items)) = f.raw("payload") {
-                for item in items {
-                    match item {
-                        Value::Object(entry) => payload.push(entry.clone()),
-                        _ => return Err(ConfigError::new("payload entries must be maps")),
-                    }
-                }
-            }
-            ProxySource::Inline { payload }
-        }
+        "inline" => ProxySource::Inline {
+            payload: std::mem::take(&mut fallback),
+        },
         other => {
             return Err(ConfigError::new(format!("unsupport vehicle type: {other}")));
         }
@@ -246,6 +259,7 @@ pub fn parse_proxy_provider(name: &str, map: &Map) -> Result<ProxyProviderDef> {
         age_secret_key,
         health_check,
         override_,
+        fallback,
         raw: map.clone(),
     })
 }
@@ -293,8 +307,9 @@ impl ProxyProviderDef {
                 continue;
             }
             if !self.dialer_proxy.is_empty() {
-                mapping.insert(
-                    "dialer-proxy".into(),
+                put(
+                    &mut mapping,
+                    "dialer-proxy",
                     Value::String(self.dialer_proxy.clone()),
                 );
             }
@@ -322,7 +337,7 @@ impl ProxyProviderDef {
         ];
         for (key, value) in flags {
             if let Some(value) = value {
-                mapping.insert(key.into(), Value::Bool(value));
+                put(mapping, key, Value::Bool(value));
             }
         }
         let texts = [
@@ -335,11 +350,11 @@ impl ProxyProviderDef {
         ];
         for (key, value) in texts {
             if let Some(value) = value {
-                mapping.insert(key.into(), Value::String(value.clone()));
+                put(mapping, key, Value::String(value.clone()));
             }
         }
         if let Some(mark) = o.routing_mark {
-            mapping.insert("routing-mark".into(), Value::from(mark));
+            put(mapping, "routing-mark", Value::from(mark));
         }
         let mut name = mapping
             .get("name")
@@ -366,11 +381,7 @@ pub fn parse_rule_provider(name: &str, map: &Map) -> Result<RuleProviderDef> {
     let behavior_text = f.string("behavior")?;
     let format_text = f.string("format")?;
     let interval = f.u32("interval")?;
-    if f.has("path-in-bundle") && !f.string("path-in-bundle")?.is_empty() {
-        return Err(ConfigError::new(
-            "path-in-bundle is not supported by this core",
-        ));
-    }
+    let path_in_bundle = f.string("path-in-bundle")?;
     let behavior = match behavior_text.as_str() {
         "domain" => RuleBehavior::Domain,
         "ipcidr" => RuleBehavior::IpCidr,
@@ -386,6 +397,12 @@ pub fn parse_rule_provider(name: &str, map: &Map) -> Result<RuleProviderDef> {
         "" | "yaml" => RuleFormat::Yaml,
         "text" => RuleFormat::Text,
         "mrs" => RuleFormat::Mrs,
+        "domain-set" if behavior == RuleBehavior::Domain => RuleFormat::DomainSet,
+        "domain-set" => {
+            return Err(ConfigError::new(
+                "the domain-set format needs the domain behavior",
+            ));
+        }
         other => {
             return Err(ConfigError::new(format!(
                 "unsupported format type: {other}"
@@ -419,8 +436,38 @@ pub fn parse_rule_provider(name: &str, map: &Map) -> Result<RuleProviderDef> {
         format,
         interval,
         fallback,
+        path_in_bundle,
         raw: map.clone(),
     })
+}
+
+/// Node keys are read without case and with `_` for `-`, first spelling first, so a spelling the
+/// node already has would win over the override.
+fn put(mapping: &mut Map, key: &str, value: Value) {
+    mapping.retain(|existing, _| !existing.replace('_', "-").eq_ignore_ascii_case(key));
+    mapping.insert(key.into(), value);
+}
+
+pub fn parse_rule_providers(
+    maps: &IndexMap<String, Map>,
+    report: &mut LoadReport,
+) -> Result<Vec<RuleProviderDef>> {
+    let mut providers = Vec::with_capacity(maps.len());
+    for (name, map) in maps {
+        let provider = parse_rule_provider(name, map)
+            .map_err(|err| err.prefixed(&format!("parse rule provider {name} error: ")))?;
+        if !provider.path_in_bundle.is_empty()
+            && !matches!(provider.source, RuleSource::Inline { .. })
+        {
+            report.warn(
+                "not_applied",
+                format!("rule-providers.{name}.path-in-bundle"),
+                "BundleMRS.7z is not read by this core; the provider loads from its path or url",
+            );
+        }
+        providers.push(provider);
+    }
+    Ok(providers)
 }
 
 pub fn parse_provider_content(bytes: &[u8], age_secret_key: Option<&str>) -> Result<Vec<Map>> {
@@ -491,6 +538,13 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(&inline.source, ProxySource::Inline { payload } if payload.len() == 1));
+        assert!(inline.fallback.is_empty());
+        let spare = parse_proxy_provider(
+            "s",
+            &map(json!({"type": "file", "path": "a.yaml", "payload": [{"name": "a", "type": "direct"}]})),
+        )
+        .unwrap();
+        assert_eq!(spare.fallback.len(), 1);
         assert!(parse_proxy_provider("x", &map(json!({"type": "ftp"}))).is_err());
         assert!(parse_proxy_provider("x", &map(json!({}))).is_err());
         assert!(
@@ -500,6 +554,56 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn a_payload_that_is_not_a_list_is_refused() {
+        let err = parse_proxy_provider(
+            "p",
+            &map(json!({"type": "inline", "payload": {"name": "a", "type": "direct"}})),
+        )
+        .unwrap_err();
+        assert_eq!(err.message, "'payload' is not a slice");
+    }
+
+    #[test]
+    fn a_proxy_name_rewrite_that_is_not_a_list_is_refused() {
+        let parsed = |rewrite: Value| {
+            parse_proxy_provider(
+                "p",
+                &map(json!({"type": "file", "path": "a", "override": {"proxy-name": rewrite}})),
+            )
+        };
+        let err = parsed(json!({"pattern": "a", "target": "b"})).unwrap_err();
+        assert_eq!(err.message, "'override.proxy-name' is not a slice");
+        assert!(parsed(Value::Null).unwrap().override_.proxy_name.is_empty());
+        let listed = parsed(json!([{"pattern": "a", "target": "b"}])).unwrap();
+        assert_eq!(listed.override_.proxy_name.len(), 1);
+    }
+
+    #[test]
+    fn an_override_replaces_every_spelling_of_its_key() {
+        let def = parse_proxy_provider(
+            "p",
+            &map(json!({"type": "file", "path": "a", "dialer-proxy": "relay",
+                "override": {"skip-cert-verify": false}})),
+        )
+        .unwrap();
+        let node = map(
+            json!({"name": "a", "type": "trojan", "server": "s", "port": 443, "password": "p",
+            "skip_cert_verify": true, "Dialer_Proxy": "other"}),
+        );
+        let out = def.select_proxies(vec![node]).unwrap();
+        let Ok(crate::ProxyParse::Ok(parsed)) =
+            crate::parse_proxy(&out[0], &crate::Capabilities::full())
+        else {
+            panic!("{out:?}");
+        };
+        assert_eq!(parsed.common.dialer_proxy, "relay");
+        let crate::proxy::ProxyKind::Trojan(trojan) = &parsed.kind else {
+            panic!("{parsed:?}");
+        };
+        assert!(!trojan.tls.skip_cert_verify);
     }
 
     #[test]
@@ -538,6 +642,19 @@ mod tests {
             (def.behavior, def.format),
             (RuleBehavior::Domain, RuleFormat::Mrs)
         );
+        let set = parse_rule_provider(
+            "s",
+            &map(json!({"type": "http", "url": "https://x", "behavior": "domain", "format": "domain-set"})),
+        )
+        .unwrap();
+        assert_eq!(set.format, RuleFormat::DomainSet);
+        assert!(
+            parse_rule_provider(
+                "s",
+                &map(json!({"type": "http", "url": "https://x", "behavior": "classical", "format": "domain-set"})),
+            )
+            .is_err()
+        );
         let inline = parse_rule_provider(
             "i",
             &map(json!({"type": "inline", "behavior": "classical", "payload": ["DOMAIN,a.com"]})),
@@ -565,7 +682,12 @@ mod tests {
             )
             .is_err()
         );
-        assert!(parse_rule_provider("x", &map(json!({"type": "file", "behavior": "domain", "path": "a", "path-in-bundle": "x"}))).is_err());
+        let bundled = parse_rule_provider(
+            "b",
+            &map(json!({"type": "file", "behavior": "domain", "path": "a", "path-in-bundle": "geo/cn.mrs"})),
+        )
+        .unwrap();
+        assert_eq!(bundled.path_in_bundle, "geo/cn.mrs");
     }
 
     #[test]

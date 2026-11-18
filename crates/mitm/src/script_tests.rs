@@ -209,6 +209,47 @@ async fn a_failing_script_leaves_the_exchange_alone_and_the_first_match_runs() {
     assert_eq!(counted.load(Ordering::SeqCst), 1);
 }
 
+fn appends(mark: &'static str) -> Arc<dyn ScriptProgram> {
+    sync_program(move |invocation| {
+        let mut body = invocation
+            .response
+            .as_ref()
+            .unwrap()
+            .body
+            .clone()
+            .unwrap_or_default();
+        body.extend_from_slice(mark.as_bytes());
+        Ok(ScriptResult {
+            body: Some(body),
+            ..ScriptResult::default()
+        })
+    })
+}
+
+#[tokio::test]
+async fn a_script_runs_only_on_the_heads_its_conditions_match() {
+    let (_server, rig) = scripted(vec![
+        ("adds", adds_header()),
+        ("missing", appends("+404")),
+        ("found", appends("+found")),
+    ])
+    .await;
+    rig.config(config(json!([
+        r"A = type=http-request,pattern=^https://example\.test/,request-head=^POST,script-path=adds.js",
+        r#"M = type=http-response,pattern=^https://example\.test/,response-head="^\S+ 404 ",requires-body=1,script-path=missing.js"#,
+        r#"F = type=http-response,pattern=^https://example\.test/,request-head="^GET ",requires-body=1,script-path=found.js"#,
+    ])));
+    let mut client = Client::tls(&rig, "example.test", 443, &["http/1.1"])
+        .await
+        .unwrap();
+    assert_eq!(client.get("/p").await.text(), "example.test|/p||+found");
+    let request = client.request("POST", "/p", &[], "body");
+    assert_eq!(
+        client.send(request).await.unwrap().text(),
+        "example.test|/p|from-script|body"
+    );
+}
+
 #[tokio::test]
 async fn pressure_sheds_scripts_then_bodies_then_the_relay() {
     let counted = Arc::new(AtomicUsize::new(0));

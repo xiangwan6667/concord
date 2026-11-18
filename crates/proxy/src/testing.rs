@@ -18,6 +18,7 @@ use concord_common::{
 };
 use concord_net::Sockets;
 use concord_platform::NativePlatform;
+use futures_util::task::AtomicWaker;
 
 pub(crate) struct IpOnly;
 
@@ -46,6 +47,53 @@ impl HostResolver for IpOnly {
 }
 
 const TEST_WAIT: Duration = Duration::from_secs(10);
+
+/// Tasks registered with a tracker the test can stop and wait on, as the engine's are.
+pub(crate) struct Tracked {
+    pub(crate) tasks: concord_common::Tasks,
+    tracker: tokio_util::task::TaskTracker,
+    stop: tokio_util::sync::CancellationToken,
+}
+
+impl Tracked {
+    pub(crate) fn new() -> Tracked {
+        let tracker = tokio_util::task::TaskTracker::new();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let tasks = concord_common::Tasks::new(
+            tracker.clone(),
+            stop.clone(),
+            tokio::runtime::Handle::current(),
+        );
+        Tracked {
+            tasks,
+            tracker,
+            stop,
+        }
+    }
+
+    pub(crate) fn ctx(&self) -> crate::ctx::BuildCtx {
+        let mut ctx = crate::ctx::BuildCtx::new(concord_tls::TrustStore::new(b"", Vec::new()));
+        ctx.tasks = self.tasks.clone();
+        ctx
+    }
+
+    pub(crate) fn running(&self) -> usize {
+        self.tracker.len()
+    }
+
+    pub(crate) fn stop(&self) {
+        self.stop.cancel();
+    }
+
+    pub(crate) async fn ended_within(&self, bound: Duration) -> bool {
+        self.tracker.close();
+        let ended = tokio::time::timeout(bound, self.tracker.wait())
+            .await
+            .is_ok();
+        self.tracker.reopen();
+        ended
+    }
+}
 
 /// What a spawned task returns; the test fails if it takes longer than ten seconds.
 pub(crate) async fn settled<T>(task: tokio::task::JoinHandle<T>) -> T {
@@ -163,6 +211,28 @@ impl NodeDialer for Nodes {
 #[derive(Default)]
 pub(crate) struct LoopbackHop {
     pub(crate) datagrams: Arc<AtomicUsize>,
+    pub(crate) cut: Arc<Cut>,
+}
+
+/// Once set, the hop's UDP sessions fail both ways, waking a receive parked on one.
+#[derive(Default)]
+pub(crate) struct Cut {
+    set: AtomicBool,
+    parked: AtomicWaker,
+}
+
+impl Cut {
+    pub(crate) fn set(&self) {
+        self.set.store(true, Ordering::SeqCst);
+        self.parked.wake();
+    }
+
+    fn check(&self) -> io::Result<()> {
+        if self.set.load(Ordering::SeqCst) {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -188,6 +258,7 @@ impl NodeDialer for LoopbackHop {
         Ok(Arc::new(HopSession {
             socket: tokio::net::UdpSocket::bind("127.0.0.1:0").await?,
             sent: self.datagrams.clone(),
+            cut: self.cut.clone(),
         }))
     }
 }
@@ -201,6 +272,7 @@ fn socket_of(dst: &Address) -> io::Result<SocketAddr> {
 struct HopSession {
     socket: tokio::net::UdpSocket,
     sent: Arc<AtomicUsize>,
+    cut: Arc<Cut>,
 }
 
 impl PacketSession for HopSession {
@@ -210,6 +282,9 @@ impl PacketSession for HopSession {
         pkt: &mut PacketBuf,
         dst: &Address,
     ) -> Poll<io::Result<()>> {
+        if let Err(err) = self.cut.check() {
+            return Poll::Ready(Err(err));
+        }
         let to = match socket_of(dst) {
             Ok(to) => to,
             Err(err) => return Poll::Ready(Err(err)),
@@ -223,6 +298,10 @@ impl PacketSession for HopSession {
     }
 
     fn poll_recv(&self, cx: &mut Context<'_>, buf: &mut PacketBuf) -> Poll<io::Result<Address>> {
+        self.cut.parked.register(cx.waker());
+        if let Err(err) = self.cut.check() {
+            return Poll::Ready(Err(err));
+        }
         let mut bytes = vec![0u8; 65535];
         let mut read = tokio::io::ReadBuf::new(&mut bytes);
         match self.socket.poll_recv_from(cx, &mut read) {

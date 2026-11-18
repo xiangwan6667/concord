@@ -656,9 +656,6 @@ impl Drop for MiuStream {
         let Some(io) = self.inner.take().filter(|_| !self.failed) else {
             return;
         };
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
         let mut cleanup = Self::new(
             IdleLane::reused(io, self.peer_idle, self.peer_raw),
             self.pool.clone(),
@@ -676,7 +673,7 @@ impl Drop for MiuStream {
         cleanup.read_end = self.read_end;
         cleanup.allow_raw = self.allow_raw;
         let write_end = self.write_end;
-        runtime.spawn(async move {
+        self.pool.tasks.spawn_detached(async move {
             let clean = tokio::time::timeout(Duration::from_secs(3), async {
                 cleanup.flush().await?;
                 if !cleanup.read_end || !write_end {

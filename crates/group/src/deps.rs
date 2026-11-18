@@ -48,7 +48,6 @@ pub enum Builtin {
 
 pub struct BuildFailure {
     pub message: String,
-    pub unsupported: bool,
 }
 
 pub enum Built {

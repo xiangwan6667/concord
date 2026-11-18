@@ -140,6 +140,16 @@ dto! {
         pub auto_route: Option<bool>,
     }
 
+    /// Which browser origins may call the external controller. An absent field takes mihomo's
+    /// default: every origin, and private-network preflights allowed. No origin refuses them all.
+    #[derive(Default)]
+    pub struct ControllerCorsPatch {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub allow_origins: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub allow_private_network: Option<bool>,
+    }
+
     /// An absent field keeps the value in force.
     #[derive(Default)]
     pub struct ConfigPatchParams {
@@ -147,6 +157,15 @@ dto! {
         pub tun: Option<TunPatch>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub allow_lan: Option<bool>,
+        /// `*` binds every address; read only while the LAN is allowed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub bind_address: Option<String>,
+        /// CIDR prefixes admitted to the mixed, HTTP and SOCKS listeners.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lan_allowed_ips: Option<Vec<String>>,
+        /// CIDR prefixes refused there even when the allowed list admits them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lan_disallowed_ips: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub mixed_port: Option<u16>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -163,6 +182,8 @@ dto! {
         pub external_controller: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub secret: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub external_controller_cors: Option<ControllerCorsPatch>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub unified_delay: Option<bool>,
         /// `user:password` lines.

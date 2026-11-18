@@ -15,6 +15,15 @@ pub fn is_armored(data: &[u8]) -> bool {
 fn identities(secret_keys: &[&str]) -> Result<Vec<Box<dyn Identity>>> {
     let mut out: Vec<Box<dyn Identity>> = Vec::new();
     for key in secret_keys {
+        if key.lines().any(|line| {
+            line.trim()
+                .to_ascii_uppercase()
+                .starts_with("AGE-SECRET-KEY-PQ-")
+        }) {
+            return Err(ConfigError::new(
+                "post-quantum (AGE-SECRET-KEY-PQ-1) keys are not supported by this core",
+            ));
+        }
         let file = IdentityFile::from_buffer(BufReader::new(key.as_bytes()))
             .map_err(|err| ConfigError::new(err.to_string()))?;
         let parsed = file
@@ -60,6 +69,15 @@ mod tests {
     use super::*;
     use age::secrecy::ExposeSecret;
     use age::x25519;
+
+    #[test]
+    fn a_post_quantum_key_is_named_as_unsupported() {
+        let err = verify_secret_key("AGE-SECRET-KEY-PQ-1QQQQ").unwrap_err();
+        assert_eq!(
+            err.message,
+            "post-quantum (AGE-SECRET-KEY-PQ-1) keys are not supported by this core"
+        );
+    }
 
     #[test]
     fn armored_input_round_trips_and_plain_input_passes_through() {

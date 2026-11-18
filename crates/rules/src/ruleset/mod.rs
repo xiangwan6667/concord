@@ -56,6 +56,7 @@ pub enum Format {
     Yaml,
     Text,
     Mrs,
+    DomainSet,
 }
 
 impl Format {
@@ -64,6 +65,7 @@ impl Format {
             Format::Yaml => "yaml",
             Format::Text => "text",
             Format::Mrs => "mrs",
+            Format::DomainSet => "domain-set",
         }
     }
 }
@@ -74,6 +76,7 @@ impl From<RuleFormat> for Format {
             RuleFormat::Yaml => Format::Yaml,
             RuleFormat::Text => Format::Text,
             RuleFormat::Mrs => Format::Mrs,
+            RuleFormat::DomainSet => Format::DomainSet,
         }
     }
 }
@@ -256,6 +259,11 @@ impl RuleSet {
                 env,
             )),
             Format::Text => Ok(Self::from_entries(behavior, &lines::text_items(bytes), env)),
+            Format::DomainSet => Ok(Self::from_entries(
+                behavior,
+                &lines::domain_set_items(bytes),
+                env,
+            )),
         }
     }
 

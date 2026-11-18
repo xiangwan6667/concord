@@ -24,7 +24,7 @@ pub(super) enum Scheme {
     V4,
 }
 
-fn derive(psk: &[u8], salt: &[u8], len: usize) -> io::Result<Vec<u8>> {
+pub(super) fn derive(psk: &[u8], salt: &[u8], len: usize) -> io::Result<Vec<u8>> {
     let params = Params::new(8, 3, 1, Some(32)).map_err(|err| io::Error::other(err.to_string()))?;
     let mut key = [0u8; 32];
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)

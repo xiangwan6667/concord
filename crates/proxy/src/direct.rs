@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use concord_common::{
     Address, BoxStream, DialCx, Initiator, IpVersion, Outbound, OutboundInfo, OutboundKind,
-    PacketSession, SockOpts,
+    PacketSession, SockOpts, Tasks,
 };
 use concord_net::{DirectPacketSession, LoopbackGuard, dial_tcp};
 
@@ -15,6 +15,7 @@ pub(crate) struct Direct {
     version: IpVersion,
     egress: Option<Egress>,
     loopback: Option<Arc<LoopbackGuard>>,
+    tasks: Tasks,
 }
 
 impl Direct {
@@ -22,12 +23,14 @@ impl Direct {
         info: OutboundInfo,
         egress: Option<Egress>,
         loopback: Option<Arc<LoopbackGuard>>,
+        tasks: Tasks,
     ) -> Self {
         Direct {
             version: egress.as_ref().map_or(IpVersion::Dual, Egress::version),
             info,
             egress,
             loopback,
+            tasks,
         }
     }
 
@@ -66,6 +69,7 @@ impl Outbound for Direct {
             self.version,
             &self.opts(cx),
             self.loopback.as_ref(),
+            &self.tasks,
         )
         .await?;
         Ok(Arc::new(session))

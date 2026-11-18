@@ -122,7 +122,7 @@ impl Outbound for Socks5 {
         }
         let closed = Arc::new(AtomicBool::new(false));
         let flag = closed.clone();
-        let task = tokio::spawn(async move {
+        let task = self.link.tasks().spawn(async move {
             let mut sink = [0u8; 256];
             while matches!(control.read(&mut sink).await, Ok(n) if n > 0) {}
             flag.store(true, Ordering::Relaxed);

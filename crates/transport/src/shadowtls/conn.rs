@@ -4,36 +4,50 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, ready};
 
+use aws_lc_rs::hmac;
 use concord_common::BoxStream;
 use concord_common::layered::{Layered, ReadLayer, WriteLayer};
-use hmac::{Hmac, Mac};
-use sha1::Sha1;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::frames::{ALERT, APPLICATION_DATA, FrameReader, HEADER, MAX_PLAINTEXT};
 use crate::http1::invalid;
 use crate::outgoing::Outgoing;
 
-pub(super) type HmacSha1 = Hmac<Sha1>;
 pub(super) const HMAC_SIZE: usize = 4;
 const HMAC_HEADER: usize = HEADER + HMAC_SIZE;
 const ALERT_RECORD: usize = 31;
+const SHA1_LEN: usize = 20;
 
-pub(super) fn new_hmac(key: &[u8]) -> io::Result<HmacSha1> {
-    HmacSha1::new_from_slice(key).map_err(|_| invalid("shadow-tls: hmac key"))
-}
+/// A running HMAC-SHA1 whose digest can be read without ending it, as Go's `hash.Sum` is.
+#[derive(Clone)]
+pub(super) struct HmacSha1(hmac::Context);
 
-pub(super) fn sum(mac: &HmacSha1) -> Vec<u8> {
-    mac.clone().finalize().into_bytes().to_vec()
-}
-
-fn tag(mac: &HmacSha1) -> [u8; HMAC_SIZE] {
-    let full = sum(mac);
-    let mut out = [0u8; HMAC_SIZE];
-    if let Some(head) = full.get(..HMAC_SIZE) {
-        out.copy_from_slice(head);
+impl HmacSha1 {
+    pub fn update(&mut self, data: &[u8]) {
+        self.0.update(data);
     }
-    out
+
+    pub fn sum(&self) -> [u8; SHA1_LEN] {
+        let mut out = [0u8; SHA1_LEN];
+        let tag = self.0.clone().sign();
+        for (out, byte) in out.iter_mut().zip(tag.as_ref()) {
+            *out = *byte;
+        }
+        out
+    }
+
+    fn tag(&self) -> [u8; HMAC_SIZE] {
+        let mut out = [0u8; HMAC_SIZE];
+        for (out, byte) in out.iter_mut().zip(self.sum()) {
+            *out = byte;
+        }
+        out
+    }
+}
+
+pub(super) fn new_hmac(key: &[u8]) -> HmacSha1 {
+    let key = hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, key);
+    HmacSha1(hmac::Context::with_key(&key))
 }
 
 fn record_header(len: usize) -> [u8; HEADER] {
@@ -223,7 +237,7 @@ fn verify_record(frame: &[u8], mac: &mut HmacSha1, update: bool) -> bool {
         return false;
     }
     mac.update(payload);
-    let expected = tag(mac);
+    let expected = mac.tag();
     if update {
         mac.update(&expected);
     }
@@ -271,8 +285,8 @@ impl ReadLayer for V3Read {
                             "shadow-tls: application data verification failed",
                         )));
                     }
-                    self.pending = frame.get(HMAC_HEADER..).unwrap_or_default().to_vec();
-                    self.pos = 0;
+                    self.pending = frame;
+                    self.pos = HMAC_HEADER;
                 }
                 other => {
                     self.alert.store(true, Ordering::Release);
@@ -299,7 +313,7 @@ impl WriteLayer for V3Write {
             .poll_write_record(io, cx, data, MAX_PLAINTEXT, |out, chunk| {
                 out.extend_from_slice(&record_header(HMAC_SIZE + chunk.len()));
                 add.update(chunk);
-                let digest = tag(add);
+                let digest = add.tag();
                 add.update(&digest);
                 out.extend_from_slice(&digest);
                 out.extend_from_slice(chunk);
@@ -362,10 +376,29 @@ mod tests {
         assert_eq!(reader.await.unwrap(), b"ok");
     }
 
+    #[test]
+    fn hmac_sum_matches_rfc_2202_and_keeps_running() {
+        let mut mac = new_hmac(b"Jefe");
+        mac.update(b"what do ya ");
+        let partial = mac.sum();
+        mac.update(b"want for nothing?");
+        let mut whole = new_hmac(b"Jefe");
+        whole.update(b"what do ya ");
+        assert_eq!(whole.sum(), partial);
+        assert_eq!(
+            mac.sum(),
+            [
+                0xef, 0xfc, 0xdf, 0x6a, 0xe5, 0xeb, 0x2f, 0xa2, 0xd2, 0x74, 0x16, 0xd5, 0xf1, 0x84,
+                0xdf, 0x9c, 0x25, 0x9a, 0x7c, 0x79
+            ]
+        );
+        assert_eq!(mac.tag(), [0xef, 0xfc, 0xdf, 0x6a]);
+    }
+
     fn pair() -> (BoxStream, BoxStream) {
         let (a, b) = duplex(8192);
-        let one = new_hmac(b"one").unwrap();
-        let two = new_hmac(b"two").unwrap();
+        let one = new_hmac(b"one");
+        let two = new_hmac(b"two");
         (
             v3_conn(Box::new(a), one.clone(), two.clone(), None),
             v3_conn(Box::new(b), two, one, None),
@@ -398,8 +431,8 @@ mod tests {
     #[tokio::test]
     async fn v3_verification_failure_sends_an_alert_on_the_write_half() {
         let (near, far) = duplex(8192);
-        let one = new_hmac(b"one").unwrap();
-        let two = new_hmac(b"two").unwrap();
+        let one = new_hmac(b"one");
+        let two = new_hmac(b"two");
         let (mut read, mut write) = v3_conn(Box::new(near), one, two, None).into_split();
         let (mut far_read, mut far_write) = tokio::io::split(far);
         far_write

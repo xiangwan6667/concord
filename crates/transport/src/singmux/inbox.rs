@@ -8,8 +8,8 @@ use futures_util::task::AtomicWaker;
 use tokio::io::{AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::mpsc;
 
-use concord_common::BoxWrite;
 use concord_common::sync::lock;
+use concord_common::{BoxWrite, Tasks};
 
 #[derive(Default)]
 struct State {
@@ -87,12 +87,10 @@ impl Inbox {
 }
 
 /// Queues a frame from a context that cannot wait for room.
-pub(super) fn send_detached(tx: &mpsc::Sender<Vec<u8>>, frame: Vec<u8>) {
-    if let Err(mpsc::error::TrySendError::Full(frame)) = tx.try_send(frame)
-        && let Ok(handle) = tokio::runtime::Handle::try_current()
-    {
+pub(super) fn send_detached(tasks: &Tasks, tx: &mpsc::Sender<Vec<u8>>, frame: Vec<u8>) {
+    if let Err(mpsc::error::TrySendError::Full(frame)) = tx.try_send(frame) {
         let tx = tx.clone();
-        handle.spawn(async move {
+        tasks.spawn_detached(async move {
             let _ = tx.send(frame).await;
         });
     }

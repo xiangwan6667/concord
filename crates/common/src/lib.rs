@@ -11,6 +11,8 @@ pub mod sync;
 #[cfg(feature = "io")]
 pub mod conn;
 #[cfg(feature = "io")]
+pub mod dns_relay;
+#[cfg(feature = "io")]
 pub mod error;
 #[cfg(feature = "io")]
 pub mod event;
@@ -30,6 +32,14 @@ pub mod packet;
 pub mod stream;
 #[cfg(feature = "io")]
 pub mod stream_buffer;
+#[cfg(feature = "io")]
+pub mod task;
+#[cfg(feature = "io")]
+pub mod timeout;
+
+/// The core's own name: the process of the connections it opens itself and the implementation it
+/// reports to hosts.
+pub const CORE_NAME: &str = "concord";
 
 /// What end users see this core called: the MITM CA's subject and the Android TUN device. The
 /// embedding app sets `CONCORD_PRODUCT_NAME` when it builds Concord.
@@ -75,3 +85,5 @@ pub use stream::{
     Attached, BoxRead, BoxStream, BoxWrite, DirectIo, PeekedStream, RawSocket, Stream,
     split_with_lock,
 };
+#[cfg(feature = "io")]
+pub use task::Tasks;

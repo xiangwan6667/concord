@@ -1,3 +1,4 @@
+mod build;
 mod delays;
 mod dialing;
 mod groups;
@@ -432,7 +433,7 @@ impl Rig {
 
     pub fn leaf(&self, name: &str) -> String {
         match self.resolve(name) {
-            Resolved::Route { leaf, .. } => leaf.info().name.to_string(),
+            Resolved::Route { leaf, .. } | Resolved::Rematch(leaf) => leaf.info().name.to_string(),
             Resolved::Pass => "<pass>".into(),
             Resolved::PassRule => "<pass-rule>".into(),
             Resolved::Rejected(_) => "<rejected>".into(),

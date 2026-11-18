@@ -1,6 +1,7 @@
 use std::convert::Infallible;
 
 use bytes::Bytes;
+use concord_api::ControllerCors;
 use http::header::{self, HeaderMap, HeaderValue};
 use http::{Method, Response, StatusCode};
 use http_body_util::combinators::UnsyncBoxBody;
@@ -133,9 +134,32 @@ pub fn is_preflight(method: &Method, headers: &HeaderMap) -> bool {
             .is_some_and(|value| !value.is_empty())
 }
 
-/// mihomo's default CORS: any origin, private network allowed, five methods,
-/// two headers, five minutes.
-pub fn preflight(headers: &HeaderMap) -> Response<Body> {
+/// The origin the response names, as `metacubex/chi/cors`: `*` when every origin
+/// is allowed, else the request's own; none when it is not allowed. An entry may
+/// hold one `*`, and case does not count.
+fn allowed_origin(cors: &ControllerCors, headers: &HeaderMap) -> Option<HeaderValue> {
+    if cors.allow_origins.iter().any(|allowed| allowed == "*") {
+        return Some(HeaderValue::from_static("*"));
+    }
+    let origin = headers.get(header::ORIGIN)?;
+    let text = origin.to_str().ok()?.to_ascii_lowercase();
+    cors.allow_origins
+        .iter()
+        .map(|allowed| allowed.to_ascii_lowercase())
+        .any(|allowed| match allowed.split_once('*') {
+            Some((prefix, suffix)) => {
+                text.len() >= prefix.len() + suffix.len()
+                    && text.starts_with(prefix)
+                    && text.ends_with(suffix)
+            }
+            None => allowed == text,
+        })
+        .then(|| origin.clone())
+}
+
+/// mihomo's CORS: the allowed origins, private network when allowed, five
+/// methods, two headers, five minutes.
+pub fn preflight(headers: &HeaderMap, cors: &ControllerCors) -> Response<Body> {
     let mut response = empty(StatusCode::OK);
     let out = response.headers_mut();
     for vary in [
@@ -150,6 +174,9 @@ pub fn preflight(headers: &HeaderMap) -> Response<Body> {
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_ascii_uppercase();
+    let Some(origin) = allowed_origin(cors, headers) else {
+        return response;
+    };
     if !ALLOWED_METHODS.contains(&method.as_str()) {
         return response;
     }
@@ -167,10 +194,7 @@ pub fn preflight(headers: &HeaderMap) -> Response<Body> {
     {
         return response;
     }
-    out.insert(
-        header::ACCESS_CONTROL_ALLOW_ORIGIN,
-        HeaderValue::from_static("*"),
-    );
+    out.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
     if let Ok(value) = HeaderValue::from_str(&method) {
         out.insert(header::ACCESS_CONTROL_ALLOW_METHODS, value);
     }
@@ -179,9 +203,10 @@ pub fn preflight(headers: &HeaderMap) -> Response<Body> {
     {
         out.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, value);
     }
-    if headers
-        .get("access-control-request-private-network")
-        .is_some_and(|value| value == "true")
+    if cors.allow_private_network
+        && headers
+            .get("access-control-request-private-network")
+            .is_some_and(|value| value == "true")
     {
         out.insert(
             "access-control-allow-private-network",
@@ -196,14 +221,19 @@ pub fn preflight(headers: &HeaderMap) -> Response<Body> {
 }
 
 /// The headers an actual request gets, whatever the route answers.
-pub fn cors(request: &HeaderMap, method: &Method, response: &mut Response<Body>) {
+pub fn cors(
+    request: &HeaderMap,
+    method: &Method,
+    cors: &ControllerCors,
+    response: &mut Response<Body>,
+) {
     let out = response.headers_mut();
     out.append(header::VARY, HeaderValue::from_static("Origin"));
-    if request.contains_key(header::ORIGIN) && ALLOWED_METHODS.contains(&method.as_str()) {
-        out.insert(
-            header::ACCESS_CONTROL_ALLOW_ORIGIN,
-            HeaderValue::from_static("*"),
-        );
+    if request.contains_key(header::ORIGIN)
+        && ALLOWED_METHODS.contains(&method.as_str())
+        && let Some(origin) = allowed_origin(cors, request)
+    {
+        out.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
     }
 }
 
@@ -270,7 +300,7 @@ mod tests {
             ("access-control-request-private-network", "true"),
         ]);
         assert!(is_preflight(&Method::OPTIONS, &request));
-        let response = preflight(&request);
+        let response = preflight(&request, &ControllerCors::default());
         let out = response.headers();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(out["access-control-allow-origin"], "*");
@@ -290,11 +320,74 @@ mod tests {
             ("access-control-request-method", "GET"),
             ("access-control-request-headers", "x-custom"),
         ]);
-        let response = preflight(&request);
+        let response = preflight(&request, &ControllerCors::default());
         assert!(
             !response
                 .headers()
                 .contains_key("access-control-allow-origin")
         );
+    }
+
+    #[test]
+    fn only_the_listed_origins_are_allowed() {
+        let listed = ControllerCors {
+            allow_origins: vec!["https://Board.example".into(), "https://*.zash.test".into()],
+            allow_private_network: false,
+        };
+        let asked = |origin: &'static str| {
+            preflight(
+                &headers(&[
+                    ("origin", origin),
+                    ("access-control-request-method", "GET"),
+                    ("access-control-request-private-network", "true"),
+                ]),
+                &listed,
+            )
+        };
+        for origin in ["https://board.example", "https://a.zash.test"] {
+            let response = asked(origin);
+            let out = response.headers();
+            assert_eq!(out["access-control-allow-origin"], origin);
+            assert!(!out.contains_key("access-control-allow-private-network"));
+        }
+        let refused = asked("https://evil.test");
+        assert!(
+            !refused
+                .headers()
+                .contains_key("access-control-allow-origin")
+        );
+
+        let mut actual = empty(StatusCode::OK);
+        cors(
+            &headers(&[("origin", "https://evil.test")]),
+            &Method::GET,
+            &listed,
+            &mut actual,
+        );
+        assert!(!actual.headers().contains_key("access-control-allow-origin"));
+        let mut actual = empty(StatusCode::OK);
+        cors(
+            &headers(&[("origin", "https://board.example")]),
+            &Method::GET,
+            &listed,
+            &mut actual,
+        );
+        assert_eq!(
+            actual.headers()["access-control-allow-origin"],
+            "https://board.example"
+        );
+
+        let none = ControllerCors {
+            allow_origins: Vec::new(),
+            allow_private_network: false,
+        };
+        let mut actual = empty(StatusCode::OK);
+        cors(
+            &headers(&[("origin", "https://board.example")]),
+            &Method::GET,
+            &none,
+            &mut actual,
+        );
+        assert!(!actual.headers().contains_key("access-control-allow-origin"));
     }
 }

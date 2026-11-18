@@ -4,7 +4,7 @@
 )]
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -12,11 +12,21 @@ use std::time::Duration;
 use concord_common::sync::lock;
 use concord_common::{CoreEvent, CoreOptions, EventSink, ResourcePhase, ResourceUpdate};
 use concord_engine::{Engine, EngineConfig, ProxyView, RouteHit, SetupRequest, UpdateRequest};
-use concord_platform::NativePlatform;
+use concord_platform::{NativePlatform, Platform};
 use concord_test_support::{tcp_echo, udp_echo};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::timeout;
+
+#[cfg(feature = "mitm")]
+#[path = "e2e/mitm.rs"]
+mod mitm;
+
+#[path = "e2e/rematch.rs"]
+mod rematch;
+
+#[path = "e2e/find_process.rs"]
+mod find_process;
 
 const PATIENCE: Duration = Duration::from_secs(10);
 
@@ -308,11 +318,15 @@ impl Rig {
     }
 
     fn at(home: tempfile::TempDir) -> Rig {
+        Rig::on(home, Arc::new(NativePlatform::new()))
+    }
+
+    fn on(home: tempfile::TempDir, platform: Arc<dyn Platform>) -> Rig {
         let events = Arc::new(Events::default());
         let engine = Engine::new(EngineConfig {
             sink: events.clone(),
             android: false,
-            platform: Arc::new(NativePlatform::new()),
+            platform,
         });
         engine.init(home.path().to_str().unwrap(), 0).unwrap();
         Rig {
@@ -353,31 +367,12 @@ impl Rig {
     }
 }
 
-fn empty_update() -> UpdateRequest {
-    UpdateRequest {
-        tun: None,
-        allow_lan: None,
-        mixed_port: None,
-        find_process_mode: None,
-        mode: None,
-        log_level: None,
-        ipv6: None,
-        tcp_concurrent: None,
-        unified_delay: None,
-        authentication: None,
-        geo_auto_update: None,
-        geo_update_interval: None,
-        geox_url: BTreeMap::new(),
-        options: None,
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_flow_goes_direct_and_shows_in_the_connection_table() {
     let echo = tcp_echo().await;
     let rig = Rig::new();
     rig.apply("rules:\n  - MATCH,DIRECT\n").await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
 
     let mut stream = socks_connect(rig.mixed, echo).await.unwrap();
     round_trip(&mut stream).await;
@@ -424,7 +419,7 @@ async fn a_flow_still_dialing_when_every_connection_closes_is_closed_as_well() {
          rules:\n  - MATCH,up\n"
     );
     rig.apply(&config).await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
 
     let mut stream = socks_connect(rig.mixed, echo).await.unwrap();
     timeout(PATIENCE, dialing)
@@ -454,7 +449,7 @@ async fn a_lazy_header_waits_for_a_slow_client_and_still_lets_a_server_speak_fir
          rules:\n  - MATCH,v\n"
     );
     rig.apply(&config).await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
 
     let mut slow = socks_connect(rig.mixed, echo).await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -487,7 +482,7 @@ async fn rules_pick_a_group_and_a_selection_moves_it() {
         echo.port()
     );
     rig.apply(&config).await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
 
     assert!(
         rig.engine
@@ -552,12 +547,61 @@ async fn a_rejected_config_falls_back_to_direct_and_says_so() {
         "{}",
         failure.message
     );
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
     assert!(
         socks_connect(rig.mixed, echo).await.is_err(),
         "the default config opens no port"
     );
     assert_eq!(rig.kind("DIRECT"), "Direct");
+    rig.engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_that_cannot_be_built_is_set_aside_and_the_config_runs() {
+    let rig = Rig::new();
+    let uuid = "6a4f3bc1-2c44-4a43-a5a3-3f1a2b0e6a11";
+    let key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+    let config = format!(
+        "proxies:\n  \
+         - {{name: pin, type: vless, server: 127.0.0.1, port: 1, uuid: {uuid}, tls: true, fingerprint: chrome}}\n  \
+         - {{name: ws-reality, type: vless, server: 127.0.0.1, port: 1, uuid: {uuid}, tls: true, network: ws, \
+         client-fingerprint: chrome, reality-opts: {{public-key: {key}}}}}\n\
+         proxy-providers:\n  \
+         inline:\n    type: inline\n    payload:\n      \
+         - {{name: in-pin, type: trojan, server: 127.0.0.1, port: 1, password: p, fingerprint: zz}}\n\
+         proxy-groups:\n  - {{name: G, type: select, proxies: [pin, ws-reality, DIRECT], use: [inline]}}\n\
+         rules:\n  - MATCH,G\n"
+    );
+    rig.apply(&config).await.unwrap();
+    let warned: Vec<_> = rig
+        .engine
+        .warnings()
+        .into_iter()
+        .map(|w| (w.code, w.path))
+        .collect();
+    assert_eq!(
+        warned,
+        [
+            ("proxy_quarantined", "proxies.pin".to_string()),
+            ("proxy_quarantined", "proxies.ws-reality".to_string()),
+        ]
+    );
+    rig.engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_provider_emptied_for_override_expr_leaves_the_config_running() {
+    let rig = Rig::new();
+    rig.apply(
+        "proxy-providers:\n  sub:\n    type: inline\n    override:\n      override-expr: ['.udp = true']\n    \
+         payload:\n      - {name: a, type: socks5, server: 127.0.0.1, port: 1}\n\
+         proxy-groups:\n  - {name: G, type: select, use: [sub], proxies: [DIRECT]}\n\
+         rules:\n  - MATCH,G\n",
+    )
+    .await
+    .unwrap();
+    let warned: Vec<_> = rig.engine.warnings().into_iter().map(|w| w.code).collect();
+    assert_eq!(warned, ["provider_emptied"]);
     rig.engine.shutdown().await;
 }
 
@@ -600,7 +644,7 @@ async fn providers_load_over_the_tunnel_and_update_on_request() {
          rules:\n  - RULE-SET,local,G\n  - MATCH,DIRECT\n"
     );
     rig.apply(&config).await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
 
     assert!(
         eventually(|| {
@@ -689,7 +733,7 @@ async fn a_rule_provider_that_failed_its_first_fetch_is_retried_before_the_inter
          rules:\n  - RULE-SET,local,REJECT\n  - MATCH,DIRECT\n"
     );
     rig.apply(&config).await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
     assert!(
         wait_loaded(&rig, "local").await,
         "the provider was not retried"
@@ -712,7 +756,7 @@ async fn a_proxy_provider_without_an_interval_is_not_retried() {
          rules:\n  - MATCH,G\n"
     );
     rig.apply(&config).await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
     assert!(!wait_loaded(&rig, "sub").await, "the provider was retried");
     assert_eq!(hits.load(Ordering::SeqCst), 1);
     rig.engine.shutdown().await;
@@ -728,7 +772,7 @@ async fn a_side_load_replaces_a_rule_set_without_a_reapply() {
          rules:\n  - RULE-SET,local,REJECT\n  - MATCH,DIRECT\n"
     );
     rig.apply(&config).await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
     assert!(eventually(|| rig.events.loaded().iter().any(|name| name == "local")).await);
 
     let mut stream = socks_connect(rig.mixed, echo).await.unwrap();
@@ -751,7 +795,7 @@ async fn a_file_rule_provider_reloads_when_the_file_is_rewritten() {
     let config = "rule-providers:\n  local:\n    type: file\n    behavior: ipcidr\n    format: text\n    path: r.txt\n\
          rules:\n  - RULE-SET,local,REJECT\n  - MATCH,DIRECT\n";
     rig.apply(config).await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
     assert!(eventually(|| rig.events.loaded().iter().any(|name| name == "local")).await);
 
     let mut stream = socks_connect(rig.mixed, echo).await.unwrap();
@@ -784,7 +828,7 @@ async fn a_file_rule_provider_serves_its_payload_until_the_file_loads() {
         echo.ip()
     );
     rig.apply(&config).await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
     assert!(refused(rig.mixed, echo).await);
 
     std::fs::write(rig.home.path().join("r.txt"), "10.0.0.0/8\n").unwrap();
@@ -797,6 +841,25 @@ async fn a_file_rule_provider_serves_its_payload_until_the_file_loads() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert!(open, "the loaded file never replaced the payload");
+    rig.engine.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_provider_path_through_a_symlink_names_the_provider_and_the_path() {
+    let rig = Rig::new();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), rig.home.path().join("linked")).unwrap();
+    let config = "rule-providers:\n  local:\n    type: file\n    behavior: domain\n    path: linked/r.txt\n\
+                  rules:\n  - RULE-SET,local,REJECT\n  - MATCH,DIRECT\n";
+    let failure = rig.apply(config).await.unwrap_err();
+    assert!(
+        failure
+            .message
+            .contains("rule provider local: path crosses a symlink: linked/r.txt"),
+        "{}",
+        failure.message
+    );
     rig.engine.shutdown().await;
 }
 
@@ -838,7 +901,7 @@ async fn a_reapplied_rule_set_keeps_matching_while_it_loads_again() {
         )
     };
     rig.apply(&config("r.txt")).await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
     assert!(eventually(|| rig.events.loaded().iter().any(|name| name == "local")).await);
     assert!(refused(rig.mixed, echo).await);
 
@@ -938,7 +1001,7 @@ async fn udp_through_socks_reaches_its_target_and_back() {
     };
     let rig = Rig::new();
     rig.apply("rules:\n  - MATCH,DIRECT\n").await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
 
     let mut control = TcpStream::connect((Ipv4Addr::LOCALHOST, rig.mixed))
         .await
@@ -977,16 +1040,80 @@ async fn udp_through_socks_reaches_its_target_and_back() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dns_node_answers_from_the_core_over_tcp_and_udp() {
+    let rig = Rig::new();
+    rig.apply(
+        "hosts:\n  a.test: 1.2.3.4\n\
+         dns:\n  enable: true\n  enhanced-mode: redir-host\n  nameserver:\n    - 127.0.0.1:1\n\
+         proxies:\n  - {name: dns-out, type: dns}\n\
+         rules:\n  - DST-PORT,53,dns-out\n  - MATCH,REJECT\n",
+    )
+    .await
+    .unwrap();
+    rig.engine.start_listeners().await;
+    assert_eq!(rig.kind("dns-out"), "Dns");
+    let resolver = SocketAddr::from(([192, 0, 2, 1], 53));
+
+    let mut stream = socks_connect(rig.mixed, resolver).await.unwrap();
+    for _ in 0..2 {
+        let query = dns_query("a.test");
+        let mut framed = u16::try_from(query.len()).unwrap().to_be_bytes().to_vec();
+        framed.extend_from_slice(&query);
+        stream.write_all(&framed).await.unwrap();
+        let mut prefix = [0u8; 2];
+        timeout(PATIENCE, stream.read_exact(&mut prefix))
+            .await
+            .expect("no TCP answer")
+            .unwrap();
+        let mut answer = vec![0u8; usize::from(u16::from_be_bytes(prefix))];
+        stream.read_exact(&mut answer).await.unwrap();
+        assert_eq!(last_a_record(&answer), [1, 2, 3, 4]);
+    }
+
+    let mut control = TcpStream::connect((Ipv4Addr::LOCALHOST, rig.mixed))
+        .await
+        .unwrap();
+    control.write_all(&[5, 1, 0]).await.unwrap();
+    let mut method = [0u8; 2];
+    control.read_exact(&mut method).await.unwrap();
+    control
+        .write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+        .await
+        .unwrap();
+    let mut reply = [0u8; 10];
+    control.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[1], 0);
+    let relay = SocketAddr::from((
+        Ipv4Addr::new(reply[4], reply[5], reply[6], reply[7]),
+        u16::from_be_bytes([reply[8], reply[9]]),
+    ));
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let mut packet = vec![0, 0, 0, 1, 192, 0, 2, 1, 0, 53];
+    packet.extend_from_slice(&dns_query("a.test"));
+    socket.send_to(&packet, relay).await.unwrap();
+    let mut buf = [0u8; 512];
+    let (len, _) = timeout(PATIENCE, socket.recv_from(&mut buf))
+        .await
+        .expect("no UDP answer")
+        .unwrap();
+    assert_eq!(&buf[..10], &[0, 0, 0, 1, 192, 0, 2, 1, 0, 53]);
+    assert_eq!(last_a_record(&buf[10..len]), [1, 2, 3, 4]);
+    rig.engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_live_update_changes_the_mode_and_the_route_stamp() {
     let echo = tcp_echo().await;
     let rig = Rig::new();
     rig.apply("rules:\n  - MATCH,REJECT\n").await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
     assert!(refused(rig.mixed, echo).await);
 
     let before = rig.engine.watch_route(true).stamp;
-    let mut request = empty_update();
-    request.mode = Some("direct".to_string());
+    let request = UpdateRequest {
+        mode: Some("direct".to_string()),
+        ..UpdateRequest::default()
+    };
     rig.engine.update(request).await.unwrap();
     let after = rig.engine.watch_route(true).stamp;
     assert_eq!(after.epoch, before.epoch);
@@ -995,8 +1122,10 @@ async fn a_live_update_changes_the_mode_and_the_route_stamp() {
     let mut stream = socks_connect(rig.mixed, echo).await.unwrap();
     round_trip(&mut stream).await;
 
-    let mut request = empty_update();
-    request.ipv6 = Some(false);
+    let request = UpdateRequest {
+        ipv6: Some(false),
+        ..UpdateRequest::default()
+    };
     rig.engine.update(request).await.unwrap();
     let moved = rig.engine.watch_route(false).stamp;
     assert_eq!(
@@ -1007,10 +1136,73 @@ async fn a_live_update_changes_the_mode_and_the_route_stamp() {
     rig.engine.shutdown().await;
 }
 
+/// mihomo's default listeners filter every peer by the LAN lists, LAN or not
+/// (`listener/mixed/mixed.go`), and bind `bind-address` only with `allow-lan`
+/// (`listener/listener.go` `genAddr`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_lan_keys_bind_and_filter_the_listeners() {
+    let echo = tcp_echo().await;
+    let rig = Rig::new();
+    rig.apply(
+        "allow-lan: true\nbind-address: 127.0.0.1\nlan-allowed-ips: [127.0.0.0/8]\nrules:\n  - MATCH,DIRECT\n",
+    )
+    .await
+    .unwrap();
+    rig.engine.start_listeners().await;
+    assert!(
+        TcpStream::connect((Ipv6Addr::LOCALHOST, rig.mixed))
+            .await
+            .is_err(),
+        "bound to the one address only"
+    );
+    let mut stream = socks_connect(rig.mixed, echo).await.unwrap();
+    round_trip(&mut stream).await;
+
+    let request = UpdateRequest {
+        lan_disallowed_ips: Some(vec!["127.0.0.1/32".to_string()]),
+        ..UpdateRequest::default()
+    };
+    rig.engine.update(request).await.unwrap();
+    assert!(refused(rig.mixed, echo).await, "the deny list wins");
+
+    let request = UpdateRequest {
+        allow_lan: Some(false),
+        bind_address: Some("192.0.2.1".to_string()),
+        ..UpdateRequest::default()
+    };
+    rig.engine.update(request).await.unwrap();
+    assert!(
+        refused(rig.mixed, echo).await,
+        "the lists hold without the LAN"
+    );
+    let request = UpdateRequest {
+        lan_disallowed_ips: Some(Vec::new()),
+        ..UpdateRequest::default()
+    };
+    rig.engine.update(request).await.unwrap();
+    let mut stream = socks_connect(rig.mixed, echo).await.unwrap();
+    round_trip(&mut stream).await;
+
+    let request = UpdateRequest {
+        lan_allowed_ips: Some(vec!["10.0.0.0/8".to_string(), "127.0.0.1".to_string()]),
+        ..UpdateRequest::default()
+    };
+    let failure = rig.engine.update(request).await.unwrap_err();
+    assert_eq!(failure.code, "invalid_arguments");
+    let general = rig.engine.general().await.unwrap();
+    assert_eq!(general.lan_allowed_ips, ["127.0.0.0/8"]);
+    assert_eq!(general.bind_address, "192.0.2.1");
+    rig.engine.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_update_before_any_config_is_refused() {
     let rig = Rig::new();
-    let failure = rig.engine.update(empty_update()).await.unwrap_err();
+    let failure = rig
+        .engine
+        .update(UpdateRequest::default())
+        .await
+        .unwrap_err();
     assert_eq!(failure.message, "config is not applied");
     rig.engine.shutdown().await;
 }
@@ -1025,19 +1217,19 @@ async fn listeners_follow_the_start_and_stop_calls() {
             .is_err(),
         "a config alone opens no port"
     );
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
     assert!(
         TcpStream::connect((Ipv4Addr::LOCALHOST, rig.mixed))
             .await
             .is_ok()
     );
-    rig.engine.stop_listeners().await.unwrap();
+    rig.engine.stop_listeners().await;
     assert!(
         TcpStream::connect((Ipv4Addr::LOCALHOST, rig.mixed))
             .await
             .is_err()
     );
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
     assert!(
         TcpStream::connect((Ipv4Addr::LOCALHOST, rig.mixed))
             .await
@@ -1110,7 +1302,7 @@ async fn a_core_that_shut_down_can_start_over() {
     let echo = tcp_echo().await;
     let rig = Rig::new();
     rig.apply("rules:\n  - MATCH,DIRECT\n").await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
     rig.engine.shutdown().await;
     assert!(!rig.engine.is_initialized());
     assert!(
@@ -1122,7 +1314,7 @@ async fn a_core_that_shut_down_can_start_over() {
         .init(rig.home.path().to_str().unwrap(), 0)
         .unwrap();
     rig.apply("rules:\n  - MATCH,DIRECT\n").await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
     let mut stream = socks_connect(rig.mixed, echo).await.unwrap();
     round_trip(&mut stream).await;
     rig.engine.shutdown().await;
@@ -1141,7 +1333,7 @@ async fn a_pass_in_a_group_moves_on_to_the_next_rule() {
         echo.port()
     );
     rig.apply(&config).await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
     let mut stream = socks_connect(rig.mixed, echo).await.unwrap();
     round_trip(&mut stream).await;
     assert_eq!(lock(&seen).len(), 1);
@@ -1167,7 +1359,7 @@ async fn udp_skips_a_rule_whose_outbound_has_no_udp() {
         free_port()
     );
     rig.apply(&config).await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
 
     let mut control = TcpStream::connect((Ipv4Addr::LOCALHOST, rig.mixed))
         .await
@@ -1211,7 +1403,7 @@ async fn direct_refuses_a_loop_back_into_the_core() {
     };
     let rig = Rig::new();
     rig.apply("rules:\n  - MATCH,DIRECT\n").await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
     let own = SocketAddr::from((Ipv4Addr::LOCALHOST, rig.mixed));
     let mut stream = socks_connect(rig.mixed, own).await.unwrap();
 
@@ -1252,7 +1444,7 @@ async fn a_fake_ip_flow_is_routed_by_the_name_behind_it() {
          rules:\n  - DOMAIN,faked.test,up\n  - MATCH,REJECT\n"
     );
     rig.apply(&config).await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
 
     let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     socket
@@ -1325,7 +1517,7 @@ async fn a_sniffed_name_is_what_rules_see() {
         server.port()
     );
     rig.apply(&config).await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
 
     let mut stream = socks_connect(rig.mixed, server).await.unwrap();
     stream
@@ -1368,7 +1560,7 @@ async fn many_flows_leave_nothing_behind() {
     });
     let rig = Rig::new();
     rig.apply("rules:\n  - MATCH,DIRECT\n").await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
 
     // macOS caps a listen backlog at kern.ipc.somaxconn, 128 by default; 200 simultaneous
     // connects can overflow the mixed listener's accept queue before it drains it.
@@ -1417,771 +1609,13 @@ async fn many_flows_leave_nothing_behind() {
     rig.engine.shutdown().await;
 }
 
-/// A bare hostname covers 443 and 80 only, and the origins here are on free ports.
-fn mitm_section(port: u16, lines: &str) -> String {
-    format!("mitm:\n  enable: true\n  hostname: ['mitm.test:{port}']\n{lines}")
-}
-
-/// An HTTP/1.1 exchange through the core over SOCKS, as a client that names the host.
-async fn http_through(mixed: u16, target: SocketAddr, host: &str, path: &str) -> String {
-    let SocketAddr::V4(v4) = target else {
-        panic!("IPv4 expected")
-    };
-    let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, mixed))
-        .await
-        .unwrap();
-    stream.write_all(&[5, 1, 0]).await.unwrap();
-    let mut method = [0u8; 2];
-    stream.read_exact(&mut method).await.unwrap();
-    let mut request = vec![5, 1, 0, 3, u8::try_from(host.len()).unwrap()];
-    request.extend_from_slice(host.as_bytes());
-    request.extend_from_slice(&v4.port().to_be_bytes());
-    stream.write_all(&request).await.unwrap();
-    let mut reply = [0u8; 10];
-    stream.read_exact(&mut reply).await.unwrap();
-    stream
-        .write_all(
-            format!(
-                "GET {path} HTTP/1.1\r\nHost: {host}:{}\r\nConnection: close\r\n\r\n",
-                v4.port()
-            )
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
-    let mut response = Vec::new();
-    // Linux resets a socket closed with the request unread, as when the host does not resolve.
-    let _ = timeout(PATIENCE, stream.read_to_end(&mut response))
-        .await
-        .expect("no HTTP answer");
-    String::from_utf8_lossy(&response).into_owned()
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mitm_rewrites_plain_http_on_the_way_through() {
-    let (server, _) = http_server(HashMap::from([
-        ("/kept", "from the server".to_string()),
-        ("/after", "rewritten target".to_string()),
-    ]))
-    .await;
-    let rig = Rig::new();
-    let config = format!(
-        "hosts:\n  mitm.test: 127.0.0.1\n{}rules:\n  - MATCH,DIRECT\n",
-        mitm_section(
-            server.port(),
-            "  url-rewrite:\n    - ^http://mitm\\.test:\\d+/blocked$ - reject\n    - ^(http://mitm\\.test:\\d+)/before$ $1/after 302\n"
-        )
-    );
-    rig.apply(&config).await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
-
-    let body = http_through(rig.mixed, server, "mitm.test", "/kept").await;
-    assert!(body.ends_with("from the server"), "{body}");
-
-    let body = http_through(rig.mixed, server, "mitm.test", "/before").await;
-    assert!(body.starts_with("HTTP/1.1 302"), "{body}");
-    assert!(body.contains("/after"), "{body}");
-
-    let body = http_through(rig.mixed, server, "mitm.test", "/blocked").await;
-    assert!(!body.contains("from the server"), "{body}");
-
-    let other = http_through(rig.mixed, server, "not-matched.test", "/kept").await;
-    assert!(other.is_empty() || other.starts_with("HTTP"), "{other}");
-    rig.engine.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_intercepted_request_still_dialing_when_every_connection_closes_gets_no_answer() {
-    let (server, _) = http_server(HashMap::from([("/kept", "from the server".to_string())])).await;
-    let (upstream, _) = upstream_socks().await;
-    let gate = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-    let gated = gate.local_addr().unwrap().port();
-    let (entered, dialing) = tokio::sync::oneshot::channel();
-    let (release, released) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
-        let (mut client, _) = gate.accept().await.unwrap();
-        let _ = entered.send(());
-        let _ = released.await;
-        let mut server = TcpStream::connect((Ipv4Addr::LOCALHOST, upstream))
-            .await
-            .unwrap();
-        let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
-    });
-    let rig = Rig::new();
-    let config = format!(
-        "proxies:\n  - {{name: up, type: socks5, server: 127.0.0.1, port: {gated}}}\n\
-         mitm:\n  enable: true\n  hostname: ['localhost:{}']\n\
-         rules:\n  - MATCH,up\n",
-        server.port()
-    );
-    rig.apply(&config).await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
-
-    let mixed = rig.mixed;
-    let answer = tokio::spawn(async move {
-        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, mixed))
-            .await
-            .unwrap();
-        stream.write_all(&[5, 1, 0]).await.unwrap();
-        let mut method = [0u8; 2];
-        stream.read_exact(&mut method).await.unwrap();
-        let mut request = vec![5, 1, 0, 3, 9];
-        request.extend_from_slice(b"localhost");
-        request.extend_from_slice(&server.port().to_be_bytes());
-        stream.write_all(&request).await.unwrap();
-        let mut reply = [0u8; 10];
-        stream.read_exact(&mut reply).await.unwrap();
-        let get = format!(
-            "GET /kept HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
-            server.port()
-        );
-        stream.write_all(get.as_bytes()).await.unwrap();
-        let mut response = Vec::new();
-        let _ = timeout(PATIENCE, stream.read_to_end(&mut response)).await;
-        String::from_utf8_lossy(&response).into_owned()
-    });
-    timeout(PATIENCE, dialing)
-        .await
-        .expect("the intercepted request never dialed upstream")
-        .unwrap();
-    rig.engine.close_all_connections();
-    release.send(()).unwrap();
-    let body = answer.await.unwrap();
-    assert!(
-        !body.contains("from the server"),
-        "the upstream dialled across close_all still answered: {body}"
-    );
-    assert_eq!(rig.engine.connection_count(), 0);
-    rig.engine.shutdown().await;
-}
-
-/// An HTTPS server with a certificate no one trusts, which answers every request alike.
-async fn tls_server(body: &'static str) -> SocketAddr {
-    let certified = rcgen::generate_simple_self_signed(vec!["origin.test".to_string()]).unwrap();
-    let key =
-        rustls_pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der()).unwrap();
-    let config = tokio_rustls::rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![certified.cert.der().clone()], key)
-        .unwrap();
-    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            let acceptor = acceptor.clone();
-            tokio::spawn(async move {
-                let Ok(mut stream) = acceptor.accept(stream).await else {
-                    return;
-                };
-                let mut head = Vec::new();
-                let mut byte = [0u8; 1];
-                while !head.ends_with(b"\r\n\r\n") {
-                    if stream.read_exact(&mut byte).await.is_err() {
-                        return;
-                    }
-                    head.push(byte[0]);
-                }
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            });
-        }
-    });
-    addr
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mitm_decrypts_a_listed_host_under_its_own_certificate() {
-    use rustls_pki_types::pem::PemObject;
-    use rustls_pki_types::{CertificateDer, ServerName};
-    use tokio_rustls::rustls::RootCertStore;
-
-    let server = tls_server("over tls").await;
-    let rig = Rig::new();
-    let info = rig.engine.mitm().generate_certificate().unwrap();
-    let fingerprint = info["fingerprint"].as_str().unwrap().to_string();
-    let certificate_pem = info["pem"].as_str().unwrap().to_string();
-    let config = format!(
-        "hosts:\n  mitm.test: 127.0.0.1\n{}rules:\n  - MATCH,DIRECT\n",
-        mitm_section(
-            server.port(),
-            &format!(
-                "  decrypt-tls: true\n  ca-fingerprint: {fingerprint}\n  skip-server-cert-verify: true\n"
-            )
-        )
-    );
-    rig.apply(&config).await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
-
-    let mut roots = RootCertStore::empty();
-    for certificate in CertificateDer::pem_slice_iter(certificate_pem.as_bytes()) {
-        roots.add(certificate.unwrap()).unwrap();
-    }
-    let tls = tokio_rustls::TlsConnector::from(Arc::new(
-        tokio_rustls::rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    ));
-    let SocketAddr::V4(v4) = server else {
-        panic!("IPv4 expected")
-    };
-    let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, rig.mixed))
-        .await
-        .unwrap();
-    stream.write_all(&[5, 1, 0]).await.unwrap();
-    let mut method = [0u8; 2];
-    stream.read_exact(&mut method).await.unwrap();
-    let host = "mitm.test";
-    let mut request = vec![5, 1, 0, 3, u8::try_from(host.len()).unwrap()];
-    request.extend_from_slice(host.as_bytes());
-    request.extend_from_slice(&v4.port().to_be_bytes());
-    stream.write_all(&request).await.unwrap();
-    let mut reply = [0u8; 10];
-    stream.read_exact(&mut reply).await.unwrap();
-
-    let mut secured = timeout(
-        PATIENCE,
-        tls.connect(ServerName::try_from(host).unwrap(), stream),
-    )
-    .await
-    .expect("the handshake with the core stalled")
-    .expect("the leaf must chain to the CA the core reported");
-    secured
-        .write_all(
-            format!(
-                "GET / HTTP/1.1\r\nHost: mitm.test:{}\r\nConnection: close\r\n\r\n",
-                v4.port()
-            )
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
-    let mut response = Vec::new();
-    let _ = timeout(PATIENCE, secured.read_to_end(&mut response))
-        .await
-        .expect("no answer through the decrypted connection");
-    let response = String::from_utf8_lossy(&response);
-    assert!(response.ends_with("over tls"), "{response}");
-
-    assert!(
-        eventually(|| rig.engine.connection_count() == 0).await,
-        "the upstream connection stayed listed"
-    );
-    rig.engine.shutdown().await;
-}
-
-/// An HTTPS origin that keeps its connections open and answers the path and
-/// the `X-Mitm` header of each request.
-async fn tls_echo_server() -> SocketAddr {
-    let certified = rcgen::generate_simple_self_signed(vec!["origin.test".to_string()]).unwrap();
-    let key =
-        rustls_pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der()).unwrap();
-    let config = tokio_rustls::rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![certified.cert.der().clone()], key)
-        .unwrap();
-    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            let acceptor = acceptor.clone();
-            tokio::spawn(async move {
-                let Ok(mut stream) = acceptor.accept(stream).await else {
-                    return;
-                };
-                loop {
-                    let mut head = Vec::new();
-                    let mut byte = [0u8; 1];
-                    while !head.ends_with(b"\r\n\r\n") {
-                        if stream.read_exact(&mut byte).await.is_err() {
-                            return;
-                        }
-                        head.push(byte[0]);
-                    }
-                    let head = String::from_utf8_lossy(&head).to_string();
-                    let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
-                    let mitm = head
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("x-mitm")
-                                .then(|| value.trim().to_string())
-                        })
-                        .unwrap_or_default();
-                    let body = format!("{path}|{mitm}");
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
-                        body.len()
-                    );
-                    if stream.write_all(response.as_bytes()).await.is_err() {
-                        return;
-                    }
-                }
-            });
-        }
-    });
-    addr
-}
-
-type Secured = tokio_rustls::client::TlsStream<TcpStream>;
-
-/// A TLS client through the core over SOCKS that trusts only the CA in `ca_pem`.
-async fn tls_through(mixed: u16, host: &str, port: u16, ca_pem: &str) -> std::io::Result<Secured> {
-    use rustls_pki_types::pem::PemObject;
-    use rustls_pki_types::{CertificateDer, ServerName};
-
-    let mut roots = tokio_rustls::rustls::RootCertStore::empty();
-    for certificate in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
-        roots.add(certificate.unwrap()).unwrap();
-    }
-    let tls = tokio_rustls::TlsConnector::from(Arc::new(
-        tokio_rustls::rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    ));
-    let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, mixed)).await?;
-    stream.write_all(&[5, 1, 0]).await?;
-    let mut method = [0u8; 2];
-    stream.read_exact(&mut method).await?;
-    let mut request = vec![5, 1, 0, 3, u8::try_from(host.len()).unwrap()];
-    request.extend_from_slice(host.as_bytes());
-    request.extend_from_slice(&port.to_be_bytes());
-    stream.write_all(&request).await?;
-    let mut reply = [0u8; 10];
-    stream.read_exact(&mut reply).await?;
-    timeout(
-        PATIENCE,
-        tls.connect(ServerName::try_from(host.to_string()).unwrap(), stream),
-    )
-    .await
-    .map_err(|_| std::io::Error::other("the handshake stalled"))?
-}
-
-/// One request on a kept connection: its status and its body.
-async fn exchange(stream: &mut Secured, host: &str, port: u16, path: &str) -> (u16, String) {
-    stream
-        .write_all(format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n").as_bytes())
-        .await
-        .unwrap();
-    let mut head = Vec::new();
-    let mut byte = [0u8; 1];
-    while !head.ends_with(b"\r\n\r\n") {
-        timeout(PATIENCE, stream.read_exact(&mut byte))
-            .await
-            .expect("no answer")
-            .unwrap();
-        head.push(byte[0]);
-    }
-    let head = String::from_utf8_lossy(&head).to_string();
-    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
-    let length: usize = head
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse().unwrap())
-        })
-        .unwrap_or(0);
-    let mut body = vec![0u8; length];
-    stream.read_exact(&mut body).await.unwrap();
-    (status, String::from_utf8(body).unwrap())
-}
-
-fn verify_leaf(ca_pem: &str, leaf_pem: &str, host: &str) -> Result<(), String> {
-    use rustls_pki_types::pem::PemObject;
-    use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
-
-    let mut roots = tokio_rustls::rustls::RootCertStore::empty();
-    for certificate in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
-        roots.add(certificate.unwrap()).unwrap();
-    }
-    let leaf = CertificateDer::from_pem_slice(leaf_pem.as_bytes()).map_err(|e| e.to_string())?;
-    let verifier = tokio_rustls::rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
-        .build()
-        .unwrap();
-    tokio_rustls::rustls::client::danger::ServerCertVerifier::verify_server_cert(
-        verifier.as_ref(),
-        &leaf,
-        &[],
-        &ServerName::try_from(host.to_string()).unwrap(),
-        &[],
-        UnixTime::now(),
-    )
-    .map(|_| ())
-    .map_err(|e| e.to_string())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mitm_makes_its_certificate_on_request_and_its_leaves_verify() {
-    let rig = Rig::new();
-    assert!(rig.engine.mitm().certificate().unwrap().is_none());
-    assert!(
-        rig.engine.mitm().issue_certificate("check.test").is_err(),
-        "a leaf was issued without a CA"
-    );
-    let generated = rig.engine.mitm().generate_certificate().unwrap();
-    let info = rig.engine.mitm().certificate().unwrap().unwrap();
-    assert_eq!(info["fingerprint"], generated["fingerprint"]);
-    assert!(rig.home.path().join("mitm/ca.crt").exists());
-    let leaf = rig.engine.mitm().issue_certificate("check.test").unwrap();
-    verify_leaf(info["pem"].as_str().unwrap(), &leaf, "check.test").unwrap();
-
-    let issues = rig
-        .engine
-        .mitm()
-        .validate(serde_json::json!({
-            "hostname": ["a.test"],
-            "url-rewrite": ["^ok _ reject", "(broken _ reject", "# note"],
-        }))
-        .unwrap();
-    let issues = issues.as_object().unwrap();
-    assert_eq!(issues.len(), 1, "{issues:?}");
-    let listed = issues["url-rewrite"].as_array().unwrap();
-    assert_eq!(
-        (listed.len(), &listed[0]["index"]),
-        (1, &serde_json::json!(1))
-    );
-}
-
-async fn decrypting_rig(rules: &str, lines: &str, capture: bool) -> (Rig, SocketAddr, String) {
-    let server = tls_echo_server().await;
-    let rig = Rig::new();
-    let info = rig.engine.mitm().generate_certificate().unwrap();
-    let config = format!(
-        "hosts:\n  mitm.test: 127.0.0.1\n{}rules:\n{rules}",
-        mitm_section(
-            server.port(),
-            &format!(
-                "  ca-fingerprint: {}\n  skip-server-cert-verify: true\n{lines}",
-                info["fingerprint"].as_str().unwrap()
-            )
-        )
-    );
-    rig.setup(
-        &config,
-        BTreeMap::new(),
-        CoreOptions {
-            mitm_capture: capture,
-            ..CoreOptions::default()
-        },
-    )
-    .await
-    .unwrap();
-    rig.engine.start_listeners().await.unwrap();
-    (rig, server, info["pem"].as_str().unwrap().to_string())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mitm_captures_the_exchanges_of_a_decrypted_connection() {
-    let (rig, server, ca) = decrypting_rig(
-        "  - MATCH,DIRECT\n",
-        "  url-rewrite: ['/ad$ _ reject']\n  header-rewrite: ['http-request ^https://mitm\\.test header-add X-Mitm yes']\n",
-        true,
-    )
-    .await;
-    let port = server.port();
-    let mut stream = tls_through(rig.mixed, "mitm.test", port, &ca)
-        .await
-        .unwrap();
-    assert_eq!(exchange(&mut stream, "mitm.test", port, "/ad").await.0, 404);
-    assert_eq!(
-        exchange(&mut stream, "mitm.test", port, "/page").await,
-        (200, "/page|yes".to_string())
-    );
-
-    let decrypted = rig
-        .engine
-        .connections()
-        .into_iter()
-        .find(|record| record.mitm.load(Ordering::SeqCst))
-        .expect("no connection is marked as decrypted");
-    let id = decrypted.id.clone();
-    let mut list = serde_json::Value::Null;
-    assert!(
-        eventually(|| {
-            list = rig.engine.mitm().exchanges(&id).unwrap();
-            list["exchanges"]
-                .as_array()
-                .is_some_and(|all| all.len() == 1 && all[0].get("pending").is_none())
-        })
-        .await,
-        "exchanges of {id}: {list}"
-    );
-    assert_eq!(
-        (&list["capturing"], &list["closed"]),
-        (&serde_json::json!(true), &serde_json::json!(false))
-    );
-    let exchange_id = list["exchanges"][0]["id"].as_i64().unwrap();
-    let found = rig.engine.mitm().exchange(exchange_id).unwrap();
-    assert_eq!(found["connection"], serde_json::json!(id));
-    assert_eq!(found["status"], 200);
-    assert_eq!(
-        found["request-header"]["X-Mitm"],
-        serde_json::json!(["yes"])
-    );
-    let body = rig.engine.mitm().body(exchange_id, true).unwrap();
-    assert_eq!(body["data"], "L3BhZ2V8eWVz", "base64 of /page|yes");
-
-    drop(stream);
-    assert!(
-        eventually(|| rig.engine.mitm().exchanges(&id).unwrap()["closed"] == true).await,
-        "{id} is still listed open"
-    );
-    assert_eq!(
-        rig.engine.mitm().exchanges(&id).unwrap()["exchanges"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    rig.engine.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mitm_lists_the_requests_it_answers_or_the_rules_reject() {
-    let (rig, server, ca) = decrypting_rig(
-        "  - DST-PORT,1,REJECT\n  - MATCH,DIRECT\n",
-        "  url-rewrite: ['/ad$ _ reject', '^https://.*/elsewhere$ https://127.0.0.1:1/']\n",
-        true,
-    )
-    .await;
-    let port = server.port();
-    let mut stream = tls_through(rig.mixed, "mitm.test", port, &ca)
-        .await
-        .unwrap();
-    exchange(&mut stream, "mitm.test", port, "/ad").await;
-    exchange(&mut stream, "mitm.test", port, "/elsewhere").await;
-
-    let rejected: Vec<_> = lock(&rig.events.seen)
-        .iter()
-        .filter_map(|event| match event {
-            CoreEvent::Request(record)
-                if record.mitm.load(Ordering::SeqCst)
-                    && record.chains.iter().map(|c| c.as_ref()).eq(["REJECT"]) =>
-            {
-                Some(record.clone())
-            }
-            _ => None,
-        })
-        .collect();
-    let mut listed: Vec<(String, String)> = rejected
-        .iter()
-        .filter_map(|record| {
-            let list = rig.engine.mitm().exchanges(&record.id).unwrap();
-            let exchanges = list["exchanges"].as_array()?;
-            (exchanges.len() == 1).then(|| {
-                (
-                    format!("{}({})", record.rule, record.rule_payload),
-                    exchanges[0]["url"].as_str().unwrap().to_string(),
-                )
-            })
-        })
-        .collect();
-    listed.sort();
-    assert_eq!(
-        listed,
-        vec![
-            ("()".to_string(), format!("https://mitm.test:{port}/ad")),
-            ("DstPort(1)".to_string(), "https://127.0.0.1:1/".to_string()),
-        ]
-    );
-    rig.engine.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mitm_leaves_a_listed_connection_the_rules_reject() {
-    let (rig, server, ca) = decrypting_rig("  - MATCH,REJECT\n", "", false).await;
-    assert!(
-        tls_through(rig.mixed, "mitm.test", server.port(), &ca)
-            .await
-            .is_err(),
-        "a connection the rules reject was answered"
-    );
-    rig.engine.shutdown().await;
-}
-
-impl Association {
-    /// Whether a datagram to `host:port`, named as a SOCKS5 domain address or
-    /// given as an address, comes back from the echo server behind it.
-    async fn echoes_to(&self, host: &str, port: u16) -> bool {
-        let mut packet = match host.parse::<Ipv4Addr>() {
-            Ok(ip) => {
-                let mut packet = vec![0, 0, 0, 1];
-                packet.extend_from_slice(&ip.octets());
-                packet
-            }
-            Err(_) => {
-                let mut packet = vec![0, 0, 0, 3, u8::try_from(host.len()).unwrap()];
-                packet.extend_from_slice(host.as_bytes());
-                packet
-            }
-        };
-        packet.extend_from_slice(&port.to_be_bytes());
-        packet.extend_from_slice(b"datagram");
-        let mut buf = [0u8; 256];
-        for _ in 0..3 {
-            self.socket.send_to(&packet, self.relay).await.unwrap();
-            if let Ok(Ok((len, _))) =
-                timeout(Duration::from_millis(500), self.socket.recv_from(&mut buf)).await
-            {
-                return buf[..len].ends_with(b"datagram");
-            }
-        }
-        false
-    }
-}
-
-/// A nameserver that answers every A query with the loopback address.
-async fn loopback_nameserver() -> SocketAddr {
-    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-    let addr = socket.local_addr().unwrap();
-    tokio::spawn(async move {
-        let mut buf = [0u8; 512];
-        while let Ok((len, from)) = socket.recv_from(&mut buf).await {
-            let Some(end) = buf[12..len]
-                .iter()
-                .position(|&b| b == 0)
-                .map(|at| 12 + at + 5)
-            else {
-                continue;
-            };
-            let is_a = buf.get(end - 4..end - 2) == Some(&[0, 1]);
-            let mut answer = buf[..end].to_vec();
-            answer[2..4].copy_from_slice(&[0x81, 0x80]);
-            answer[6..12].copy_from_slice(&[0, u8::from(is_a), 0, 0, 0, 0]);
-            if is_a {
-                answer
-                    .extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1]);
-            }
-            let _ = socket.send_to(&answer, from).await;
-        }
-    });
-    addr
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mitm_drops_quic_to_a_listed_host_by_name_or_fake_ip() {
-    let echo = udp_echo().await;
-    let port = echo.port();
-    let nameserver = loopback_nameserver().await;
-    let dns = free_port();
-    let rig = Rig::new();
-    let info = rig.engine.mitm().generate_certificate().unwrap();
-    let config = format!(
-        "dns:\n  enable: true\n  listen: 127.0.0.1:{dns}\n  enhanced-mode: fake-ip\n  fake-ip-range: 198.18.0.1/16\n  nameserver:\n    - {nameserver}\n\
-         mitm:\n  enable: true\n  hostname: ['quic.test:{port}', 'faked.test:{port}']\n  ca-fingerprint: {}\n\
-         rules:\n  - MATCH,DIRECT\n",
-        info["fingerprint"].as_str().unwrap()
-    );
-    rig.apply(&config).await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
-    let listed_fake = fake_ip_of(dns, "faked.test").await;
-    let unlisted_fake = fake_ip_of(dns, "plain.test").await;
-    assert_eq!(listed_fake.octets()[..2], [198, 18], "{listed_fake}");
-
-    assert!(
-        associate(rig.mixed)
-            .await
-            .echoes_to(&unlisted_fake.to_string(), port)
-            .await,
-        "UDP to an unlisted host was dropped"
-    );
-    assert!(
-        !associate(rig.mixed)
-            .await
-            .echoes_to("quic.test", port)
-            .await,
-        "QUIC to a listed host went out"
-    );
-    assert!(
-        !associate(rig.mixed)
-            .await
-            .echoes_to(&listed_fake.to_string(), port)
-            .await,
-        "QUIC to the fake IP of a listed host went out"
-    );
-    rig.engine.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mitm_tasks_follow_the_core_and_reach_the_network() {
-    let (server, hits) = http_server(HashMap::from([
-        ("/tool", "pong".to_string()),
-        ("/engine-started", "ok".to_string()),
-        ("/network-changed", "ok".to_string()),
-    ]))
-    .await;
-    let rig = Rig::new();
-    let resources = rig.home.path().join("mitm/resources");
-    std::fs::create_dir_all(&resources).unwrap();
-    std::fs::write(
-        resources.join("event.js"),
-        format!("$httpClient.get('http://{server}/' + $event.name, () => $done())"),
-    )
-    .unwrap();
-    std::fs::write(
-        resources.join("tool.js"),
-        format!(
-            "$httpClient.get('http://{server}/tool', (error, response, body) => {{ console.log(body); $done({{ title: $trigger }}) }})"
-        ),
-    )
-    .unwrap();
-    rig.apply("rules:\n  - MATCH,DIRECT\n").await.unwrap();
-    assert!(
-        rig.engine.mitm().run_script("Tool").await.is_err(),
-        "a script ran with decryption off"
-    );
-
-    rig.apply(
-        "mitm:\n  enable: true\n  script:\n    - Started = type=event,event-name=engine-started,script-path=event.js\n    - Network = type=event,event-name=network-changed,script-path=event.js\n    - Tool = type=generic,script-path=tool.js\nrules:\n  - MATCH,DIRECT\n",
-    )
-    .await
-    .unwrap();
-    let output = rig.engine.mitm().run_script("Tool").await.unwrap();
-    assert_eq!(output["result"], r#"{"title":"button"}"#, "{output}");
-    assert_eq!(output["logs"], serde_json::json!(["pong"]));
-    assert_eq!(hits.load(Ordering::SeqCst), 1);
-
-    rig.engine.network_changed();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(
-        hits.load(Ordering::SeqCst),
-        1,
-        "an event script ran while stopped"
-    );
-    rig.engine.start_listeners().await.unwrap();
-    assert!(
-        eventually(|| hits.load(Ordering::SeqCst) == 2).await,
-        "engine-started"
-    );
-    rig.engine.network_changed();
-    assert!(
-        eventually(|| hits.load(Ordering::SeqCst) == 3).await,
-        "network-changed"
-    );
-    rig.engine.stop_listeners().await.unwrap();
-    rig.engine.network_changed();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(
-        hits.load(Ordering::SeqCst),
-        3,
-        "an event script ran after the stop"
-    );
-    rig.engine.shutdown().await;
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capabilities_report_ss_plugins_and_congestion_controllers() {
     let rig = Rig::new();
     let value = serde_json::to_value(rig.engine.capabilities()).unwrap();
     assert_eq!(
         value["ss-plugins"],
-        serde_json::json!(["obfs", "v2ray-plugin", "shadow-tls"])
+        serde_json::json!(["obfs", "v2ray-plugin", "shadow-tls", "jls", "gost-plugin"])
     );
     assert_eq!(
         value["congestion-controllers"],
@@ -2249,15 +1683,23 @@ async fn the_ntp_section_runs_a_service_that_a_config_without_it_stops() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mitm_off_leaves_flows_alone_and_capabilities_say_it_exists() {
+async fn mitm_off_leaves_flows_alone_and_capabilities_say_whether_it_is_built() {
     let echo = tcp_echo().await;
     let rig = Rig::new();
     rig.apply("rules:\n  - MATCH,DIRECT\n").await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
     let mut stream = socks_connect(rig.mixed, echo).await.unwrap();
     round_trip(&mut stream).await;
-    assert!(rig.engine.capabilities().features.mitm);
-    assert!(rig.engine.mitm().certificate().unwrap().is_none());
+    assert_eq!(
+        rig.engine.capabilities().features.mitm,
+        cfg!(feature = "mitm")
+    );
+    let certificate = rig.engine.mitm().certificate();
+    if cfg!(feature = "mitm") {
+        assert!(certificate.unwrap().is_none());
+    } else {
+        assert!(certificate.is_err());
+    }
     rig.engine.shutdown().await;
 }
 
@@ -2389,13 +1831,13 @@ async fn udp_after_a_switch(switch: Switch) {
     let (proxy, relayed) = upstream_socks_udp().await;
     let mut rig = Rig::new();
     rig.apply("rules:\n  - MATCH,DIRECT\n").await.unwrap();
-    rig.engine.start_listeners().await.unwrap();
+    rig.engine.start_listeners().await;
     let before = associate(rig.mixed).await;
     assert!(before.echoes(echo).await);
     assert_eq!(relayed.load(Ordering::SeqCst), 0);
 
     if switch.stop_around {
-        rig.engine.stop_listeners().await.unwrap();
+        rig.engine.stop_listeners().await;
     }
     if switch.move_port {
         rig.mixed = free_port();
@@ -2409,7 +1851,7 @@ async fn udp_after_a_switch(switch: Switch) {
         .await
         .unwrap();
     if switch.stop_around {
-        rig.engine.start_listeners().await.unwrap();
+        rig.engine.start_listeners().await;
     }
 
     let fresh = associate(rig.mixed).await;

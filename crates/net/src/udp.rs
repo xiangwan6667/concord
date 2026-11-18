@@ -1,17 +1,17 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::task::{Context, Poll, Waker};
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-use concord_common::sync::write;
-use concord_common::sync::{lock, read};
+use concord_common::sync::{lock, read, write};
 use concord_common::{
     Address, CoreError, Datagram, DialCx, HostResolver, Initiator, IpVersion, LookupIps, PacketBuf,
-    PacketSession, SockOpts,
+    PacketSession, RecvBatch, SockOpts, SocketWatch, SocketWatcher, Tasks,
 };
+use concord_platform::UdpBatch;
+use futures_util::task::AtomicWaker;
 use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
@@ -44,15 +44,13 @@ pub struct DirectPacketSession {
     names: Arc<Mutex<Names>>,
     closed: AtomicBool,
     /// Datagrams a full watched socket did not take.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    dropped: std::sync::atomic::AtomicU64,
+    dropped: AtomicU64,
     /// The one sender that may wait on a full socket. Tokio drops a waker left on a socket
     /// that leaves its reactor without waking it, so `watch` wakes this one.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    sender: futures_util::task::AtomicWaker,
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    gso: concord_platform::UdpGso,
+    sender: AtomicWaker,
+    batch: UdpBatch,
     _ticket: Option<UdpTicket>,
+    tasks: Tasks,
 }
 
 /// Where the socket's read readiness comes from.
@@ -60,17 +58,14 @@ enum Io {
     Tokio(UdpSocket),
     /// Watched by the writer that adopted the session's replies. Nothing waits on such a
     /// socket's writes: a send goes straight to the descriptor.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     Watched {
         socket: Arc<std::net::UdpSocket>,
-        watch: Arc<dyn concord_common::SocketWatch>,
+        watch: Arc<dyn SocketWatch>,
     },
     /// The socket could not be handed over or back.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     Closed,
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
 fn gone() -> io::Error {
     io::Error::from(io::ErrorKind::BrokenPipe)
 }
@@ -90,6 +85,7 @@ impl DirectPacketSession {
         initiator: Initiator,
         version: IpVersion,
         ipv6: bool,
+        tasks: Tasks,
     ) -> Self {
         let v6 = socket.local_addr().is_ok_and(|addr| addr.is_ipv6());
         DirectPacketSession {
@@ -101,13 +97,11 @@ impl DirectPacketSession {
             ipv6,
             names: Arc::new(Mutex::new(Names::default())),
             closed: AtomicBool::new(false),
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            dropped: std::sync::atomic::AtomicU64::new(0),
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            sender: futures_util::task::AtomicWaker::new(),
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            gso: concord_platform::UdpGso::default(),
+            dropped: AtomicU64::new(0),
+            sender: AtomicWaker::new(),
+            batch: UdpBatch::default(),
             _ticket: None,
+            tasks,
         }
     }
 
@@ -118,6 +112,7 @@ impl DirectPacketSession {
         version: IpVersion,
         opts: &SockOpts,
         loopback: Option<&Arc<LoopbackGuard>>,
+        tasks: &Tasks,
     ) -> io::Result<Self> {
         let resolving = resolve(cx, hint, version);
         let resolved = match cx.deadline {
@@ -141,6 +136,7 @@ impl DirectPacketSession {
             cx.initiator,
             version,
             cx.env.ipv6,
+            tasks.clone(),
         );
         session._ticket = ticket;
         if let Some(host) = hint.domain()
@@ -158,9 +154,7 @@ impl DirectPacketSession {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         match &*self.io() {
             Io::Tokio(socket) => socket.local_addr(),
-            #[cfg(any(target_os = "linux", target_os = "android"))]
             Io::Watched { socket, .. } => socket.local_addr(),
-            #[cfg(any(target_os = "linux", target_os = "android"))]
             Io::Closed => Err(gone()),
         }
     }
@@ -187,7 +181,7 @@ impl DirectPacketSession {
         }
         if names.resolving.is_none() {
             let key: concord_common::Host = host.into();
-            let task = tokio::spawn(resolve_name(
+            let task = self.tasks.spawn(resolve_name(
                 Arc::clone(&self.names),
                 Arc::clone(&self.resolver),
                 key,
@@ -217,17 +211,14 @@ impl DirectPacketSession {
                 let sent = socket.poll_send_to(cx, payload, addr).map_ok(|_| ());
                 self.waiting(cx, sent)
             }
-            #[cfg(any(target_os = "linux", target_os = "android"))]
             Io::Watched { socket, .. } => Poll::Ready(
                 self.or_dropped(socket.send_to(payload, addr), 1)
                     .map(|_| ()),
             ),
-            #[cfg(any(target_os = "linux", target_os = "android"))]
             Io::Closed => Poll::Ready(Err(gone())),
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn waiting<T>(&self, cx: &Context<'_>, sent: Poll<T>) -> Poll<T> {
         if sent.is_pending() {
             self.sender.register(cx.waker());
@@ -235,15 +226,9 @@ impl DirectPacketSession {
         sent
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    fn waiting<T>(&self, _cx: &Context<'_>, sent: Poll<T>) -> Poll<T> {
-        sent
-    }
-
     /// A full watched socket loses what it was offered, and the session counts it: sing-tun's
     /// engine sends a flow's uploads once and takes `EAGAIN` for sent (`flushPacketUploads`,
     /// `stack_go_splice.go:911-939`).
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn or_dropped(&self, sent: io::Result<usize>, offered: usize) -> io::Result<usize> {
         match sent {
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -294,7 +279,6 @@ impl Drop for DirectPacketSession {
         if let Some(resolving) = lock(&self.names).resolving.take() {
             resolving.task.abort();
         }
-        #[cfg(any(target_os = "linux", target_os = "android"))]
         match *self.dropped.get_mut() {
             0 => {}
             dropped => tracing::debug!("[UDP] a full socket dropped {dropped} datagrams"),
@@ -331,7 +315,6 @@ impl PacketSession for DirectPacketSession {
         let mut read = ReadBuf::new(buf.spare_mut());
         let from = match &*self.io() {
             Io::Tokio(socket) => std::task::ready!(socket.poll_recv_from(cx, &mut read))?,
-            #[cfg(any(target_os = "linux", target_os = "android"))]
             Io::Watched { socket, watch } => loop {
                 std::task::ready!(watch.poll_read_ready(cx))?;
                 let mut from = None;
@@ -351,7 +334,6 @@ impl PacketSession for DirectPacketSession {
                     _ => {}
                 }
             },
-            #[cfg(any(target_os = "linux", target_os = "android"))]
             Io::Closed => return Poll::Ready(Err(gone())),
         };
         let received = read.filled().len();
@@ -367,7 +349,7 @@ impl PacketSession for DirectPacketSession {
     }
 
     fn batches(&self) -> bool {
-        cfg!(any(target_os = "linux", target_os = "android"))
+        UdpBatch::SENDS
     }
 
     fn poll_send_batch(
@@ -378,8 +360,7 @@ impl PacketSession for DirectPacketSession {
         if self.closed.load(Ordering::Relaxed) {
             return Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)));
         }
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
+        if UdpBatch::SENDS {
             let same = batch
                 .iter()
                 .take_while(|datagram| datagram.dst.is_ipv6() == self.v6)
@@ -392,18 +373,15 @@ impl PacketSession for DirectPacketSession {
                         if let Err(err) = std::task::ready!(self.waiting(cx, ready)) {
                             return Poll::Ready(Err(err));
                         }
-                        match concord_platform::send_udp_batch(socket, batch, &self.gso) {
+                        match self.batch.send(socket, batch) {
                             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
                             sent => return Poll::Ready(sent),
                         }
                     },
-                    #[cfg(any(target_os = "linux", target_os = "android"))]
                     Io::Watched { socket, .. } => {
-                        let fd = std::os::fd::AsRawFd::as_raw_fd(&**socket);
-                        let sent = concord_platform::send_udp_batch_fd(fd, batch, &self.gso);
+                        let sent = self.batch.send_std(socket, batch);
                         return Poll::Ready(self.or_dropped(sent, batch.len()));
                     }
-                    #[cfg(any(target_os = "linux", target_os = "android"))]
                     Io::Closed => return Poll::Ready(Err(gone())),
                 }
             }
@@ -421,38 +399,30 @@ impl PacketSession for DirectPacketSession {
     }
 
     fn recv_batches(&self) -> bool {
-        cfg!(any(target_os = "linux", target_os = "android"))
+        UdpBatch::RECEIVES
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn poll_recv_batch(
-        &self,
-        cx: &mut Context<'_>,
-        batch: &mut concord_common::RecvBatch,
-    ) -> Poll<io::Result<()>> {
+    fn poll_recv_batch(&self, cx: &mut Context<'_>, batch: &mut RecvBatch) -> Poll<io::Result<()>> {
         if self.closed.load(Ordering::Relaxed) {
             return Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)));
         }
         match &*self.io() {
             Io::Tokio(socket) => loop {
                 std::task::ready!(socket.poll_recv_ready(cx))?;
-                match concord_platform::recv_udp_batch(socket, batch) {
+                match UdpBatch::recv(socket, batch) {
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
                     received => return Poll::Ready(received),
                 }
             },
-            #[cfg(any(target_os = "linux", target_os = "android"))]
             Io::Watched { socket, watch } => loop {
                 std::task::ready!(watch.poll_read_ready(cx))?;
-                let fd = std::os::fd::AsRawFd::as_raw_fd(&**socket);
-                let received = watch
-                    .try_read(&mut || concord_platform::recv_udp_batch_fd(fd, batch).map(|()| 0));
+                let received =
+                    watch.try_read(&mut || UdpBatch::recv_std(socket, batch).map(|()| 0));
                 match received {
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
                     received => return Poll::Ready(received.map(|_| ())),
                 }
             },
-            #[cfg(any(target_os = "linux", target_os = "android"))]
             Io::Closed => Poll::Ready(Err(gone())),
         }
     }
@@ -460,8 +430,7 @@ impl PacketSession for DirectPacketSession {
     /// Moves the socket from Tokio's reactor to `watcher`. The write lock is held across the
     /// move, so no send or receive sees the socket while nothing watches it; a socket that can
     /// be neither watched nor handed back closes the session.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn watch(&self, watcher: &dyn concord_common::SocketWatcher) {
+    fn watch(&self, watcher: &dyn SocketWatcher) {
         let mut io = write(&self.socket);
         let socket = match std::mem::replace(&mut *io, Io::Closed) {
             Io::Tokio(socket) => socket.into_std(),
@@ -520,6 +489,7 @@ mod tests {
             Initiator::Direct,
             IpVersion::Dual,
             true,
+            Default::default(),
         );
         (session, platform, loopback_udp().await)
     }
@@ -667,6 +637,7 @@ mod tests {
             IpVersion::Dual,
             &SockOpts::default(),
             Some(&guard),
+            &Default::default(),
         )
         .await
         .unwrap();

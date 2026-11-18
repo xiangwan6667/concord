@@ -5,7 +5,7 @@ use crate::Map;
 use crate::crypt;
 use crate::error::{ConfigError, Result};
 use crate::general::General;
-use crate::keys::{self, Tier};
+use crate::keys::{self, Tier, Tiers};
 use crate::lenient::scalar_text;
 use crate::report::LoadReport;
 use crate::rule::RuleLines;
@@ -124,7 +124,7 @@ fn expect_named_maps(value: Value, what: &str) -> Result<IndexMap<String, Map>> 
 }
 
 /// The app writes every key it knows, so an unsupported key left empty asks for nothing.
-fn asks_for_something(value: &Value) -> bool {
+pub(crate) fn asks_for_something(value: &Value) -> bool {
     match value {
         Value::Null => false,
         Value::String(text) => !text.is_empty(),
@@ -134,24 +134,34 @@ fn asks_for_something(value: &Value) -> bool {
     }
 }
 
-fn section_user_keys(
-    report: &mut LoadReport,
-    name: &str,
-    user: &Map,
-    t0: &[&str],
-    t1: &[&str],
-    t2: &[&str],
-) {
+fn section_user_keys(report: &mut LoadReport, name: &str, user: &Map, tiers: &Tiers) {
     for (key, value) in user {
-        match keys::tier_in(key, t0, t1, t2) {
+        match tiers.of(key) {
             Some(Tier::T2) if !asks_for_something(value) => {}
             Some(Tier::T2) => report.warn(
                 "unsupported_key",
                 format!("{name}.{key}"),
-                "key is not supported by this core and is ignored",
+                unsupported_message(name, key),
             ),
             None => report.warn("unknown_key", format!("{name}.{key}"), "unknown key"),
             _ => {}
+        }
+    }
+}
+
+fn unsupported_message(section: &str, key: &str) -> &'static str {
+    match key {
+        "global-client-fingerprint" if section.is_empty() => {
+            "key was removed and is ignored; set client-fingerprint on each node instead"
+        }
+        _ if section != "tun" || !keys::TUN_SCOPE.contains(&key) => {
+            "key is not supported by this core and is ignored"
+        }
+        "include-package" | "exclude-package" | "include-android-user" => {
+            "key is not supported by this core and is ignored, so the TUN captures other apps than the profile says; an app that embeds the core picks the apps itself"
+        }
+        _ => {
+            "key is not supported by this core and is ignored, so the TUN captures other traffic than the profile says"
         }
     }
 }
@@ -215,60 +225,23 @@ impl RawConfig {
                     }
                 }
                 "hosts" => raw.hosts = expect_map(value, "hosts")?,
-                "dns" => {
-                    raw.dns = raw.section(
-                        "dns",
-                        value,
-                        keys::dns_defaults(),
-                        keys::DNS_T0,
-                        keys::DNS_T1,
-                        &[],
-                    )?
-                }
+                "dns" => raw.dns = raw.section("dns", value, keys::dns_defaults(), &keys::DNS)?,
                 "tun" => {
-                    raw.tun = raw.section(
-                        "tun",
-                        value,
-                        keys::tun_defaults(),
-                        keys::TUN_T0,
-                        keys::TUN_T1,
-                        keys::TUN_T2,
-                    )?;
+                    raw.tun = raw.section("tun", value, keys::tun_defaults(), &keys::TUN)?;
                 }
                 "sniffer" => {
-                    raw.sniffer = raw.section(
-                        "sniffer",
-                        value,
-                        keys::sniffer_defaults(),
-                        keys::SNIFFER_T0,
-                        keys::SNIFFER_T1,
-                        keys::SNIFFER_T2,
-                    )?;
+                    raw.sniffer =
+                        raw.section("sniffer", value, keys::sniffer_defaults(), &keys::SNIFFER)?;
                     stringify_sniff_ports(&mut raw.sniffer);
                 }
-                "ntp" => {
-                    raw.ntp =
-                        raw.section("ntp", value, keys::ntp_defaults(), keys::NTP_KEYS, &[], &[])?
-                }
+                "ntp" => raw.ntp = raw.section("ntp", value, keys::ntp_defaults(), &keys::NTP)?,
                 "geox-url" => {
-                    raw.geox_url = raw.section(
-                        "geox-url",
-                        value,
-                        keys::geox_defaults(),
-                        keys::GEOX_KEYS,
-                        &[],
-                        keys::GEOX_T2,
-                    )?;
+                    raw.geox_url =
+                        raw.section("geox-url", value, keys::geox_defaults(), &keys::GEOX)?;
                 }
                 "profile" => {
-                    raw.profile = raw.section(
-                        "profile",
-                        value,
-                        keys::profile_defaults(),
-                        keys::PROFILE_KEYS,
-                        &[],
-                        &[],
-                    )?;
+                    raw.profile =
+                        raw.section("profile", value, keys::profile_defaults(), &keys::PROFILE)?;
                 }
                 "experimental" => {
                     let user = expect_map(value, "experimental")?;
@@ -282,8 +255,8 @@ impl RawConfig {
                     let user = expect_map(value, "mitm")?;
                     raw.mitm = keys::overlay(&keys::mitm_defaults(), user);
                 }
-                other => match keys::top_tier(other) {
-                    Some(Tier::T0 | Tier::T1) => {
+                other => match keys::TOP.of(other) {
+                    Some(Tier::T0 | Tier::T1 | Tier::Inert) => {
                         scalars.insert(key, value);
                     }
                     Some(Tier::T2) => {
@@ -292,7 +265,7 @@ impl RawConfig {
                             raw.report.warn(
                                 "unsupported_key",
                                 other,
-                                "key is not supported by this core and is ignored",
+                                unsupported_message("", other),
                             );
                         }
                         raw.extra.insert(key, value);
@@ -311,17 +284,9 @@ impl RawConfig {
         Ok(raw)
     }
 
-    fn section(
-        &mut self,
-        name: &str,
-        value: Value,
-        defaults: Map,
-        t0: &[&str],
-        t1: &[&str],
-        t2: &[&str],
-    ) -> Result<Map> {
+    fn section(&mut self, name: &str, value: Value, defaults: Map, tiers: &Tiers) -> Result<Map> {
         let user = expect_map(value, name)?;
-        section_user_keys(&mut self.report, name, &user, t0, t1, t2);
+        section_user_keys(&mut self.report, name, &user, tiers);
         if name == "dns"
             && let Some(Value::Object(filter)) = user.get("fallback-filter")
         {
@@ -329,9 +294,7 @@ impl RawConfig {
                 &mut self.report,
                 "dns.fallback-filter",
                 filter,
-                keys::FALLBACK_FILTER,
-                &[],
-                &[],
+                &keys::FALLBACK_FILTER_TIERS,
             );
         }
         Ok(keys::overlay(&defaults, user))
@@ -601,6 +564,49 @@ mod tests {
         assert!(raw.report.warnings.is_empty());
         let raw = parse_raw_str("external-ui: ui\ntun:\n  dns-mode: fake\n").unwrap();
         assert_eq!(raw.report.warnings.len(), 2);
+    }
+
+    #[test]
+    fn the_removed_global_fingerprint_points_at_the_nodes() {
+        let raw = parse_raw_str("global-client-fingerprint: chrome\n").unwrap();
+        let warning = &raw.report.warnings[0];
+        assert_eq!(warning.code, "unsupported_key");
+        assert_eq!(
+            warning.message,
+            "key was removed and is ignored; set client-fingerprint on each node instead"
+        );
+    }
+
+    #[test]
+    fn a_tun_key_that_changes_what_is_captured_says_so() {
+        let raw = parse_raw_str(
+            "iptables: {enable: true}\ntun:\n  include-package: [a.b]\n  exclude-uid-range: ['1:2']\n  dns-mode: fake\n",
+        )
+        .unwrap();
+        let warned: Vec<(&str, &str, &str)> = raw
+            .report
+            .warnings
+            .iter()
+            .map(|w| (w.code, w.path.as_str(), w.message.as_str()))
+            .collect();
+        let plain = "key is not supported by this core and is ignored";
+        assert_eq!(
+            warned,
+            [
+                ("unsupported_key", "iptables", plain),
+                (
+                    "unsupported_key",
+                    "tun.include-package",
+                    "key is not supported by this core and is ignored, so the TUN captures other apps than the profile says; an app that embeds the core picks the apps itself"
+                ),
+                (
+                    "unsupported_key",
+                    "tun.exclude-uid-range",
+                    "key is not supported by this core and is ignored, so the TUN captures other traffic than the profile says"
+                ),
+                ("unsupported_key", "tun.dns-mode", plain),
+            ]
+        );
     }
 
     #[test]

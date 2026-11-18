@@ -7,6 +7,7 @@ use concord_common::stream_buffer::BufferRequirements;
 use concord_common::{BoxRead, BoxWrite, Stream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use super::codec::{Decode, Encode};
 use super::frame::{Chunk, MAX_CHUNK, Opener, Scheme, Sealer};
 
 const READ_CHUNK: usize = 17 * 1024;
@@ -52,8 +53,8 @@ impl Reply {
     }
 }
 
-struct Incoming {
-    opener: Opener,
+struct Incoming<D> {
+    opener: D,
     input: BytesMut,
     plain: BytesMut,
     reply: Reply,
@@ -61,25 +62,31 @@ struct Incoming {
     peer_zero: bool,
 }
 
-struct Outgoing {
-    sealer: Sealer,
+struct Outgoing<E> {
+    sealer: E,
     out: Vec<u8>,
     sent: usize,
     sent_zero: bool,
 }
 
-pub(super) struct SnellStream<S> {
+pub(super) struct SnellStream<S, E = Sealer, D = Opener> {
     inner: S,
-    incoming: Incoming,
-    outgoing: Outgoing,
+    incoming: Incoming<D>,
+    outgoing: Outgoing<E>,
 }
 
 impl<S> SnellStream<S> {
     pub(super) fn new(inner: S, scheme: Scheme, psk: &[u8]) -> Self {
+        Self::with_codecs(inner, Sealer::new(scheme, psk), Opener::new(scheme, psk))
+    }
+}
+
+impl<S, E: Encode, D: Decode> SnellStream<S, E, D> {
+    pub(super) fn with_codecs(inner: S, sealer: E, opener: D) -> Self {
         SnellStream {
             inner,
             incoming: Incoming {
-                opener: Opener::new(scheme, psk),
+                opener,
                 input: BytesMut::new(),
                 plain: BytesMut::new(),
                 reply: Reply::Start,
@@ -87,7 +94,7 @@ impl<S> SnellStream<S> {
                 peer_zero: false,
             },
             outgoing: Outgoing {
-                sealer: Sealer::new(scheme, psk),
+                sealer,
                 out: Vec::new(),
                 sent: 0,
                 sent_zero: false,
@@ -106,7 +113,7 @@ impl<S> SnellStream<S> {
     }
 }
 
-impl Outgoing {
+impl<E: Encode> Outgoing<E> {
     fn queue(&mut self, data: &[u8]) -> io::Result<()> {
         self.sealer.seal_stream(&mut self.out, data)
     }
@@ -166,7 +173,7 @@ impl Outgoing {
     }
 }
 
-impl Incoming {
+impl<D: Decode> Incoming<D> {
     fn poll_fill<R: AsyncRead + Unpin>(
         &mut self,
         cx: &mut Context<'_>,
@@ -244,7 +251,7 @@ fn server_error(code: u8, message: &[u8]) -> io::Error {
     ))
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for SnellStream<S> {
+impl<S: AsyncRead + AsyncWrite + Unpin, E: Encode, D: Decode> AsyncRead for SnellStream<S, E, D> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -255,7 +262,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for SnellStream<S> {
     }
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SnellStream<S> {
+impl<S: AsyncRead + AsyncWrite + Unpin, E: Encode, D: Decode> AsyncWrite for SnellStream<S, E, D> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -276,12 +283,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SnellStream<S> {
     }
 }
 
-struct ReadHalf {
+struct ReadHalf<D> {
     io: BoxRead,
-    incoming: Incoming,
+    incoming: Incoming<D>,
 }
 
-impl AsyncRead for ReadHalf {
+impl<D: Decode> AsyncRead for ReadHalf<D> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -292,12 +299,12 @@ impl AsyncRead for ReadHalf {
     }
 }
 
-struct WriteHalf {
+struct WriteHalf<E> {
     io: BoxWrite,
-    outgoing: Outgoing,
+    outgoing: Outgoing<E>,
 }
 
-impl AsyncWrite for WriteHalf {
+impl<E: Encode> AsyncWrite for WriteHalf<E> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -318,7 +325,7 @@ impl AsyncWrite for WriteHalf {
     }
 }
 
-impl<S: Stream> Stream for SnellStream<S> {
+impl<S: Stream, E: Encode, D: Decode> Stream for SnellStream<S, E, D> {
     concord_common::stream_policy!(inner;
         forward: peer_addr;
         own: into_split, write_requirements;

@@ -63,6 +63,10 @@ impl Outbounds {
         let flow = dummy_flow(dst.clone(), Network::Tcp);
         let (leaf, chain) = match self.walk(node.clone(), &flow, dst.domain(), Touch::Yes) {
             Resolved::Route { leaf, chain, .. } => (leaf, chain),
+            Resolved::Rematch(leaf) => {
+                let chain = vec![leaf.info().name.clone()].into();
+                (leaf, chain)
+            }
             Resolved::Pass | Resolved::PassRule => return Err("PASS cannot be tested".into()),
             Resolved::Rejected(reason) => return Err(reason.to_string()),
             Resolved::Unknown => return Err("proxy not found".into()),

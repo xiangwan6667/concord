@@ -9,6 +9,7 @@ use bytes::BytesMut;
 use concord_common::{Address, BoxRead, BoxStream, BoxWrite, PacketBuf, PacketSession};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use super::codec::{Decode, Encode};
 use super::frame::{Chunk, MAX_CHUNK, Opener, Scheme, Sealer};
 use super::stream::Reply;
 use crate::util::{invalid_data, lock};
@@ -16,26 +17,26 @@ use crate::util::{invalid_data, lock};
 const FORWARD: u8 = 1;
 const READ_CHUNK: usize = 17 * 1024;
 
-struct Writer {
+struct Writer<E> {
     io: BoxWrite,
-    sealer: Sealer,
+    sealer: E,
     scratch: Vec<u8>,
     out: Vec<u8>,
     sent: usize,
     inflight: bool,
 }
 
-struct Reader {
+struct Reader<D> {
     io: BoxRead,
-    opener: Opener,
+    opener: D,
     input: BytesMut,
     plain: BytesMut,
     reply: Reply,
 }
 
-pub(super) struct SnellPackets {
-    writer: Mutex<Writer>,
-    reader: Mutex<Reader>,
+pub(super) struct SnellPackets<E = Sealer, D = Opener> {
+    writer: Mutex<Writer<E>>,
+    reader: Mutex<Reader<D>>,
     closed: AtomicBool,
 }
 
@@ -45,6 +46,12 @@ fn closed() -> io::Error {
 
 impl SnellPackets {
     pub(super) fn new(io: BoxStream, scheme: Scheme, psk: &[u8], sealer: Sealer) -> Self {
+        Self::with_codecs(io, sealer, Opener::new(scheme, psk))
+    }
+}
+
+impl<E: Encode, D: Decode> SnellPackets<E, D> {
+    pub(super) fn with_codecs(io: BoxStream, sealer: E, opener: D) -> Self {
         let (read, write) = io.into_split();
         SnellPackets {
             writer: Mutex::new(Writer {
@@ -57,7 +64,7 @@ impl SnellPackets {
             }),
             reader: Mutex::new(Reader {
                 io: read,
-                opener: Opener::new(scheme, psk),
+                opener,
                 input: BytesMut::new(),
                 plain: BytesMut::new(),
                 reply: Reply::Start,
@@ -82,7 +89,7 @@ impl SnellPackets {
     }
 }
 
-fn fill(reader: &mut Reader, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+fn fill<D: Decode>(reader: &mut Reader<D>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
     loop {
         match reader.opener.open(&mut reader.input, &mut reader.plain)? {
             Some(Chunk::Data) => return Poll::Ready(Ok(())),
@@ -160,7 +167,7 @@ fn parse_source(packet: &[u8]) -> io::Result<(SocketAddr, &[u8])> {
     Ok((SocketAddr::new(ip, port), rest.get(2..).unwrap_or_default()))
 }
 
-impl PacketSession for SnellPackets {
+impl<E: Encode, D: Decode> PacketSession for SnellPackets<E, D> {
     fn poll_send(
         &self,
         cx: &mut Context<'_>,

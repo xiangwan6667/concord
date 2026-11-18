@@ -26,7 +26,9 @@ async fn request_bytes_follow_net_http_ordering() {
         ("user-agent".into(), "Mozilla/5.0".into()),
         ("X-Custom".into(), "one".into()),
     ];
-    let task = tokio::spawn(async move { apply(Box::new(client), &o, "example.com").await });
+    let task = tokio::spawn(async move {
+        apply(Box::new(client), &o, "example.com", &Default::default()).await
+    });
     let (head, _) = read_request(&mut server).await;
     server.write_all(SWITCH).await.unwrap();
     task.await.unwrap().unwrap();
@@ -49,7 +51,9 @@ async fn default_user_agent_and_host_override() {
     let (client, mut server) = duplex(8192);
     let mut o = opts("");
     o.headers = vec![("Host".into(), "front.example.net".into())];
-    let task = tokio::spawn(async move { apply(Box::new(client), &o, "198.51.100.7").await });
+    let task = tokio::spawn(async move {
+        apply(Box::new(client), &o, "198.51.100.7", &Default::default()).await
+    });
     let (head, _) = read_request(&mut server).await;
     server.write_all(SWITCH).await.unwrap();
     task.await.unwrap().unwrap();
@@ -62,7 +66,10 @@ async fn default_user_agent_and_host_override() {
 #[tokio::test]
 async fn non_101_status_is_an_error() {
     let (client, mut server) = duplex(8192);
-    let task = tokio::spawn(async move { apply(Box::new(client), &opts("/"), "h").await });
+    let task =
+        tokio::spawn(
+            async move { apply(Box::new(client), &opts("/"), "h", &Default::default()).await },
+        );
     read_request(&mut server).await;
     server
         .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
@@ -75,7 +82,10 @@ async fn non_101_status_is_an_error() {
 #[tokio::test]
 async fn missing_upgrade_headers_are_an_error() {
     let (client, mut server) = duplex(8192);
-    let task = tokio::spawn(async move { apply(Box::new(client), &opts("/"), "h").await });
+    let task =
+        tokio::spawn(
+            async move { apply(Box::new(client), &opts("/"), "h", &Default::default()).await },
+        );
     read_request(&mut server).await;
     server
         .write_all(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
@@ -87,7 +97,11 @@ async fn missing_upgrade_headers_are_an_error() {
 #[tokio::test]
 async fn frames_round_trip_and_masking_is_set_on_client_frames() {
     let (client, mut server) = duplex(1 << 20);
-    let task = tokio::spawn(async move { apply(Box::new(client), &opts("/"), "h").await.unwrap() });
+    let task = tokio::spawn(async move {
+        apply(Box::new(client), &opts("/"), "h", &Default::default())
+            .await
+            .unwrap()
+    });
     let (_, rest) = read_request(&mut server).await;
     assert!(rest.is_empty());
     server.write_all(SWITCH).await.unwrap();
@@ -128,7 +142,9 @@ async fn early_data_rides_in_the_protocol_header_and_the_rest_follows_as_frames(
     let mut o = opts("/ws");
     o.max_early_data = 4;
     o.early_data_header_name = "Sec-WebSocket-Protocol".into();
-    let mut client = apply(Box::new(client), &o, "h").await.unwrap();
+    let mut client = apply(Box::new(client), &o, "h", &Default::default())
+        .await
+        .unwrap();
 
     let writer = tokio::spawn(async move {
         client.write_all(b"abcdefgh").await.unwrap();
@@ -156,7 +172,9 @@ async fn early_data_without_a_header_name_extends_the_path() {
     let (client, mut server) = duplex(8192);
     let mut o = opts("/ws");
     o.max_early_data = 16;
-    let mut client = apply(Box::new(client), &o, "h").await.unwrap();
+    let mut client = apply(Box::new(client), &o, "h", &Default::default())
+        .await
+        .unwrap();
     let writer = tokio::spawn(async move {
         client.write_all(b"abcd").await.unwrap();
         client.flush().await.unwrap();
@@ -172,7 +190,9 @@ async fn early_data_without_a_header_name_extends_the_path() {
 async fn ed_query_turns_on_early_data_and_leaves_the_rest_of_the_query() {
     let (client, mut server) = duplex(8192);
     let o = opts("/ws?z=1&ed=2048&a=b");
-    let mut client = apply(Box::new(client), &o, "h").await.unwrap();
+    let mut client = apply(Box::new(client), &o, "h", &Default::default())
+        .await
+        .unwrap();
     let writer = tokio::spawn(async move {
         client.write_all(b"hello").await.unwrap();
         client.flush().await.unwrap();
@@ -191,7 +211,9 @@ async fn reads_wait_for_the_first_write_when_the_handshake_is_delayed() {
     let mut o = opts("/");
     o.max_early_data = 8;
     o.early_data_header_name = "Sec-WebSocket-Protocol".into();
-    let mut client = apply(Box::new(client), &o, "h").await.unwrap();
+    let mut client = apply(Box::new(client), &o, "h", &Default::default())
+        .await
+        .unwrap();
     let task = tokio::spawn(async move {
         let mut buf = [0u8; 5];
         client.read_exact(&mut buf).await.unwrap();
@@ -215,7 +237,9 @@ async fn v2ray_http_upgrade_is_unframed_and_carries_leftover_bytes() {
     let mut o = opts("/up");
     o.v2ray_http_upgrade = true;
     let task = tokio::spawn(async move {
-        let mut c = apply(Box::new(client), &o, "h").await.unwrap();
+        let mut c = apply(Box::new(client), &o, "h", &Default::default())
+            .await
+            .unwrap();
         c.write_all(b"raw-out").await.unwrap();
         let mut got = [0u8; 6];
         c.read_exact(&mut got).await.unwrap();
@@ -239,7 +263,9 @@ async fn fast_open_writes_before_the_response_arrives() {
     let mut o = opts("/up");
     o.v2ray_http_upgrade = true;
     o.v2ray_http_upgrade_fast_open = true;
-    let mut c = apply(Box::new(client), &o, "h").await.unwrap();
+    let mut c = apply(Box::new(client), &o, "h", &Default::default())
+        .await
+        .unwrap();
     c.write_all(b"early").await.unwrap();
     c.flush().await.unwrap();
     let (_, rest) = read_request(&mut server).await;
@@ -263,7 +289,9 @@ async fn fast_open_rejects_a_bad_response_on_first_read() {
     let mut o = opts("/up");
     o.v2ray_http_upgrade = true;
     o.v2ray_http_upgrade_fast_open = true;
-    let mut c = apply(Box::new(client), &o, "h").await.unwrap();
+    let mut c = apply(Box::new(client), &o, "h", &Default::default())
+        .await
+        .unwrap();
     read_request(&mut server).await;
     server
         .write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n")
@@ -276,7 +304,11 @@ async fn fast_open_rejects_a_bad_response_on_first_read() {
 #[tokio::test]
 async fn server_close_frame_surfaces_as_eof() {
     let (client, mut server) = duplex(8192);
-    let task = tokio::spawn(async move { apply(Box::new(client), &opts("/"), "h").await.unwrap() });
+    let task = tokio::spawn(async move {
+        apply(Box::new(client), &opts("/"), "h", &Default::default())
+            .await
+            .unwrap()
+    });
     read_request(&mut server).await;
     server.write_all(SWITCH).await.unwrap();
     let mut client = task.await.unwrap();
@@ -294,7 +326,10 @@ async fn lazy_halves_hand_over_after_the_first_write_and_shutdown_keeps_reading(
     let mut o = opts("/");
     o.max_early_data = 8;
     o.early_data_header_name = "Sec-WebSocket-Protocol".into();
-    let (mut read, mut write) = apply(Box::new(client), &o, "h").await.unwrap().into_split();
+    let (mut read, mut write) = apply(Box::new(client), &o, "h", &Default::default())
+        .await
+        .unwrap()
+        .into_split();
     let reader = tokio::spawn(async move {
         let mut got = Vec::new();
         read.read_to_end(&mut got).await.unwrap();
@@ -325,7 +360,10 @@ async fn lazy_halves_fail_reads_when_the_writer_shuts_down_first() {
     let mut o = opts("/");
     o.max_early_data = 8;
     o.early_data_header_name = "Sec-WebSocket-Protocol".into();
-    let (mut read, mut write) = apply(Box::new(client), &o, "h").await.unwrap().into_split();
+    let (mut read, mut write) = apply(Box::new(client), &o, "h", &Default::default())
+        .await
+        .unwrap()
+        .into_split();
     write.shutdown().await.unwrap();
     let mut buf = [0u8; 1];
     assert!(read.read(&mut buf).await.is_err());
@@ -337,7 +375,10 @@ async fn lazy_halves_fail_reads_when_the_writer_drops_before_writing() {
     let mut o = opts("/");
     o.max_early_data = 8;
     o.early_data_header_name = "Sec-WebSocket-Protocol".into();
-    let (mut read, write) = apply(Box::new(client), &o, "h").await.unwrap().into_split();
+    let (mut read, write) = apply(Box::new(client), &o, "h", &Default::default())
+        .await
+        .unwrap()
+        .into_split();
     let reader = tokio::spawn(async move {
         let mut buf = [0u8; 1];
         read.read(&mut buf).await
@@ -357,7 +398,10 @@ async fn fast_open_halves_move_data_both_ways_and_shutdown_keeps_reading() {
     let mut o = opts("/up");
     o.v2ray_http_upgrade = true;
     o.v2ray_http_upgrade_fast_open = true;
-    let (mut read, mut write) = apply(Box::new(client), &o, "h").await.unwrap().into_split();
+    let (mut read, mut write) = apply(Box::new(client), &o, "h", &Default::default())
+        .await
+        .unwrap()
+        .into_split();
     let writer = tokio::spawn(async move {
         write.write_all(b"early").await.unwrap();
         write.shutdown().await.unwrap();

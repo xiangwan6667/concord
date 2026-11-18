@@ -7,8 +7,11 @@
 
 mod direct;
 
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use base64::Engine;
@@ -26,8 +29,8 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::WireGuard;
-use super::stack::{Stack, StackConfig, StackRecv, StackSend};
-use crate::testing::{HeldLookup, test_env};
+use crate::stack::{Stack, StackConfig, StackRecv, StackSend};
+use crate::testing::{HeldLookup, LoopbackHop, test_env, test_env_with};
 
 const SERVER_TUNNEL_IP: Ipv4Addr = Ipv4Addr::new(10, 7, 0, 1);
 const CLIENT_TUNNEL_IP: Ipv4Addr = Ipv4Addr::new(10, 7, 0, 2);
@@ -75,10 +78,13 @@ async fn server(client_public: PublicKey) -> Server {
     let secret = secret(1);
     let public = PublicKey::from(&secret);
     let port = free_udp_port();
-    let wired = Stack::start(&StackConfig {
-        addrs: vec![SERVER_TUNNEL_IP.into()],
-        mtu: 1408,
-    });
+    let wired = Stack::start(
+        &StackConfig {
+            addrs: vec![SERVER_TUNNEL_IP.into()],
+            mtu: 1408,
+        },
+        &Default::default(),
+    );
     wired.stack.serve_tcp_echo(7);
     wired.stack.serve_udp(7001, |data| Some(data.to_vec()));
     wired.stack.serve_udp(53, dns_answer);
@@ -106,6 +112,16 @@ fn client(port: u16, public: &PublicKey, extra: Value) -> Arc<WireGuard> {
 }
 
 fn client_at(host: &str, port: u16, public: &PublicKey, extra: Value) -> Arc<WireGuard> {
+    client_with(host, port, public, extra, Default::default())
+}
+
+fn client_with(
+    host: &str,
+    port: u16,
+    public: &PublicKey,
+    extra: Value,
+    tasks: concord_common::Tasks,
+) -> Arc<WireGuard> {
     let mut proxy = json!({
         "name": "wg", "type": "wireguard", "udp": true,
         "private-key": b64(&[2; 32]),
@@ -126,7 +142,7 @@ fn client_at(host: &str, port: u16, public: &PublicKey, extra: Value) -> Arc<Wir
     let ProxyKind::WireGuard(opts) = &def.kind else {
         unreachable!()
     };
-    Arc::new(super::construct(&def, opts).unwrap())
+    Arc::new(super::construct(&def, opts, tasks).unwrap())
 }
 
 async fn setup(extra: Value) -> (Server, Arc<WireGuard>) {
@@ -197,6 +213,24 @@ async fn concurrent_connections_share_one_tunnel() {
 }
 
 #[tokio::test]
+async fn callers_that_wait_for_the_tunnel_share_it_and_mark_it_used() {
+    let (_server, outbound) = setup(json!({})).await;
+    let env = test_env();
+    let cx = DialCx::new(&env, Initiator::Direct, None);
+    let shared = &outbound.shared;
+    let (first, second, third) =
+        tokio::join!(shared.tunnel(&cx), shared.tunnel(&cx), shared.tunnel(&cx));
+    let first = first.unwrap();
+    assert!(Arc::ptr_eq(&first, &second.unwrap()));
+    assert!(Arc::ptr_eq(&first, &third.unwrap()));
+    assert_eq!(
+        first.touch(),
+        3,
+        "only the two callers that waited count as uses of the new tunnel"
+    );
+}
+
+#[tokio::test]
 async fn udp_echoes_through_the_tunnel() {
     let (_server, outbound) = setup(json!({})).await;
     let env = test_env();
@@ -215,6 +249,57 @@ async fn udp_echoes_through_the_tunnel() {
         assert_eq!(got.as_slice(), data);
         assert_eq!(from, dst);
     }
+}
+
+async fn assert_parked<F: Future>(waiting: Pin<&mut F>) {
+    let mut waiting = Some(waiting);
+    std::future::poll_fn(|cx| {
+        assert!(waiting.take().unwrap().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn closing_a_udp_session_wakes_its_parked_receive() {
+    let (_server, outbound) = setup(json!({})).await;
+    let env = test_env();
+    let cx = DialCx::new(&env, Initiator::Direct, None);
+    let dst = Address::new(&SERVER_TUNNEL_IP.to_string(), 7001);
+    let session = outbound.associate(&cx, &dst).await.unwrap();
+    let mut waiting = std::pin::pin!(recv_packet(&*session));
+    assert_parked(waiting.as_mut()).await;
+    session.close();
+    let woken = tokio::time::timeout(Duration::from_secs(2), waiting).await;
+    assert!(woken.expect("the receive stayed parked").is_err());
+}
+
+#[tokio::test]
+async fn a_failed_wire_fails_the_flows_parked_on_the_tunnel() {
+    let server = server(PublicKey::from(&secret(2))).await;
+    let outbound = client(server.port, &server.public, json!({"dialer-proxy": "hop"}));
+    let hop = Arc::new(LoopbackHop::default());
+    let env = test_env_with(hop.clone());
+    let cx = DialCx::new(&env, Initiator::Direct, None);
+    let udp_dst = Address::new(&SERVER_TUNNEL_IP.to_string(), 7001);
+    let session = outbound.associate(&cx, &udp_dst).await.unwrap();
+    let tcp_dst = Address::new(&SERVER_TUNNEL_IP.to_string(), 7);
+    let stream = tokio::time::timeout(Duration::from_secs(10), outbound.connect(&cx, &tcp_dst))
+        .await
+        .expect("connect timed out")
+        .unwrap();
+    let (mut read, _write) = stream.into_split();
+    let mut byte = [0u8; 1];
+    let mut udp = std::pin::pin!(recv_packet(&*session));
+    let mut tcp = std::pin::pin!(read.read(&mut byte));
+    assert_parked(udp.as_mut()).await;
+    assert_parked(tcp.as_mut()).await;
+    hop.cut.set();
+    let udp = tokio::time::timeout(Duration::from_secs(2), udp).await;
+    assert!(udp.expect("the UDP receive stayed parked").is_err());
+    let tcp = tokio::time::timeout(Duration::from_secs(2), tcp).await;
+    assert!(tcp.expect("the TCP read stayed parked").is_err());
+    assert!(outbound.shared.current().is_none());
 }
 
 #[tokio::test]
@@ -623,4 +708,48 @@ async fn talks_to_amneziawg_go() {
             "a plain client got through an obfuscated server"
         );
     }
+}
+
+#[tokio::test]
+async fn a_tunnel_s_tasks_end_when_its_outbound_is_dropped() {
+    let server = server(PublicKey::from(&secret(2))).await;
+    let tracked = crate::testing::Tracked::new();
+    let outbound = client_with(
+        "127.0.0.1",
+        server.port,
+        &server.public,
+        json!({}),
+        tracked.tasks.clone(),
+    );
+    echo(
+        &*outbound,
+        Address::new(&SERVER_TUNNEL_IP.to_string(), 7),
+        16,
+    )
+    .await;
+    assert!(tracked.running() > 0, "the tunnel is not tracked");
+    drop(outbound);
+    assert!(tracked.ended_within(Duration::from_secs(5)).await);
+}
+
+#[tokio::test]
+async fn a_stop_ends_a_tunnel_s_tasks_once_the_outbound_is_gone() {
+    let server = server(PublicKey::from(&secret(2))).await;
+    let tracked = crate::testing::Tracked::new();
+    let outbound = client_with(
+        "127.0.0.1",
+        server.port,
+        &server.public,
+        json!({}),
+        tracked.tasks.clone(),
+    );
+    echo(
+        &*outbound,
+        Address::new(&SERVER_TUNNEL_IP.to_string(), 7),
+        16,
+    )
+    .await;
+    tracked.stop();
+    drop(outbound);
+    assert!(tracked.ended_within(Duration::from_secs(5)).await);
 }

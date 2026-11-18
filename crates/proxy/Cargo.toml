@@ -32,6 +32,10 @@ h3 ={ workspace = true }
 h3-quinn = { workspace = true }
 rustls = { workspace = true }
 http = { workspace = true }
+h2 = { workspace = true }
+rcgen = { workspace = true }
+x509-parser = { workspace = true }
+time = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
 sha3 = { workspace = true }
@@ -41,6 +45,7 @@ blake2 = { workspace = true }
 blake3 = { workspace = true }
 ctr = { workspace = true }
 aes = { workspace = true }
+aes-cfb = { workspace = true }
 aes-gcm = { workspace = true }
 x25519-dalek = { workspace = true }
 chacha20poly1305 = { workspace = true }
@@ -64,11 +69,11 @@ hickory-proto = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+h2 = { workspace = true }
 concord-test-support = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 concord-dns = { workspace = true }
 tempfile = { workspace = true }
-rcgen = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 

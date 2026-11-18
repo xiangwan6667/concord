@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use concord_common::{
-    Address, BoxStream, DialCx, Outbound, OutboundInfo, OutboundKind, PacketSession,
+    Address, BoxStream, DialCx, Outbound, OutboundInfo, OutboundKind, PacketSession, Tasks,
 };
 use concord_config::proxy::{MieruOpts, ProxyDef};
 use rand::Rng;
@@ -123,6 +123,7 @@ struct Mieru {
     pattern: Arc<Pattern>,
     clock: Clock,
     pool: Pool,
+    tasks: Tasks,
 }
 
 fn request(command: u8, dst: &Address) -> io::Result<Vec<u8>> {
@@ -167,10 +168,18 @@ impl Mieru {
                 self.pattern.clone(),
                 MTU,
                 self.factor,
+                &self.tasks,
             )
         } else {
             let conn = self.egress.dial(cx, &target).await?;
-            Underlay::start(conn, &key, &self.user, self.pattern.clone(), self.factor)
+            Underlay::start(
+                conn,
+                &key,
+                &self.user,
+                self.pattern.clone(),
+                self.factor,
+                &self.tasks,
+            )
         };
         if !self.pool.add(underlay.clone(), ticket) {
             underlay.close();
@@ -248,6 +257,7 @@ impl Outbound for Mieru {
             udp::Frames,
             udp::Frames,
             hint.clone(),
+            &self.tasks,
         )))
     }
 
@@ -368,5 +378,6 @@ fn construct(def: &ProxyDef, opts: &MieruOpts, ctx: &BuildCtx) -> Result<Mieru, 
         pool: Pool {
             underlays: Mutex::new(Underlays::default()),
         },
+        tasks: ctx.tasks.clone(),
     })
 }

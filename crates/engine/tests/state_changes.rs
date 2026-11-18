@@ -71,20 +71,8 @@ impl Rig {
 
 fn mode(mode: &str) -> UpdateRequest {
     UpdateRequest {
-        tun: None,
-        allow_lan: None,
-        mixed_port: None,
-        find_process_mode: None,
         mode: Some(mode.to_string()),
-        log_level: None,
-        ipv6: None,
-        tcp_concurrent: None,
-        unified_delay: None,
-        authentication: None,
-        geo_auto_update: None,
-        geo_update_interval: None,
-        geox_url: BTreeMap::new(),
-        options: None,
+        ..UpdateRequest::default()
     }
 }
 

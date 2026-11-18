@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
+use concord_common::dns_relay::DnsHijack;
 use concord_common::{
     CoreError, DnsMode, EventSink, Host, HostResolver, Initiator, IpVersion, LookupIps, SockOpts,
     SocketFactory,
@@ -263,6 +264,21 @@ impl HostResolver for Resolver {
             .await?;
         msg::ech_config_list(&resp)
             .ok_or_else(|| io::Error::other("no ECH config found in DNS records"))
+    }
+
+    fn dns_server(&self) -> Option<&dyn DnsHijack> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl DnsHijack for Resolver {
+    async fn answer(&self, query: &[u8]) -> Option<Vec<u8>> {
+        self.handle_query_udp(query, Initiator::Other).await
+    }
+
+    async fn answer_stream(&self, query: &[u8]) -> Option<Vec<u8>> {
+        self.handle_query(query, Initiator::Other).await
     }
 }
 

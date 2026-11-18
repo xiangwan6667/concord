@@ -5,9 +5,12 @@ use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use aws_lc_rs::agreement::{self, UnparsedPublicKey, X25519};
 use aws_lc_rs::kem::{DecapsulationKey, ML_KEM_768};
 use aws_lc_rs::signature::{self, ED25519};
-use concord_common::BoxStream;
-use rustls_pki_types::{CertificateDer, ServerName};
+use concord_common::{BoxStream, Tasks};
+use rustls_pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+mod verify;
+use verify::certificate_verify_message;
 
 use super::cert::{hmac_matches, parse_ed25519_cert, verify_mldsa};
 use super::hello::{HelloParams, SESSION_ID_LEN, SESSION_ID_OFFSET, build_client_hello};
@@ -56,10 +59,11 @@ enum Established {
 
 pub(crate) struct RealityClient {
     options: Option<RealityOptions>,
+    jls: Option<crate::JlsAuth>,
     /// A decoy hello offers X25519MLKEM768 only when its protocol survives the larger hello.
     decoy_hybrid: bool,
     spec: &'static FingerprintSpec,
-    user_agent: &'static str,
+    browser: spider::Browser,
     alpn: Vec<String>,
     policy: Arc<CertPolicy>,
 }
@@ -76,6 +80,38 @@ async fn read_record(io: &mut RecordIo<BoxStream>) -> io::Result<Record> {
     let mut body = vec![0u8; usize::from(u16::from_be_bytes([hi, lo]))];
     io.read_exact(&mut body).await?;
     Ok(Record { header, body })
+}
+
+async fn read_server_hello(io: &mut RecordIo<BoxStream>) -> io::Result<Vec<u8>> {
+    let mut hello = Vec::new();
+    loop {
+        let record = read_record(io).await?;
+        match record.header.first().copied() {
+            Some(20) if record.body == [1] => continue,
+            Some(21) => return Err(alert_error(&record.body)),
+            Some(22) => {
+                if hello.is_empty()
+                    && let Some(&[_, a, b, c]) = record.body.first_chunk::<4>()
+                {
+                    let len = (usize::from(a) << 16) | (usize::from(b) << 8) | usize::from(c);
+                    if record.body.len() == 4 + len {
+                        return Ok(record.body);
+                    }
+                }
+                hello.extend_from_slice(&record.body);
+            }
+            _ => return Err(invalid_data("TLS: expected a handshake record")),
+        }
+        if let Some(&[_, a, b, c]) = hello.first_chunk::<4>() {
+            let len = (usize::from(a) << 16) | (usize::from(b) << 8) | usize::from(c);
+            if len > MAX_HANDSHAKE || hello.len() > 4 + len {
+                return Err(invalid_data("TLS: invalid ServerHello length"));
+            }
+            if hello.len() == 4 + len {
+                return Ok(hello);
+            }
+        }
+    }
 }
 
 fn alert_error(body: &[u8]) -> io::Error {
@@ -247,13 +283,6 @@ fn decompress_certificate(spec: &FingerprintSpec, body: &[u8]) -> io::Result<Vec
     Ok(out)
 }
 
-fn certificate_verify_message(transcript_hash: &[u8]) -> Vec<u8> {
-    let mut message = vec![0x20u8; 64];
-    message.extend_from_slice(b"TLS 1.3, server CertificateVerify\0");
-    message.extend_from_slice(transcript_hash);
-    message
-}
-
 fn weak_secret(secret: &[u8]) -> bool {
     secret.iter().all(|byte| *byte == 0)
 }
@@ -264,9 +293,42 @@ impl RealityClient {
         fingerprint: Option<ClientFingerprint>,
         alpn: Vec<String>,
         trust: Arc<TrustStore>,
+        tasks: &Tasks,
     ) -> Result<Self, TlsError> {
         let policy = Arc::new(CertPolicy::new(&TlsOptions::default(), trust)?);
-        Self::build(Some(options), fingerprint, alpn, policy)
+        Self::build(Some(options), fingerprint, alpn, policy, tasks)
+    }
+
+    pub(crate) fn jls(options: &TlsOptions, trust: Arc<TrustStore>) -> Result<Self, TlsError> {
+        let auth = options
+            .jls
+            .clone()
+            .ok_or_else(|| TlsError::Config("jls: missing credentials".into()))?;
+        if auth.username.is_empty() || auth.password.is_empty() {
+            return Err(TlsError::Config(
+                "jls: username and password are required".into(),
+            ));
+        }
+        let fingerprint = options
+            .client_fingerprint
+            .map(ClientFingerprint::resolve_random);
+        if fingerprint
+            .and_then(|fp| fp.spec())
+            .is_some_and(|spec| !spec.tls13)
+        {
+            return Err(TlsError::Config(
+                "jls: fingerprint does not support TLS 1.3".into(),
+            ));
+        }
+        let policy = Arc::new(CertPolicy::new(&TlsOptions::default(), trust)?);
+        let alpn = options.alpn.clone();
+        let mut client = Self::build(None, fingerprint, alpn, policy, &options.tasks)?;
+        if fingerprint.is_none_or(|fp| fp == ClientFingerprint::None) {
+            client.spec = &crate::jls::NATIVE;
+        }
+        client.jls = Some(auth);
+        client.decoy_hybrid = true;
+        Ok(client)
     }
 
     pub(crate) fn decoy(
@@ -280,6 +342,7 @@ impl RealityClient {
             options.client_fingerprint,
             options.alpn.clone(),
             policy,
+            &options.tasks,
         )?;
         client.decoy_hybrid = hybrid;
         Ok(client)
@@ -290,6 +353,7 @@ impl RealityClient {
         fingerprint: Option<ClientFingerprint>,
         alpn: Vec<String>,
         policy: Arc<CertPolicy>,
+        tasks: &Tasks,
     ) -> Result<Self, TlsError> {
         let requested = fingerprint.unwrap_or(ClientFingerprint::Chrome);
         let resolved = match requested {
@@ -317,9 +381,13 @@ impl RealityClient {
         };
         Ok(Self {
             options,
+            jls: None,
             decoy_hybrid: false,
             spec,
-            user_agent,
+            browser: spider::Browser {
+                user_agent,
+                tasks: tasks.clone(),
+            },
             alpn,
             policy,
         })
@@ -330,7 +398,22 @@ impl RealityClient {
         io: BoxStream,
         name: &ServerName<'static>,
     ) -> io::Result<RealityStream> {
-        match self.run(io, name, None).await? {
+        let run = self.run(io, name, None);
+        let established = if self.jls.is_some() {
+            tokio::time::timeout(crate::jls::HANDSHAKE_TIMEOUT, run)
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "JLS: handshake timed out"))?
+                .map_err(|err| {
+                    let text = err.to_string();
+                    match text.strip_prefix("REALITY:") {
+                        Some(message) => io::Error::new(err.kind(), format!("JLS:{message}")),
+                        None => err,
+                    }
+                })?
+        } else {
+            run.await?
+        };
+        match established {
             Established::Reality(stream) => Ok(*stream),
             Established::Raw { .. } => Err(invalid_data("REALITY: unexpected handshake outcome")),
         }
@@ -396,8 +479,9 @@ impl RealityClient {
         let mut hello = build_client_hello(
             self.spec,
             &HelloParams {
+                jls: self.jls.is_some(),
                 server_name: sni.as_deref(),
-                alpn: &self.alpn,
+                alpn: (self.jls.is_some() || !self.alpn.is_empty()).then_some(self.alpn.as_slice()),
                 random: &random,
                 x25519_public: &x25519_public,
                 mlkem_encapsulation_key: mlkem_public.as_ref().map(|key| key.as_ref()),
@@ -416,12 +500,16 @@ impl RealityClient {
                 (session_id, Some(auth_key))
             }
             (None, Some(sealer)) => (sealer(&hello)?, None),
+            (None, None) if self.jls.is_some() => (rand::random(), None),
             _ => return Err(invalid_data("TLS: handshake mode mismatch")),
         };
         hello
             .get_mut(SESSION_ID_OFFSET..SESSION_ID_OFFSET + SESSION_ID_LEN)
             .ok_or_else(|| invalid_data("REALITY: hello layout"))?
             .copy_from_slice(&session_id);
+        if let Some(auth) = &self.jls {
+            auth.seal(&mut hello)?;
+        }
 
         let mut record = vec![22, 3, 1];
         record.extend_from_slice(
@@ -433,15 +521,7 @@ impl RealityClient {
         io.write_all(&record).await?;
         io.flush().await?;
 
-        let server_hello_raw = loop {
-            let record = read_record(&mut io).await?;
-            match record.header.first().copied() {
-                Some(20) => continue,
-                Some(21) => return Err(alert_error(&record.body)),
-                Some(22) => break record.body,
-                _ => return Err(invalid_data("REALITY: expected a handshake record")),
-            }
-        };
+        let server_hello_raw = read_server_hello(&mut io).await?;
         let server_hello = parse_server_hello(&server_hello_raw)?;
         if server_hello.session_id != session_id {
             return Err(invalid_data("REALITY: server did not echo the session id"));
@@ -494,33 +574,8 @@ impl RealityClient {
             )
             .await?;
 
-        let cv_hash = flight.certificate_verify_hash.clone();
-        let authenticated = match flight
-            .chain
-            .first()
-            .and_then(|leaf| parse_ed25519_cert(leaf))
-        {
-            Some(cert)
-                if auth_key
-                    .as_deref()
-                    .is_some_and(|key| hmac_matches(key, &cert)) =>
-            {
-                if flight.signature_scheme != SCHEME_ED25519 {
-                    return Err(invalid_data("REALITY: unexpected signature scheme"));
-                }
-                signature::UnparsedPublicKey::new(&ED25519, &cert.public_key)
-                    .verify(&certificate_verify_message(&cv_hash), &flight.signature)
-                    .map_err(|_| invalid_data("REALITY: CertificateVerify signature mismatch"))?;
-                if let Some((key, hellos)) = &mldsa {
-                    verify_mldsa(auth_key.as_deref().unwrap_or_default(), &cert, key, hellos)?;
-                }
-                true
-            }
-            _ => {
-                self.verify_fallback_chain(&flight, &cv_hash, name)?;
-                false
-            }
-        };
+        let authenticated =
+            self.authenticate(&flight, &server_hello_raw, auth_key.as_deref(), mldsa, name)?;
 
         let mut finished = vec![HS_FINISHED];
         let verify_data = finished_verify_data(hash, &secrets.client, &transcript);
@@ -546,9 +601,68 @@ impl RealityClient {
         if authenticated {
             return Ok(Established::Reality(Box::new(stream)));
         }
-        let host = sni.unwrap_or_default();
-        spider::spawn(stream, host, self.user_agent);
-        Err(invalid_data("REALITY authentication failed"))
+        if self.jls.is_some() {
+            if !std::ptr::eq(self.spec, &crate::jls::NATIVE) {
+                self.browser.jls_fallback(stream, name).await;
+            }
+            Err(invalid_data("jls authentication failed"))
+        } else {
+            self.browser.spawn(stream, sni.unwrap_or_default());
+            Err(invalid_data("REALITY authentication failed"))
+        }
+    }
+
+    fn authenticate(
+        &self,
+        flight: &Flight,
+        server_hello_raw: &[u8],
+        auth_key: Option<&[u8]>,
+        mldsa: Option<(&[u8], Vec<u8>)>,
+        name: &ServerName<'static>,
+    ) -> io::Result<bool> {
+        if self.jls.is_some()
+            && flight
+                .alpn
+                .as_ref()
+                .is_some_and(|alpn| !self.alpn.iter().any(|offered| offered.as_bytes() == alpn))
+        {
+            return Err(invalid_data("jls: server selected an unoffered ALPN"));
+        }
+        let cv_hash = flight.certificate_verify_hash.clone();
+        if let Some(auth) = &self.jls {
+            let authenticated = auth.verify(server_hello_raw)?;
+            if authenticated {
+                self.verify_signature(flight, &cv_hash)?;
+            } else {
+                self.verify_fallback_chain(flight, &cv_hash, name)?;
+            }
+            Ok(authenticated)
+        } else {
+            match flight
+                .chain
+                .first()
+                .and_then(|leaf| parse_ed25519_cert(leaf))
+            {
+                Some(cert) if auth_key.is_some_and(|key| hmac_matches(key, &cert)) => {
+                    if flight.signature_scheme != SCHEME_ED25519 {
+                        return Err(invalid_data("REALITY: unexpected signature scheme"));
+                    }
+                    signature::UnparsedPublicKey::new(&ED25519, &cert.public_key)
+                        .verify(&certificate_verify_message(&cv_hash), &flight.signature)
+                        .map_err(|_| {
+                            invalid_data("REALITY: CertificateVerify signature mismatch")
+                        })?;
+                    if let Some((key, hellos)) = mldsa {
+                        verify_mldsa(auth_key.unwrap_or_default(), &cert, key, &hellos)?;
+                    }
+                    Ok(true)
+                }
+                _ => {
+                    self.verify_fallback_chain(flight, &cv_hash, name)?;
+                    Ok(false)
+                }
+            }
+        }
     }
 
     async fn read_flight(
@@ -610,45 +724,6 @@ impl RealityClient {
                 _ => return Err(invalid_data("REALITY: unexpected handshake message")),
             }
             transcript.extend_from_slice(&message.raw);
-        }
-    }
-
-    fn verify_fallback_chain(
-        &self,
-        flight: &Flight,
-        transcript_hash: &[u8],
-        name: &ServerName<'static>,
-    ) -> io::Result<()> {
-        let chain: Vec<CertificateDer<'_>> = flight
-            .chain
-            .iter()
-            .map(|der| CertificateDer::from(der.as_slice()))
-            .collect();
-        self.policy.verify(&chain, name, self.policy.now())?;
-        let leaf = chain
-            .first()
-            .ok_or_else(|| invalid_data("REALITY: server sent no certificate"))?;
-        let end_entity = webpki::EndEntityCert::try_from(leaf)
-            .map_err(|_| invalid_data("REALITY: unparsable certificate"))?;
-        let message = certificate_verify_message(transcript_hash);
-        let verified = self
-            .policy
-            .algorithms()
-            .mapping
-            .iter()
-            .filter(|(scheme, _)| u16::from(*scheme) == flight.signature_scheme)
-            .flat_map(|(_, algs)| algs.iter())
-            .any(|alg| {
-                end_entity
-                    .verify_signature(*alg, &message, &flight.signature)
-                    .is_ok()
-            });
-        if verified {
-            Ok(())
-        } else {
-            Err(invalid_data(
-                "REALITY: CertificateVerify signature mismatch",
-            ))
         }
     }
 }

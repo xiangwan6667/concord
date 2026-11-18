@@ -26,6 +26,7 @@ pub struct ConnMeta {
     pub dst_geoip: Option<Vec<String>>,
     pub src_asn: String,
     pub dst_asn: String,
+    pub rematch_name: String,
     pub special_rules: String,
     pub special_proxy: String,
 }

@@ -14,8 +14,6 @@ pub mod wire;
 pub use attach::Gather;
 pub use cc::Congestion;
 pub use engine::{Accepted, Admit, FlowOwner, StackConfig, TcpInput, TcpStack};
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub use readiness::SocketSource;
 pub use readiness::{SocketOwner, SocketReady};
 pub use stream::{NetReadHalf, NetStream, NetWriteHalf};
 pub use tcp::{Egress, TcpConfig};

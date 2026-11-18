@@ -1,12 +1,11 @@
 use std::collections::HashMap;
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use concord_common::sync::lock;
 use concord_platform::HomeDir;
 
-use crate::ca::{AUTHORITY_DIR, restrict_to_owner};
+use crate::ca::AUTHORITY_DIR;
 
 const MAX_VALUE: usize = 4 << 20;
 const MAX_SIZE: usize = 8 << 20;
@@ -133,10 +132,7 @@ impl Store {
         };
         let written = data.map_err(std::io::Error::other).and_then(|data| {
             self.home.create_dir_all(AUTHORITY_DIR)?;
-            self.home.write_atomic_with(Self::path(), |file| {
-                restrict_to_owner(file)?;
-                file.write_all(&data)
-            })
+            self.home.write_private(Self::path(), &data)
         });
         if let Err(err) = written {
             tracing::warn!("[MITM] saving the script store: {err}");

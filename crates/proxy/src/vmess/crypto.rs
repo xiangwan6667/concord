@@ -1,8 +1,8 @@
 use std::io;
 use std::ops::Range;
 
-use aes::Aes128;
 use aes::cipher::{BlockEncrypt, KeyInit};
+use aes_cfb::Aes128;
 use aws_lc_rs::aead::{AES_128_GCM, Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
 use aws_lc_rs::digest::{Context as DigestContext, SHA256};
 use cfb_mode::cipher::KeyIvInit;
@@ -321,7 +321,7 @@ impl Request {
             check.copy_from_slice(&crc32fast::hash(&crc_input).to_be_bytes());
         }
         let auth_key = head16(&kdf(user, "AES Auth ID Encryption", &[]))?;
-        let cipher = Aes128::new_from_slice(&auth_key).map_err(|_| invalid_data("bad auth key"))?;
+        let cipher = aes::Aes128::new(&auth_key.into());
         let mut block = aes::Block::from(auth);
         cipher.encrypt_block(&mut block);
         let auth_id: [u8; 16] = block.into();

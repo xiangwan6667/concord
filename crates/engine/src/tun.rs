@@ -17,6 +17,9 @@ use concord_tun::{
 };
 use concord_tunnel::Tunnel;
 
+use crate::engine::{Engine, TunPatch, UpdateRequest};
+use crate::error::Failure;
+
 const DEFAULT_MTU: u32 = 9000;
 const DEFAULT_INET4: &str = "198.18.0.1/30";
 const DEFAULT_INET6: &str = "fdfe:dcba:9876::1/126";
@@ -172,64 +175,42 @@ pub(crate) fn options_of(config: &TunConfig, inet4: Option<Prefix>, ipv6: bool) 
     }
 }
 
-/// What Android hands over with the `VpnService` descriptor.
+/// `tun.Start`: how to run the descriptor the Android service hands over.
 #[cfg(unix)]
-#[derive(Clone, Debug, Default)]
-pub struct VpnTunRequest {
-    pub stack: String,
-    pub address: String,
-    pub dns: String,
-    pub options: String,
-}
-
-#[cfg(unix)]
-#[derive(serde::Deserialize, Default)]
-struct VpnTunSettings {
-    #[serde(default)]
-    mtu: u32,
-    #[serde(default, rename = "congestion-controller")]
-    congestion_controller: String,
-}
-
-/// `tun.Start`: the options the Android service sends, read the same way.
-#[cfg(unix)]
-pub(crate) fn vpn_options(request: &VpnTunRequest) -> Result<(TunOptions, Congestion), String> {
-    let settings: VpnTunSettings =
-        serde_json::from_str(&request.options).map_err(|err| err.to_string())?;
+pub(crate) fn vpn_options(
+    tun: &InheritedTun,
+) -> Result<(TunOptions, Congestion), InheritedTunError> {
     let mut options = TunOptions {
         device: Some(concord_common::PRODUCT_NAME.to_owned()),
-        mtu: if settings.mtu == 0 {
-            DEFAULT_MTU
-        } else {
-            settings.mtu
-        },
+        mtu: tun.mtu.filter(|mtu| *mtu != 0).unwrap_or(DEFAULT_MTU),
         auto_route: false,
         ..TunOptions::default()
     };
-    for address in request.address.split(',').map(str::trim) {
+    for address in tun.address.iter().map(|address| address.trim()) {
         if address.is_empty() {
             continue;
         }
-        let prefix =
-            Prefix::parse(address).ok_or_else(|| format!("invalid tun address {address}"))?;
+        let prefix = Prefix::parse(address)
+            .ok_or_else(|| InheritedTunError::Address(address.to_string()))?;
         if prefix.addr().is_ipv4() {
             options.inet4_address.push(prefix);
         } else {
             options.inet6_address.push(prefix);
         }
     }
-    for server in request.dns.split(',').map(str::trim) {
+    for server in tun.dns.iter().map(|server| server.trim()) {
         if server.is_empty() {
             continue;
         }
         let ip: std::net::IpAddr = server
             .parse()
-            .map_err(|_| format!("invalid tun dns {server}"))?;
+            .map_err(|_| InheritedTunError::Dns(server.to_string()))?;
         options
             .dns_hijack
             .push(std::net::SocketAddr::new(ip, 53).to_string());
     }
-    Ok((options, congestion_of(&settings.congestion_controller)))
+    let congestion = congestion_of(tun.congestion_controller.as_deref().unwrap_or_default());
+    Ok((options, congestion))
 }
 
 pub(crate) fn congestion_of(name: &str) -> Congestion {
@@ -287,6 +268,84 @@ pub(crate) async fn stop_runner(runner: TunRunner) {
     }
 }
 
+/// Why a TUN start a host asked for did not happen.
+#[derive(Debug, thiserror::Error)]
+pub enum TunStartError {
+    #[error("TUN is unavailable: {0}")]
+    Unavailable(String),
+    #[cfg(unix)]
+    #[error("the TUN device did not start: {0}")]
+    Request(#[from] InheritedTunError),
+    #[cfg(unix)]
+    #[error("the TUN device did not start: {0}")]
+    Start(#[from] StartError),
+    #[error("applying the TUN change failed")]
+    Failed(#[from] Failure),
+}
+
+/// What in an inherited device's settings cannot be used.
+#[cfg(unix)]
+#[derive(Debug, thiserror::Error)]
+pub enum InheritedTunError {
+    #[error("invalid tun address {0}")]
+    Address(String),
+    #[error("invalid tun dns {0}")]
+    Dns(String),
+}
+
+/// A device the host opened and hands over, with how to run it.
+#[cfg(unix)]
+pub struct InheritedTun {
+    pub mtu: Option<u32>,
+    pub address: Vec<String>,
+    pub dns: Vec<String>,
+    pub congestion_controller: Option<String>,
+}
+
+impl Engine {
+    /// Android hands the core a descriptor; elsewhere the core opens a device by name.
+    pub fn named_tun_supported(&self) -> bool {
+        !self.is_android()
+    }
+
+    /// Turns TUN on with this device and stack, and off again if it did not come up.
+    pub async fn start_named_tun(
+        &self,
+        device: Option<String>,
+        stack: Option<String>,
+    ) -> Result<(), TunStartError> {
+        self.update(UpdateRequest {
+            tun: Some(TunPatch {
+                enable: true,
+                device,
+                stack,
+                auto_route: None,
+            }),
+            ..UpdateRequest::default()
+        })
+        .await?;
+        if let Some(fault) = self.tun_fault() {
+            self.disable_tun().await?;
+            return Err(TunStartError::Unavailable(fault.message));
+        }
+        Ok(())
+    }
+
+    /// Turns off the TUN device the core opened by name.
+    pub async fn disable_tun(&self) -> Result<(), Failure> {
+        self.update(UpdateRequest {
+            tun: Some(TunPatch {
+                enable: false,
+                device: None,
+                stack: None,
+                auto_route: None,
+            }),
+            ..UpdateRequest::default()
+        })
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,13 +392,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn vpn_options_read_what_the_service_sends() {
-        let request = VpnTunRequest {
-            stack: "mixed".into(),
-            address: "172.19.0.1/30, fdfe:dcba:9876::1/126".into(),
-            dns: "172.19.0.2".into(),
-            options: r#"{"mtu":1480,"congestion-controller":"bbr"}"#.into(),
+        let tun = InheritedTun {
+            mtu: Some(1480),
+            address: vec!["172.19.0.1/30".into(), " fdfe:dcba:9876::1/126".into()],
+            dns: vec!["172.19.0.2".into()],
+            congestion_controller: Some("bbr".into()),
         };
-        let (options, _) = vpn_options(&request).unwrap();
+        let (options, _) = vpn_options(&tun).unwrap();
         assert_eq!(options.mtu, 1480);
         assert_eq!(
             options.inet4_address,
@@ -355,18 +414,31 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_bad_vpn_request_is_refused() {
-        let bad = |address: &str, dns: &str, options: &str| {
-            vpn_options(&VpnTunRequest {
-                stack: String::new(),
-                address: address.into(),
-                dns: dns.into(),
-                options: options.into(),
+        let bad = |address: &str, dns: &str| {
+            vpn_options(&InheritedTun {
+                mtu: None,
+                address: vec![address.into()],
+                dns: vec![dns.into()],
+                congestion_controller: None,
             })
             .is_err()
         };
-        assert!(bad("172.19.0.1/30", "", "not json"));
-        assert!(bad("nonsense", "", "{}"));
-        assert!(bad("172.19.0.1/30", "nonsense", "{}"));
-        assert!(!bad("172.19.0.1/30", "172.19.0.2", "{}"));
+        assert!(bad("nonsense", ""));
+        assert!(bad("172.19.0.1/30", "nonsense"));
+        assert!(!bad("172.19.0.1/30", "172.19.0.2"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unset_or_zero_vpn_mtu_keeps_the_default() {
+        for mtu in [None, Some(0)] {
+            let tun = InheritedTun {
+                mtu,
+                address: Vec::new(),
+                dns: Vec::new(),
+                congestion_controller: None,
+            };
+            assert_eq!(vpn_options(&tun).unwrap().0.mtu, DEFAULT_MTU);
+        }
     }
 }

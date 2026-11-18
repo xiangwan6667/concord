@@ -37,6 +37,10 @@ use crate::script::ScriptRuntime;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Seen {
+    #[cfg_attr(
+        not(feature = "script"),
+        expect(dead_code, reason = "only the QuickJS tests read it")
+    )]
     pub method: String,
     pub path: String,
     pub host: String,

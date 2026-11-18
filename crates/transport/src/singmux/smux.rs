@@ -4,13 +4,14 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, ready};
+use std::time::Duration;
 
 use bytes::Bytes;
 use concord_common::sync::lock;
-use concord_common::{BoxRead, BoxStream, BoxWrite, Stream};
+use concord_common::{BoxRead, BoxStream, BoxWrite, Stream, Tasks};
 use futures_util::future::BoxFuture;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
-use tokio::sync::{Notify, mpsc};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::PollSender;
 
@@ -19,6 +20,7 @@ use super::inbox::{Inbox, send_detached, write_frames};
 use crate::http1::invalid;
 
 const VERSION: u8 = 1;
+const FIRST_STREAM_ID: u32 = 3;
 const CMD_SYN: u8 = 0;
 const CMD_FIN: u8 = 1;
 const CMD_PSH: u8 = 2;
@@ -27,6 +29,7 @@ const CMD_UPD: u8 = 4;
 const MAX_FRAME: usize = 32768;
 const MAX_RECEIVE_BUFFER: i64 = 4 * 1024 * 1024;
 const QUEUE: usize = 64;
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn frame(cmd: u8, sid: u32, payload: &[u8]) -> Vec<u8> {
     let len = u16::try_from(payload.len())
@@ -50,6 +53,8 @@ struct Core {
     closed: AtomicBool,
     bucket: AtomicI64,
     bucket_notify: Notify,
+    fin_queued: Option<AtomicBool>,
+    tasks: Tasks,
 }
 
 impl Core {
@@ -75,39 +80,92 @@ impl Core {
 pub(super) struct SmuxSession {
     core: Arc<Core>,
     tasks: Vec<JoinHandle<()>>,
+    stop: Option<oneshot::Sender<()>>,
 }
 
 impl SmuxSession {
-    pub fn new(io: BoxStream) -> Self {
+    pub fn new(io: BoxStream, tasks: &Tasks) -> Self {
+        Self::start(io, FIRST_STREAM_ID, false, tasks)
+    }
+
+    pub(super) fn with_first_id(io: BoxStream, first_id: u32, tasks: &Tasks) -> Self {
+        Self::start(io, first_id, true, tasks)
+    }
+
+    fn start(io: BoxStream, first_id: u32, drain_on_drop: bool, tasks: &Tasks) -> Self {
         let (read, write) = Box::new(io).into_split();
         let (tx, rx) = mpsc::channel(QUEUE);
+        let (stop, stopped) = if drain_on_drop {
+            let (tx, rx) = oneshot::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let core = Arc::new(Core {
             streams: Mutex::new(HashMap::new()),
-            next_id: AtomicU32::new(1),
+            next_id: AtomicU32::new(first_id),
             tx,
             closed: AtomicBool::new(false),
             bucket: AtomicI64::new(MAX_RECEIVE_BUFFER),
             bucket_notify: Notify::new(),
+            fin_queued: drain_on_drop.then(|| AtomicBool::new(false)),
+            tasks: tasks.clone(),
         });
         let reader = {
             let core = core.clone();
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 let _ = read_loop(&core, read).await;
                 core.close();
             })
         };
         let writer = {
             let core = core.clone();
-            tokio::spawn(async move {
-                let _ = write_frames(write, rx).await;
+            tasks.spawn(async move {
+                if let Some(stopped) = stopped {
+                    let _ = write_frames_draining(write, rx, stopped, &core, first_id).await;
+                } else {
+                    let _ = write_frames(write, rx).await;
+                }
                 core.close();
             })
         };
         SmuxSession {
             core,
             tasks: vec![reader, writer],
+            stop,
         }
     }
+}
+
+async fn write_frames_draining(
+    mut write: BoxWrite,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut stopped: oneshot::Receiver<()>,
+    core: &Core,
+    stream_id: u32,
+) -> io::Result<()> {
+    loop {
+        tokio::select! {
+            _ = &mut stopped => { rx.close(); break; }
+            frame = rx.recv() => {
+                let Some(frame) = frame else { break; };
+                write.write_all(&frame).await?;
+                if rx.is_empty() { write.flush().await?; }
+            }
+        }
+    }
+    while let Some(frame) = rx.recv().await {
+        write.write_all(&frame).await?;
+    }
+    if core
+        .fin_queued
+        .as_ref()
+        .is_some_and(|fin| !fin.load(Ordering::Relaxed))
+    {
+        write.write_all(&frame(CMD_FIN, stream_id, &[])).await?;
+    }
+    write.flush().await?;
+    write.shutdown().await
 }
 
 async fn read_loop(core: &Core, mut io: BoxRead) -> io::Result<()> {
@@ -158,11 +216,42 @@ async fn read_loop(core: &Core, mut io: BoxRead) -> io::Result<()> {
     }
 }
 
+/// Without a runtime to drain on, the writer stops with the session.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 impl Drop for SmuxSession {
     fn drop(&mut self) {
         self.core.close();
-        for task in &self.tasks {
-            task.abort();
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+            let mut tasks = self.tasks.drain(..);
+            if let Some(reader) = tasks.next() {
+                reader.abort();
+            }
+            if let Some(mut writer) = tasks.next() {
+                let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
+                let guard = AbortOnDrop(writer.abort_handle());
+                self.core.tasks.spawn_detached(async move {
+                    let _guard = guard;
+                    if tokio::time::timeout_at(deadline, &mut writer)
+                        .await
+                        .is_err()
+                    {
+                        writer.abort();
+                        let _ = writer.await;
+                    }
+                });
+            }
+        } else {
+            for task in &self.tasks {
+                task.abort();
+            }
         }
     }
 }
@@ -319,6 +408,9 @@ impl AsyncWrite for SmuxWrite {
             this.sender
                 .send_item(frame(CMD_FIN, shared.id, &[]))
                 .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+            if let Some(fin_queued) = &shared.core.fin_queued {
+                fin_queued.store(true, Ordering::Relaxed);
+            }
             shared.closed.store(true, Ordering::Relaxed);
             shared.release();
         }
@@ -331,7 +423,13 @@ impl Drop for SmuxWrite {
     fn drop(&mut self) {
         let shared = &*self.shared;
         if !shared.closed.swap(true, Ordering::Relaxed) {
-            send_detached(&shared.core.tx, frame(CMD_FIN, shared.id, &[]));
+            if shared.core.fin_queued.is_none() {
+                send_detached(
+                    &shared.core.tasks,
+                    &shared.core.tx,
+                    frame(CMD_FIN, shared.id, &[]),
+                );
+            }
             shared.release();
         }
     }
@@ -393,15 +491,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_smux_syn_matches_mihomo_and_sing_box_client_bytes() {
+        let (near, mut far) = duplex(128);
+        let session = SmuxSession::new(Box::new(near), &Default::default());
+        let _first = session.open().await.unwrap();
+        let mut header = [0; 8];
+        far.read_exact(&mut header).await.unwrap();
+        assert_eq!(header, [1, 0, 0, 0, 3, 0, 0, 0]);
+        let _second = session.open().await.unwrap();
+        far.read_exact(&mut header).await.unwrap();
+        assert_eq!(header, [1, 0, 0, 0, 5, 0, 0, 0]);
+    }
+
+    #[tokio::test]
     async fn dropping_either_half_first_leaves_the_session_to_other_streams() {
         for read_first in [true, false] {
             let (near, far) = duplex(64 * 1024);
             let (mut far_read, mut far_write) = tokio::io::split(far);
-            let session = SmuxSession::new(Box::new(near));
+            let session = SmuxSession::new(Box::new(near), &Default::default());
             let first = session.open().await.unwrap();
             let mut second = session.open().await.unwrap();
-            assert_eq!(next_frame(&mut far_read).await, (CMD_SYN, 1));
-            assert_eq!(next_frame(&mut far_read).await, (CMD_SYN, 3));
+            assert_eq!(next_frame(&mut far_read).await, (CMD_SYN, FIRST_STREAM_ID));
+            assert_eq!(
+                next_frame(&mut far_read).await,
+                (CMD_SYN, FIRST_STREAM_ID + 2)
+            );
             let (read, write) = first.into_split();
             let rest: Box<dyn Send> = if read_first {
                 drop(read);
@@ -413,17 +527,17 @@ mod tests {
             let flood = usize::try_from(MAX_RECEIVE_BUFFER).unwrap() / MAX_FRAME + 8;
             tokio::time::timeout(Duration::from_secs(10), async {
                 if !read_first {
-                    assert_eq!(next_frame(&mut far_read).await, (CMD_FIN, 1));
+                    assert_eq!(next_frame(&mut far_read).await, (CMD_FIN, FIRST_STREAM_ID));
                 }
                 let chunk = vec![7u8; MAX_FRAME];
                 for _ in 0..flood {
                     far_write
-                        .write_all(&frame(CMD_PSH, 1, &chunk))
+                        .write_all(&frame(CMD_PSH, FIRST_STREAM_ID, &chunk))
                         .await
                         .unwrap();
                 }
                 far_write
-                    .write_all(&frame(CMD_PSH, 3, b"ok"))
+                    .write_all(&frame(CMD_PSH, FIRST_STREAM_ID + 2, b"ok"))
                     .await
                     .unwrap();
                 let mut got = [0u8; 2];
@@ -431,7 +545,7 @@ mod tests {
                 assert_eq!(&got, b"ok");
                 drop(rest);
                 if read_first {
-                    assert_eq!(next_frame(&mut far_read).await, (CMD_FIN, 1));
+                    assert_eq!(next_frame(&mut far_read).await, (CMD_FIN, FIRST_STREAM_ID));
                 }
             })
             .await

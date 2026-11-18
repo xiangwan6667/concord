@@ -7,7 +7,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use concord_common::sync::lock;
-use concord_netstack::{SocketOwner, SocketReady, SocketSource};
+use concord_netstack::{SocketOwner, SocketReady};
+use concord_platform::SocketObserver;
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Token};
 use tokio::io::unix::AsyncFd;
@@ -104,16 +105,13 @@ impl Reactor {
         })
     }
 
-    #[allow(unsafe_code, reason = "registering an Arc-owned source with Tokio")]
-    fn native(source: &Source, read_only: bool) -> io::Result<AsyncFd<SocketSource>> {
+    fn native(source: &Source, read_only: bool) -> io::Result<SocketObserver> {
         let interest = if read_only {
             tokio::io::Interest::READABLE
         } else {
             tokio::io::Interest::READABLE | tokio::io::Interest::WRITABLE
         };
-        // SAFETY: the source Arc keeps the descriptor open and stable until deregistration.
-        unsafe { AsyncFd::register_with_interest(SocketSource::new(Arc::clone(source)), interest) }
-            .map_err(|error| error.into_parts().1)
+        SocketObserver::register(Arc::clone(source), interest)
     }
 
     #[allow(
@@ -718,6 +716,44 @@ mod tests {
         reactor.set_busy(false).unwrap();
         far.send(b"late").unwrap();
         receive_datagram(&reactor, &*watch, &near, b"late").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reader_parked_on_the_queue_is_woken_when_its_socket_moves_to_tokio() {
+        struct Woken(std::sync::atomic::AtomicBool);
+        impl std::task::Wake for Woken {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let reactor = Reactor::new().unwrap();
+        let (near, mut far) = UnixStream::pair().unwrap();
+        near.set_nonblocking(true).unwrap();
+        let near = Arc::new(near);
+        let ready = Arc::new(SocketReady::default());
+        let _lease = reactor
+            .register(Arc::clone(&near), Arc::clone(&ready))
+            .unwrap();
+        assert!(reactor.set_busy(true).unwrap());
+        let woken = Arc::new(Woken(std::sync::atomic::AtomicBool::new(false)));
+        let waker = std::task::Waker::from(Arc::clone(&woken));
+        assert!(
+            ready
+                .poll_read_ready(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+
+        assert!(reactor.set_busy(false).unwrap());
+        far.write_all(b"reply").unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !woken.0.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the reader parked on the queue poller was never woken");
+        receive(&reactor, &ready, near.as_ref(), b"reply").await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

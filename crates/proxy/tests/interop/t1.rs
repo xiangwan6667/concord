@@ -11,9 +11,13 @@ fn snell_case(
     listener_extra: &str,
     extra: serde_json::Value,
 ) -> Case {
-    let body =
-        format!("    psk: snell-psk\n    version: {version}\n    udp: {udp}\n{listener_extra}");
-    let mut proxy = json!({"psk": "snell-psk", "version": version, "udp": udp});
+    let psk = if version == 6 {
+        "snell-v6-test-psk-0123456789"
+    } else {
+        "snell-psk"
+    };
+    let body = format!("    psk: {psk}\n    version: {version}\n    udp: {udp}\n{listener_extra}");
+    let mut proxy = json!({"psk": psk, "version": version, "udp": udp});
     if let (Some(base), Some(more)) = (proxy.as_object_mut(), extra.as_object()) {
         base.extend(more.clone());
     }
@@ -429,6 +433,37 @@ pub(super) fn cases(certs: &Certs) -> Vec<Case> {
         snell_case("snell-v3", 3, true, "", json!({})),
         snell_case("snell-v4", 4, true, "", json!({})),
         snell_case("snell-v5", 5, true, "", json!({})),
+        snell_case("snell-v6", 6, true, "", json!({"userkey":"alice-key"})),
+        snell_case(
+            "snell-v6-unshaped",
+            6,
+            true,
+            "    mode: unshaped\n",
+            json!({"mode":"unshaped","userkey":"alice-key"}),
+        ),
+        snell_case(
+            "snell-v6-unsafe-raw",
+            6,
+            true,
+            "    mode: unsafe-raw\n",
+            json!({"mode":"unsafe-raw","userkey":"alice-key"}),
+        ),
+        snell_case(
+            "snell-v6-reuse",
+            6,
+            true,
+            "",
+            json!({"reuse":true,"userkey":"alice-key"}),
+        ),
+        snell_case(
+            "snell-v6-long-userkey",
+            6,
+            true,
+            "",
+            json!({"userkey":"a".repeat(255)}),
+        ),
+        snell_shadowtls_case("snell-v6-shadowtls-v2", 6, 2, certs),
+        snell_shadowtls_case("snell-v6-shadowtls-v3", 6, 3, certs),
         snell_case("snell-v4-reuse", 4, true, "", json!({"reuse": true})),
         snell_case(
             "snell-v1-obfs-tls",

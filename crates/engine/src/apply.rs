@@ -24,25 +24,24 @@ use concord_group::{
     EnvFactory, GroupDeps, GroupError, Outbounds, ProxyFactory, RouteMoved, SelectionStore,
     TestDefaults,
 };
-use concord_inbound::{Cidr, ListenSpec};
+use concord_inbound::ListenSpec;
 use concord_net::{LoopbackGuard, Sockets};
 use concord_platform::{HomeDir, Platform};
 use concord_proxy::BuildCtx;
 use concord_rules::geo::{GeoError, GeoFile, GeoStore};
 use concord_rules::{CompileEnv, CompileError, RouteProgram, RuleSetStore};
 use concord_tls::{SystemRoots, TrustStore, parse_certificates};
-use concord_tun::Prefix;
+use concord_tun::{Congestion, Prefix, TunDevice};
 use concord_tunnel::sniff::{Dispatcher, DispatcherConfig, SnifferEntry, SnifferKind};
 use concord_tunnel::{Runtime, Tunnel};
 use rustls_pki_types::CertificateDer;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::Failure;
+use crate::error::{Failure, GeoUpdateError, RuleLoadError};
 use crate::fake_ip_store::FakeIpStore;
+use crate::lan;
 use crate::ops::on_parse_stack;
-use crate::resources::{
-    GeoUpdateError, GeoUpdater, GeoUrls, RuleLoadError, RuleProviders, TunnelFetcher,
-};
+use crate::resources::{GeoUpdater, GeoUrls, RuleProviders, TunnelFetcher};
 use crate::route::RouteCounters;
 use crate::views::WarningView;
 
@@ -285,7 +284,7 @@ fn sniffer_of(config: &SnifferConfig, rules: &dyn RuleEnv) -> Result<Dispatcher,
 
 /// mihomo turns keep-alive off on Android for dialed and accepted sockets alike.
 fn keep_alive_disabled(general: &General) -> bool {
-    cfg!(target_os = "android") || general.disable_keep_alive
+    !concord_platform::KEEP_ALIVE || general.disable_keep_alive
 }
 
 pub(crate) fn sock_opts(general: &General) -> SockOpts {
@@ -302,7 +301,7 @@ pub(crate) fn sock_opts(general: &General) -> SockOpts {
     }
 }
 
-pub(crate) fn listen_spec(general: &General, lan_refused: bool) -> ListenSpec {
+pub(crate) fn listen_spec(general: &General) -> ListenSpec {
     let port = |port: u16| (port != 0).then_some(port);
     ListenSpec {
         mixed_port: port(general.mixed_port),
@@ -310,17 +309,16 @@ pub(crate) fn listen_spec(general: &General, lan_refused: bool) -> ListenSpec {
         socks_port: port(general.socks_port),
         redir_port: port(general.redir_port),
         tproxy_port: port(general.tproxy_port),
-        allow_lan: general.allow_lan && !lan_refused,
+        allow_lan: general.allow_lan,
+        bind_address: general.bind_address.clone(),
+        lan_allowed_ips: lan::cidrs(&general.lan_allowed_ips),
+        lan_disallowed_ips: lan::cidrs(&general.lan_disallowed_ips),
         authentication: general
             .authentication
             .iter()
             .map(|credential| (credential.user.clone(), credential.pass.clone()))
             .collect(),
-        skip_auth: general
-            .skip_auth_prefixes
-            .iter()
-            .filter_map(|prefix| Cidr::new(prefix.addr, prefix.prefix))
-            .collect(),
+        skip_auth: lan::cidrs(&general.skip_auth_prefixes),
         tcp_keepalive: !keep_alive_disabled(general),
         keepalive_idle_secs: general.keep_alive_idle,
         keepalive_interval_secs: general.keep_alive_interval,
@@ -334,7 +332,6 @@ pub(crate) struct Applied {
     pub ntp: NtpConfig,
     pub tun: TunConfig,
     pub tun_inet4: Option<Prefix>,
-    pub lan_refused: bool,
     pub dns_listen: String,
     pub dns_listen_mark: u32,
     pub store_fake_ip: bool,
@@ -350,7 +347,7 @@ pub(crate) struct Built {
     pub rule_providers: Arc<RuleProviders>,
     pub deferred_geo: Vec<GeoFile>,
     pub warnings: Vec<WarningView>,
-    pub mitm: concord_config::Map,
+    pub mitm: concord_config::MitmDef,
     pub trust: Arc<TrustStore>,
 }
 
@@ -413,6 +410,7 @@ pub(crate) struct Shared {
     pub rule_providers: ArcSwapOption<RuleProviders>,
     pub fake_ip_store: Arc<FakeIpStore>,
     pub android: bool,
+    pub proxy_tasks: crate::proxy_tasks::ProxyTasks,
 }
 
 /// Why a config could not be applied. Only the text reaches the host, as the failure message.
@@ -441,6 +439,8 @@ pub(crate) enum ApplyError {
     },
     #[error(transparent)]
     Outbounds(#[from] GroupError),
+    #[error(transparent)]
+    OutboundsTask(tokio::task::JoinError),
 }
 
 pub(crate) async fn load_profile(
@@ -531,7 +531,7 @@ async fn fetch_geo(shared: &Shared, problem: GeoProblem) -> Result<(), ApplyErro
 /// refuses the config. mihomo reads a UID only on Linux and Android.
 pub(crate) fn capabilities() -> Capabilities {
     let mut capabilities = concord_proxy::capabilities();
-    if !cfg!(any(target_os = "linux", target_os = "android")) {
+    if !concord_platform::owner::READS_UID {
         capabilities.rule_types.retain(|name| *name != "UID");
     }
     capabilities
@@ -582,8 +582,8 @@ pub(crate) async fn build(
     let dns = build_dns(shared, home, &profile, &rules, &trust, &opts).await?;
 
     let sniffer = Arc::new(sniffer_of(&profile.sniffer, rules.as_ref())?);
-
-    let outbounds = build_outbounds(shared, home, &mut profile, selections, &dns, &trust, &opts)?;
+    let (profile, outbounds) =
+        build_outbounds(shared, home, profile, selections, &dns, &trust, &opts).await?;
 
     shared.sockets.set_ip4p(profile.dialer_ip4p_convert);
     shared
@@ -591,7 +591,8 @@ pub(crate) async fn build(
         .unified_delay
         .store(profile.general.unified_delay, Ordering::Relaxed);
 
-    let warnings = warning_views(&profile);
+    let warnings = warning_views(&profile, shared.android);
+    log_warnings(&warnings);
     let deferred_geo = program.deferred_geo().to_vec();
 
     let runtime = Arc::new(Runtime::new(
@@ -603,7 +604,6 @@ pub(crate) async fn build(
         shared.platform.clone(),
     ));
     let applied = Applied {
-        lan_refused: profile.lan_listener_refused,
         tun_inet4: crate::tun::inet4_of(profile.dns.fake_ip_range),
         dns_listen: if profile.dns.enable {
             profile.dns.listen.clone()
@@ -685,15 +685,15 @@ fn carry_rule_sets(providers: &RuleProviders, previous: &RuleProviders) {
     }
 }
 
-fn build_outbounds(
+async fn build_outbounds(
     shared: &Shared,
     home: &Arc<HomeDir>,
-    profile: &mut Profile,
+    mut profile: Profile,
     selections: Arc<SelectionStore>,
     dns: &Arc<Resolver>,
     trust: &Arc<TrustStore>,
     opts: &SockOpts,
-) -> Result<Arc<Outbounds>, ApplyError> {
+) -> Result<(Profile, Arc<Outbounds>), ApplyError> {
     let env_factory: EnvFactory = {
         let sockets = shared.sockets.clone();
         let resolver: Arc<dyn HostResolver> = dns.clone();
@@ -710,31 +710,33 @@ fn build_outbounds(
             ipv6,
         })
     };
-    let mut ctx = BuildCtx::new(trust.clone()).with_clock({
-        let clock = shared.clock.clone();
-        Arc::new(move || clock.now())
-    });
-    ctx.loopback = shared.loopback.clone();
-    let ctx = ctx.with_home(home.clone());
-    Outbounds::build(
-        profile,
-        GroupDeps {
-            selections,
-            env: env_factory,
-            fetcher: shared.fetcher.clone(),
-            events: shared.events.clone(),
-            route: Arc::new(Moved(shared.route.clone())),
-            options: shared.options.clone(),
-            home: home.clone(),
-            trust: trust.clone(),
-            factory: Arc::new(ProxyFactory::new(ctx, capabilities())),
-        },
-    )
-    .map_err(ApplyError::from)
+    let clock = shared.clock.clone();
+    let mut ctx = BuildCtx::new(trust.clone())
+        .with_home(home.clone())
+        .with_clock(Arc::new(move || clock.now()));
+    (ctx.loopback, ctx.tasks) = (shared.loopback.clone(), shared.proxy_tasks.tasks());
+    let deps = GroupDeps {
+        selections,
+        env: env_factory,
+        fetcher: shared.fetcher.clone(),
+        events: shared.events.clone(),
+        route: Arc::new(Moved(shared.route.clone())),
+        options: shared.options.clone(),
+        home: home.clone(),
+        trust: trust.clone(),
+        factory: Arc::new(ProxyFactory::new(ctx, capabilities())),
+    };
+    tokio::task::spawn_blocking(move || {
+        let outbounds = Outbounds::build(&mut profile, deps)?;
+        Ok((profile, outbounds))
+    })
+    .await
+    .map_err(ApplyError::OutboundsTask)?
 }
 
-fn warning_views(profile: &Profile) -> Vec<WarningView> {
-    let warnings = profile
+/// Everything an apply of `profile` warns about; `concord -t` reports the same list.
+pub(crate) fn warning_views(profile: &Profile, android: bool) -> Vec<WarningView> {
+    let mut warnings = profile
         .report
         .warnings
         .iter()
@@ -748,14 +750,44 @@ fn warning_views(profile: &Profile) -> Vec<WarningView> {
             message: warning.message.clone(),
         })
         .collect::<Vec<_>>();
-    for warning in &warnings {
+    warnings.extend(tun_congestion_warning(&profile.tun, android));
+    warnings.extend(tun_offload_warning(&profile.tun, TunDevice::OFFLOADS));
+    warnings
+}
+
+fn log_warnings(warnings: &[WarningView]) {
+    for warning in warnings {
         if warning.level == "info" {
             tracing::info!("[Config] {}: {}", warning.path, warning.message);
         } else {
             tracing::warn!("[Config] {}: {}", warning.path, warning.message);
         }
     }
-    warnings
+}
+
+/// Android takes the congestion control from the host's VPN options, not the profile.
+fn tun_congestion_warning(tun: &TunConfig, android: bool) -> Option<WarningView> {
+    let name = &tun.congestion_controller;
+    if !tun.enable || android || Congestion::parse(name).1 {
+        return None;
+    }
+    Some(WarningView {
+        level: "warning",
+        code: "not_applied",
+        path: "tun.congestion-controller".to_string(),
+        message: format!("{name} is not available, so cubic runs instead"),
+    })
+}
+
+/// The Linux device asks for offload whatever `gso` says, where sing-tun enables it only when
+/// asked (`tun_linux.go`); no other platform has it, in either core.
+fn tun_offload_warning(tun: &TunConfig, offloads: bool) -> Option<WarningView> {
+    (tun.enable && offloads && tun.gso == Some(false)).then(|| WarningView {
+        level: "warning",
+        code: "not_applied",
+        path: "tun.gso".to_string(),
+        message: "offload is used whenever the device supports it".to_string(),
+    })
 }
 
 fn user_agent(general: &General) -> String {
@@ -768,6 +800,8 @@ fn user_agent(general: &General) -> String {
 
 #[cfg(test)]
 mod tests {
+    use concord_config::net::IpCidr;
+
     use super::*;
 
     #[test]
@@ -778,7 +812,7 @@ mod tests {
             ..General::default()
         };
         let enabled = !cfg!(target_os = "android");
-        let spec = listen_spec(&general, false);
+        let spec = listen_spec(&general);
         assert_eq!(spec.tcp_keepalive, enabled);
         assert_eq!(
             (spec.keepalive_idle_secs, spec.keepalive_interval_secs),
@@ -787,7 +821,65 @@ mod tests {
         assert_eq!(sock_opts(&general).disable_keep_alive, !enabled);
 
         general.disable_keep_alive = true;
-        assert!(!listen_spec(&general, false).tcp_keepalive);
+        assert!(!listen_spec(&general).tcp_keepalive);
         assert!(sock_opts(&general).disable_keep_alive);
+    }
+
+    #[test]
+    fn an_unavailable_tun_congestion_control_is_reported() {
+        let mut tun = TunConfig {
+            enable: true,
+            congestion_controller: "bbr".into(),
+            ..TunConfig::default()
+        };
+        let warning = tun_congestion_warning(&tun, false).unwrap();
+        assert_eq!(
+            (warning.code, warning.path.as_str()),
+            ("not_applied", "tun.congestion-controller")
+        );
+        assert!(tun_congestion_warning(&tun, true).is_none());
+        for name in ["", "cubic", "Reno"] {
+            tun.congestion_controller = name.into();
+            assert!(tun_congestion_warning(&tun, false).is_none(), "{name}");
+        }
+        tun.congestion_controller = "bbr3".into();
+        tun.enable = false;
+        assert!(tun_congestion_warning(&tun, false).is_none());
+    }
+
+    #[test]
+    fn the_lan_keys_reach_the_listen_spec() {
+        let mut general = General {
+            allow_lan: true,
+            bind_address: "192.168.1.2".into(),
+            lan_disallowed_ips: vec![IpCidr::parse("192.168.1.1/32").unwrap()],
+            ..General::default()
+        };
+        let spec = listen_spec(&general);
+        assert!(spec.allow_lan);
+        assert_eq!(spec.bind_address, "192.168.1.2");
+        assert_eq!(spec.lan_allowed_ips.len(), 2);
+        assert_eq!(spec.lan_disallowed_ips.len(), 1);
+        general.lan_allowed_ips.clear();
+        assert!(listen_spec(&general).lan_allowed_ips.is_empty());
+    }
+
+    #[test]
+    fn only_turning_linux_offload_off_is_reported() {
+        let mut tun = TunConfig {
+            enable: true,
+            gso: Some(false),
+            ..TunConfig::default()
+        };
+        let warning = tun_offload_warning(&tun, true).unwrap();
+        assert_eq!(
+            (warning.code, warning.path.as_str()),
+            ("not_applied", "tun.gso")
+        );
+        assert!(tun_offload_warning(&tun, false).is_none());
+        for gso in [None, Some(true)] {
+            tun.gso = gso;
+            assert!(tun_offload_warning(&tun, true).is_none(), "{gso:?}");
+        }
     }
 }

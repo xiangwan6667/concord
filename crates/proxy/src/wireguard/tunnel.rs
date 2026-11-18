@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -9,19 +9,21 @@ use arc_swap::ArcSwap;
 use concord_common::sync::lock;
 use concord_common::{
     Address, CoreError, DialCx, DialEnv, HostResolver, Initiator, IpVersion, LookupIps, SockOpts,
+    Tasks,
 };
 use gotatun::device::{Device, DeviceBuilder, Peer};
 use gotatun::x25519::{PublicKey, StaticSecret};
 use ipnetwork::IpNetwork;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
+use tokio_util::sync::CancellationToken;
 
 use super::amnezia::Amnezia;
 use super::config::{PeerConfig, WgConfig};
 use super::dns::RemoteDns;
-use super::stack::{Stack, StackConfig, StackRecv, StackSend, TcpConn, UdpPort};
-use super::transport::{Carrier, Reserved, WireFactory};
+use super::transport::{Breaker, Carrier, Reserved, WireFactory};
 use crate::node::{Egress, resolve_server};
+use crate::stack::{Stack, StackConfig, StackRecv, StackSend, TcpConn, UdpPort};
 
 const IDLE_TICK: Duration = Duration::from_secs(90);
 
@@ -29,11 +31,13 @@ type WgDevice = Device<(WireFactory, StackSend, StackRecv)>;
 
 pub(super) struct Tunnel {
     pub(super) stack: Arc<Stack>,
-    device: WgDevice,
+    device: Option<WgDevice>,
     driver: JoinHandle<()>,
+    tasks: Tasks,
+    dropped: CancellationToken,
     reserved: Arc<Reserved>,
     amnezia: Option<Arc<Amnezia>>,
-    broken: Arc<AtomicBool>,
+    broken: Arc<Breaker>,
     dns: Option<RemoteDns>,
     endpoints: Mutex<Endpoints>,
     epoch: AtomicU64,
@@ -44,9 +48,15 @@ struct Endpoints {
     checked: Instant,
 }
 
+/// gotatun's own `Drop` stops the device on a task nothing waits for; `stop` lets the engine
+/// wait for it.
 impl Drop for Tunnel {
     fn drop(&mut self) {
         self.driver.abort();
+        self.dropped.cancel();
+        if let Some(device) = self.device.take() {
+            self.tasks.spawn_to_end(device.stop());
+        }
     }
 }
 
@@ -92,6 +102,7 @@ impl Tunnel {
         cx: &DialCx<'_>,
         egress: &Egress,
         config: &WgConfig,
+        tasks: &Tasks,
     ) -> io::Result<Arc<Tunnel>> {
         let mut resolved = Vec::with_capacity(config.peers.len());
         for peer in &config.peers {
@@ -110,7 +121,6 @@ impl Tunnel {
             None => Carrier::Sockets(bind_families(cx.env, egress, &resolved)?),
         };
         let reserved = Arc::new(ArcSwap::from_pointee(reserved_map(config, &resolved)));
-        let broken = Arc::new(AtomicBool::new(false));
         let amnezia = config.amnezia.as_ref().map(|settings| {
             let own = PublicKey::from(&StaticSecret::from(config.private_key));
             let publics: Vec<[u8; 32]> = config.peers.iter().map(|peer| peer.public_key).collect();
@@ -120,12 +130,15 @@ impl Tunnel {
             }
             amnezia
         });
+        let stack = Stack::start(
+            &StackConfig {
+                addrs: config.addrs.iter().map(|net| net.ip()).collect(),
+                mtu: config.mtu,
+            },
+            tasks,
+        );
+        let broken = Arc::new(Breaker::new(stack.driver.abort_handle()));
         let factory = WireFactory::new(carrier, reserved.clone(), amnezia.clone(), broken.clone());
-
-        let stack = Stack::start(&StackConfig {
-            addrs: config.addrs.iter().map(|net| net.ip()).collect(),
-            mtu: config.mtu,
-        });
         let peers = config
             .peers
             .iter()
@@ -141,8 +154,10 @@ impl Tunnel {
             .map_err(|err| io::Error::other(format!("wireguard device: {err}")))?;
         let tunnel = Arc::new(Tunnel {
             stack: stack.stack,
-            device,
+            device: Some(device),
             driver: stack.driver,
+            tasks: tasks.clone(),
+            dropped: tasks.child_token(),
             reserved,
             amnezia,
             broken,
@@ -161,8 +176,8 @@ impl Tunnel {
         Ok(tunnel)
     }
 
-    pub(super) fn is_broken(&self) -> bool {
-        self.broken.load(Ordering::Relaxed) || self.driver.is_finished()
+    pub(super) fn usable(&self) -> bool {
+        !self.broken.tripped() && !self.driver.is_finished()
     }
 
     pub(super) fn touch(&self) -> u64 {
@@ -238,8 +253,8 @@ impl Tunnel {
                 continue;
             }
             let key = PublicKey::from(peer.public_key);
-            let updated = self
-                .device
+            let Some(device) = &self.device else { return };
+            let updated = device
                 .write(async |device| {
                     device
                         .modify_peer(&key, |peer| peer.set_endpoint(Some(fresh)))
@@ -266,14 +281,15 @@ where
     F: Fn(&Arc<Tunnel>) + Send + 'static,
 {
     let weak: Weak<Tunnel> = Arc::downgrade(tunnel);
-    tokio::spawn(async move {
+    let dropped = tunnel.dropped.clone();
+    let watch = async move {
         let mut seen = 0;
         let mut quiet = false;
         loop {
             sleep(IDLE_TICK).await;
             let Some(tunnel) = weak.upgrade() else { return };
             let epoch = tunnel.epoch.load(Ordering::Relaxed);
-            if tunnel.is_broken() {
+            if !tunnel.usable() {
                 retire(&tunnel);
                 return;
             }
@@ -285,5 +301,8 @@ where
             quiet = idle;
             seen = epoch;
         }
+    };
+    tunnel.tasks.spawn(async move {
+        let _ = dropped.run_until_cancelled_owned(watch).await;
     });
 }

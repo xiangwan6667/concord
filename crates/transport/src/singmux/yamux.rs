@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use concord_common::sync::lock;
-use concord_common::{BoxRead, BoxStream, BoxWrite, Stream};
+use concord_common::{BoxRead, BoxStream, BoxWrite, Stream, Tasks};
 use futures_util::future::BoxFuture;
 use futures_util::task::AtomicWaker;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
@@ -63,6 +63,7 @@ struct Core {
     tx: mpsc::Sender<Vec<u8>>,
     closed: AtomicBool,
     received: AtomicU64,
+    tasks: Tasks,
 }
 
 impl Core {
@@ -89,7 +90,7 @@ pub(super) struct YamuxSession {
 }
 
 impl YamuxSession {
-    pub fn new(io: BoxStream) -> Self {
+    pub fn new(io: BoxStream, tasks: &Tasks) -> Self {
         let (read, write) = Box::new(io).into_split();
         let (tx, rx) = mpsc::channel(QUEUE);
         let core = Arc::new(Core {
@@ -98,24 +99,25 @@ impl YamuxSession {
             tx,
             closed: AtomicBool::new(false),
             received: AtomicU64::new(0),
+            tasks: tasks.clone(),
         });
         let reader = {
             let core = core.clone();
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 let _ = read_loop(&core, read).await;
                 core.close();
             })
         };
         let writer = {
             let core = core.clone();
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 let _ = write_frames(write, rx).await;
                 core.close();
             })
         };
         let keepalive = {
             let core = core.clone();
-            tokio::spawn(async move { keepalive(&core).await })
+            tasks.spawn(async move { keepalive(&core).await })
         };
         YamuxSession {
             core,
@@ -266,7 +268,11 @@ fn return_credit(core: &Core, id: u32, entry: &Entry, n: usize) {
         flow.credit += delta;
         delta
     };
-    send_detached(&core.tx, header(TYPE_WINDOW_UPDATE, 0, id, delta));
+    send_detached(
+        &core.tasks,
+        &core.tx,
+        header(TYPE_WINDOW_UPDATE, 0, id, delta),
+    );
 }
 
 async fn discard(io: &mut BoxRead, mut left: u32) -> io::Result<()> {
@@ -491,7 +497,11 @@ impl Drop for YamuxWrite {
             send_fin
         };
         if send_fin {
-            send_detached(&core.tx, header(TYPE_WINDOW_UPDATE, FLAG_FIN, *id, 0));
+            send_detached(
+                &core.tasks,
+                &core.tx,
+                header(TYPE_WINDOW_UPDATE, FLAG_FIN, *id, 0),
+            );
         }
     }
 }
@@ -558,7 +568,7 @@ mod tests {
         for data_first in [true, false] {
             let (near, far) = duplex(64 * 1024);
             let (mut far_read, mut far_write) = tokio::io::split(far);
-            let session = YamuxSession::new(Box::new(near));
+            let session = YamuxSession::new(Box::new(near), &Default::default());
             let stream = session.open().await.unwrap();
             let (kind, flags, sid, _) = next_header(&mut far_read).await;
             assert_eq!((kind, flags), (TYPE_WINDOW_UPDATE, FLAG_SYN));

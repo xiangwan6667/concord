@@ -503,7 +503,7 @@ impl Session {
 
     fn reply(&self, datagram: Vec<u8>) {
         let wire = self.wire.clone();
-        tokio::spawn(async move {
+        self.wire.tasks.spawn_detached(async move {
             let _ = wire.transmit(&datagram).await;
         });
     }

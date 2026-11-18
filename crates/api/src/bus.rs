@@ -488,6 +488,7 @@ mod tests {
             dst_geoip: None,
             src_asn: String::new(),
             dst_asn: String::new(),
+            rematch_name: String::new(),
             special_rules: String::new(),
             special_proxy: String::new(),
         };

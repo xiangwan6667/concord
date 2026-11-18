@@ -3,7 +3,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use concord_common::{
-    Address, BoxStream, DialCx, DialEnv, Initiator, IpVersion, OutboundInfo, OutboundKind, SockOpts,
+    Address, BoxStream, DialCx, DialEnv, Initiator, IpVersion, OutboundInfo, OutboundKind,
+    SockOpts, Tasks,
 };
 use concord_config::proxy::{CommonOpts, IpVersionPref, ProxyDef};
 use concord_net::dial_tcp;
@@ -53,9 +54,7 @@ impl Egress {
             interface: Some(common.interface_name.as_str())
                 .filter(|name| !name.is_empty())
                 .map(Arc::from),
-            routing_mark: u32::try_from(common.routing_mark)
-                .ok()
-                .filter(|mark| *mark != 0),
+            routing_mark: Some(common.routing_mark).filter(|mark| *mark != 0),
             tfo: common.tfo,
             mptcp: common.mptcp,
         }
@@ -168,16 +167,20 @@ pub(crate) struct Link {
 
 impl Link {
     /// A bare TCP connection to the server, for callers to add TLS and layers to.
-    pub(crate) fn plain(def: &ProxyDef, server: &str, port: u16) -> Link {
+    pub(crate) fn plain(def: &ProxyDef, server: &str, port: u16, tasks: &Tasks) -> Link {
         Link {
             egress: Egress::new(&def.name, &def.common),
             server: Address::new(server, port),
             tls: None,
             sni_fallback: server.to_string(),
-            stack: TransportStack::default(),
+            stack: TransportStack::new(Vec::new(), tasks.clone()),
             transport_host: server.to_string(),
             env_slot: None,
         }
+    }
+
+    pub(crate) fn tasks(&self) -> &Tasks {
+        self.stack.tasks()
     }
 
     pub(crate) async fn open(&self, cx: &DialCx<'_>) -> io::Result<BoxStream> {
@@ -278,7 +281,7 @@ mod tests {
         let link = Link {
             tls: Some(tls),
             sni_fallback: "localhost".to_string(),
-            ..Link::plain(&def, "127.0.0.1", port)
+            ..Link::plain(&def, "127.0.0.1", port, &ctx.tasks)
         };
 
         let accept = async {

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::future::poll_fn;
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{Instant, timeout};
 
 use super::config::{DnsServer, DnsTransport};
-use super::stack::{Congestion, Stack};
+use crate::stack::{Congestion, Stack};
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const SECOND_ANSWER_GRACE: Duration = Duration::from_millis(100);
@@ -27,7 +27,7 @@ struct Cached {
 }
 
 /// Name lookups for `remote-dns-resolve`: the query itself travels through the tunnel.
-pub(super) struct RemoteDns {
+pub(crate) struct RemoteDns {
     servers: Vec<DnsServer>,
     ipv6: bool,
     cache: Mutex<HashMap<String, Cached>>,
@@ -78,7 +78,7 @@ fn parse(wire: &[u8], id: u16) -> Option<Answer> {
     Some(answer)
 }
 
-async fn establish(conn: &mut super::stack::TcpConn) -> io::Result<()> {
+async fn establish(conn: &mut crate::stack::TcpConn) -> io::Result<()> {
     poll_fn(|cx| conn.poll_established(cx)).await
 }
 
@@ -92,9 +92,17 @@ async fn over_tcp(
     let (id, wire) = query(host, rtype)?;
     let mut conn = stack.connect_tcp(server.addr, congestion)?;
     establish(&mut conn).await?;
+    over_stream(&mut conn, id, &wire).await
+}
+
+async fn over_stream(
+    conn: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
+    id: u16,
+    wire: &[u8],
+) -> io::Result<Answer> {
     let len = u16::try_from(wire.len()).map_err(|_| io::Error::other("query too long"))?;
     let mut framed = len.to_be_bytes().to_vec();
-    framed.extend_from_slice(&wire);
+    framed.extend_from_slice(wire);
     conn.write_all(&framed).await?;
     let mut size = [0u8; 2];
     conn.read_exact(&mut size).await?;
@@ -143,7 +151,7 @@ async fn over_udp(
 }
 
 impl RemoteDns {
-    pub(super) fn new(servers: Vec<DnsServer>, ipv6: bool) -> Self {
+    pub(crate) fn new(servers: Vec<DnsServer>, ipv6: bool) -> Self {
         RemoteDns {
             servers,
             ipv6,
@@ -226,7 +234,64 @@ impl RemoteDns {
         Ok((ips, ttl))
     }
 
-    pub(super) async fn lookup(
+    pub(crate) async fn lookup_tcp<F, Fut>(&self, host: &str, connect: F) -> io::Result<LookupIps>
+    where
+        F: Fn(SocketAddr) -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = io::Result<concord_common::BoxStream>> + Send,
+    {
+        let key = host.to_ascii_lowercase();
+        if let Some(hit) = self.cached(&key) {
+            return Ok(hit);
+        }
+        let mut asks: FuturesUnordered<_> = self
+            .servers
+            .iter()
+            .map(|server| {
+                let connect = &connect;
+                async move {
+                    let types: &[RecordType] = if self.ipv6 {
+                        &[RecordType::A, RecordType::AAAA]
+                    } else {
+                        &[RecordType::A]
+                    };
+                    let mut ips = LookupIps::default();
+                    let mut ttl = u32::MAX;
+                    for rtype in types {
+                        let (id, wire) = query(host, *rtype)?;
+                        let mut stream = connect(server.addr).await?;
+                        let answer = over_stream(&mut stream, id, &wire).await?;
+                        ttl = ttl.min(answer.ttl);
+                        for ip in answer.ips {
+                            if ip.is_ipv4() {
+                                ips.v4.push(ip);
+                            } else {
+                                ips.v6.push(ip);
+                            }
+                        }
+                    }
+                    Ok::<_, io::Error>((ips, ttl))
+                }
+            })
+            .collect();
+        let race = async {
+            let mut last = CoreError::IpNotFound(host.to_string()).into();
+            while let Some(result) = asks.next().await {
+                match result {
+                    Ok((ips, ttl)) if !ips.is_empty() => return Ok((ips, ttl)),
+                    Ok(_) => {}
+                    Err(err) => last = err,
+                }
+            }
+            Err::<_, io::Error>(last)
+        };
+        let (ips, ttl) = timeout(QUERY_TIMEOUT, race)
+            .await
+            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+        self.store(&key, &ips, ttl);
+        Ok(ips)
+    }
+
+    pub(crate) async fn lookup(
         &self,
         stack: &Arc<Stack>,
         host: &str,

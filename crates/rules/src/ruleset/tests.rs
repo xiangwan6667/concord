@@ -311,6 +311,26 @@ fn dumping_a_non_mrs_file_reports_both_attempts() {
 }
 
 #[test]
+fn a_domain_set_covers_the_domain_a_leading_dot_names() {
+    let surge = b"# Surge DOMAIN-SET\n.example.com\nexact.test\n+.plus.test\n";
+    let parsed = RuleSet::parse(Behavior::Domain, Format::DomainSet, surge, &env()).unwrap();
+    for (host, matched) in [
+        ("example.com", true),
+        ("a.b.example.com", true),
+        ("exact.test", true),
+        ("sub.exact.test", false),
+        ("plus.test", true),
+    ] {
+        assert_eq!(host_matches(&parsed.set, host), matched, "{host}");
+    }
+    let text = RuleSet::parse(Behavior::Domain, Format::Text, surge, &env()).unwrap();
+    assert!(
+        !host_matches(&text.set, "example.com"),
+        "mihomo's text leaves the domain out"
+    );
+}
+
+#[test]
 fn providers_parse_text_and_yaml_and_report_skips() {
     let parsed = RuleSet::parse(
         Behavior::Domain,

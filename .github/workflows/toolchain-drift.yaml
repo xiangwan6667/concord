@@ -1,0 +1,59 @@
+name: toolchain-drift
+
+# `rust-toolchain.toml` pins the toolchain every other workflow uses. This runs the lint part of the gate on floating
+# stable, so a new release's warnings show here before the pin moves; a failure means bump the pin and fix them.
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  stable:
+    name: Lint on stable
+    if: ${{ !github.event.repository.fork }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # RUSTUP_TOOLCHAIN outranks `rust-toolchain.toml`.
+      - name: Use floating stable
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          echo "RUSTUP_TOOLCHAIN=stable" >> "$GITHUB_ENV"
+
+      - name: Check that stable is active
+        run: |
+          rustc --version
+          rustup show active-toolchain | grep '^stable'
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Check format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Clippy crates without their optional features
+        run: |
+          for crate in concord-common concord-engine concord-mitm; do
+            cargo clippy -p "$crate" --no-default-features --all-targets --locked -- -D warnings
+          done
+
+      - name: Check documentation
+        run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings

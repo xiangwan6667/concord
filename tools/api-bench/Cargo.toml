@@ -12,7 +12,7 @@ repository.workspace = true
 name = "api-bench"
 path = "src/main.rs"
 
-[dependencies]
+[target.'cfg(unix)'.dependencies]
 concord-common = { workspace = true, features = ["io"] }
 concord-api = { workspace = true }
 concord-engine = { workspace = true }

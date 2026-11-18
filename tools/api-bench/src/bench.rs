@@ -97,7 +97,7 @@ async fn boot(sink: Arc<dyn concord_common::EventSink>) -> Rig {
         })
         .await
         .unwrap();
-    engine.start_listeners().await.unwrap();
+    engine.start_listeners().await;
     Rig {
         engine,
         proxy,

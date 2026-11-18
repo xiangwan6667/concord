@@ -39,11 +39,11 @@ impl Vless {
         let flow = self.vision.then_some(FLOW_VISION);
         let header = request_header(&self.user, flow, command, dst)?;
         if let Some(encryption) = &self.encryption {
-            let io = self.link.open(cx).await?;
-            let encrypted = encryption.handshake(io).await?;
+            let encrypted = encryption.handshake(self.link.open(cx).await?).await?;
             if self.vision {
-                return Ok(Box::new(Vision::new_encrypted(
-                    encrypted, header, self.user,
+                let (read, write) = encrypted.into_halves();
+                return Ok(Box::new(Vision::from_halves(
+                    read, write, header, self.user,
                 )));
             }
             return Ok(Box::new(ResponseSkip::new(HeadFirst::new(
@@ -91,6 +91,7 @@ impl Outbound for Vless {
                 XudpFrames::new(cx.source()),
                 XudpFrames::new(None),
                 hint.clone(),
+                self.link.tasks(),
             )));
         }
         let magic = Address::new(PACKET_ADDR_MAGIC, 443);
@@ -100,6 +101,7 @@ impl Outbound for Vless {
             PacketAddrFrames,
             PacketAddrFrames,
             hint.clone(),
+            self.link.tasks(),
         )))
     }
 }
@@ -158,8 +160,7 @@ pub(crate) fn build(
     } else {
         false
     };
-    let encryption = encryption::Client::parse(&opts.encryption)
-        .map_err(|error| BuildError::invalid(error.to_string()))?;
+    let encryption = encryption::Client::parse(&opts.encryption)?;
     let link = build_link(
         LinkSpec {
             def,

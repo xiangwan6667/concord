@@ -131,6 +131,7 @@ pub fn connection_info(record: &ConnRecord) -> ConnectionInfo {
         destination_geo_ip: some_list(&meta.dst_geoip),
         source_asn: some(&meta.src_asn),
         destination_asn: some(&meta.dst_asn),
+        rematch_name: some(&meta.rematch_name),
         special_rules: some(&meta.special_rules),
         special_proxy: some(&meta.special_proxy),
         mitm: record.mitm.load(Ordering::Relaxed),
@@ -272,6 +273,9 @@ pub fn general_state(view: GeneralView) -> GeneralState {
         tproxy_port: view.tproxy_port,
         mixed_port: view.mixed_port,
         allow_lan: view.allow_lan,
+        bind_address: view.bind_address,
+        lan_allowed_ips: view.lan_allowed_ips,
+        lan_disallowed_ips: view.lan_disallowed_ips,
         authentication: view.users,
         skip_auth_prefixes: view.skip_auth_prefixes,
         mode: view.mode.as_str().to_string(),
@@ -493,6 +497,7 @@ mod tests {
             dst_geoip: geoip,
             src_asn: String::new(),
             dst_asn: String::new(),
+            rematch_name: String::new(),
             special_rules: String::new(),
             special_proxy: String::new(),
         };
@@ -531,19 +536,31 @@ mod tests {
             "rulePayload",
             "providerChains",
             "remoteDestination",
+            "rematchName",
         ] {
             assert!(
                 !object.contains_key(absent),
                 "{absent} is empty and must be left out"
             );
         }
-        for padding in ["rematchName", "dscp", "metadata"] {
+        for padding in ["dscp", "metadata"] {
             assert!(!object.contains_key(padding), "{padding}");
         }
         assert!(
             value["inboundType"].is_string(),
             "the inbound kind is real data"
         );
+    }
+
+    #[test]
+    fn rematch_name_is_real_sparse_connection_metadata() {
+        let mut record = record("example.com", None);
+        record.meta.rematch_name = "Next".into();
+        let value = serde_json::to_value(connection_info(&record)).unwrap();
+        assert_eq!(value["rematchName"], "Next");
+        record.meta.rematch_name.clear();
+        let value = serde_json::to_value(connection_info(&record)).unwrap();
+        assert!(value.get("rematchName").is_none());
     }
 
     #[test]

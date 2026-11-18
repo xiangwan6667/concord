@@ -134,7 +134,16 @@ impl Peer {
 
 async fn client(peer: &Peer, pattern: Arc<Pattern>, id: u32) -> (Arc<PacketUnderlay>, MieruStream) {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let underlay = PacketUnderlay::start(socket, peer.addr(), &key(), USER, pattern, 1400, 1);
+    let underlay = PacketUnderlay::start(
+        socket,
+        peer.addr(),
+        &key(),
+        USER,
+        pattern,
+        1400,
+        1,
+        &Default::default(),
+    );
     let events = underlay.open_session(id).unwrap();
     let stream = MieruStream::new(id, underlay.clone(), events, meta::MAX_PDU);
     (underlay, stream)
@@ -149,8 +158,16 @@ async fn datagrams_fit_the_mtu_and_parse_back() {
     let pattern = pattern(NonceKind::Random, true, None);
     let peer = Peer::new(&pattern).await;
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let underlay =
-        PacketUnderlay::start(socket, peer.addr(), &key(), USER, pattern.clone(), 1400, 1);
+    let underlay = PacketUnderlay::start(
+        socket,
+        peer.addr(),
+        &key(),
+        USER,
+        pattern.clone(),
+        1400,
+        1,
+        &Default::default(),
+    );
     assert_eq!(underlay.fragment_size(), 1400 - 88);
     for size in [1usize, 17, 500, 1311, 1312] {
         let payload = bytes(size);
@@ -208,8 +225,16 @@ async fn low_entropy_datagrams_carry_whole_chunks() {
     let pattern = pattern(NonceKind::Random, true, Some(low));
     let peer = Peer::new(&pattern).await;
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let underlay =
-        PacketUnderlay::start(socket, peer.addr(), &key(), USER, pattern.clone(), 1400, 1);
+    let underlay = PacketUnderlay::start(
+        socket,
+        peer.addr(),
+        &key(),
+        USER,
+        pattern.clone(),
+        1400,
+        1,
+        &Default::default(),
+    );
     let size = underlay.fragment_size();
     assert_eq!(size, (1400 - 88) / 8 * 5);
     let payload = bytes(size);
@@ -237,7 +262,16 @@ async fn nonces(every: bool) -> Vec<Vec<u8>> {
     let pattern = pattern(NonceKind::Printable, every, None);
     let peer = Peer::new(&pattern).await;
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let underlay = PacketUnderlay::start(socket, peer.addr(), &key(), USER, pattern, 1400, 1);
+    let underlay = PacketUnderlay::start(
+        socket,
+        peer.addr(),
+        &key(),
+        USER,
+        pattern,
+        1400,
+        1,
+        &Default::default(),
+    );
     let nonces = (0..24)
         .map(|seq| {
             underlay
@@ -294,6 +328,7 @@ async fn a_dialer_proxy_session_carries_the_datagrams() {
         pattern,
         1400,
         1,
+        &Default::default(),
     );
     let events = underlay.open_session(5).unwrap();
     let mut stream = MieruStream::new(5, underlay.clone(), events, meta::MAX_PDU);

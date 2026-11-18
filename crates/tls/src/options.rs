@@ -65,10 +65,13 @@ pub struct TlsOptions {
     pub private_key: Option<String>,
     pub client_fingerprint: Option<ClientFingerprint>,
     pub reality: Option<RealityOptions>,
+    pub jls: Option<crate::JlsAuth>,
     /// An `ECHConfigList`: the hello is encrypted to the first config this build can use.
     pub ech_config_list: Option<Vec<u8>>,
     /// Asked at each handshake when `ech_config_list` is `None`.
     pub ech_lookup: Option<Arc<dyn EchLookup>>,
+    /// Where a failed REALITY handshake browses the cover site.
+    pub tasks: concord_common::Tasks,
 }
 
 #[cfg(test)]

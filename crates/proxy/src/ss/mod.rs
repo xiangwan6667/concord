@@ -1,5 +1,6 @@
 mod chunk;
 pub(crate) mod crypto;
+mod legacy;
 mod udp;
 mod window;
 
@@ -66,7 +67,7 @@ impl Outbound for Shadowsocks {
     ) -> io::Result<Arc<dyn PacketSession>> {
         if let Some(version) = self.uot {
             let stream = self.open(cx, &uot::destination(version)).await?;
-            return uot::session(Box::new(stream), version, hint);
+            return uot::session(Box::new(stream), version, hint, self.link.tasks());
         }
         let server = self.link.server_socket(cx).await?;
         let codec = SsUdp::new(self.key.kind, self.key.key(), self.clock.clone())
@@ -96,7 +97,7 @@ fn plugin_link(def: &ProxyDef, opts: &SsOpts, ctx: &BuildCtx) -> Result<Link, Bu
                 clock: ctx.clock.clone(),
             })]
         }
-        Some(SsPlugin::V2ray(plugin)) => {
+        Some(SsPlugin::V2ray(plugin) | SsPlugin::Gost(plugin)) => {
             if plugin.mode != "websocket" {
                 return Err(BuildError::invalid(format!(
                     "obfs mode error: {}",
@@ -134,7 +135,7 @@ fn plugin_link(def: &ProxyDef, opts: &SsOpts, ctx: &BuildCtx) -> Result<Link, Bu
                     env_slot = Some(slot);
                 }
             }
-            vec![Layer::V2rayPlugin(V2rayPluginOptions {
+            let options = V2rayPluginOptions {
                 host: plugin.host.clone(),
                 ws: WsOptions {
                     path: plugin.path.clone(),
@@ -150,7 +151,20 @@ fn plugin_link(def: &ProxyDef, opts: &SsOpts, ctx: &BuildCtx) -> Result<Link, Bu
                     random_host: false,
                 },
                 mux: plugin.mux,
-            })]
+            };
+            vec![if matches!(&opts.plugin, Some(SsPlugin::Gost(_))) {
+                Layer::GostPlugin(options)
+            } else {
+                Layer::V2rayPlugin(options)
+            }]
+        }
+        Some(SsPlugin::Jls(plugin)) => {
+            transport_host = plugin.host.clone();
+            vec![crate::link::jls_layer(
+                plugin,
+                &opts.client_fingerprint,
+                ctx,
+            )?]
         }
         Some(SsPlugin::ShadowTls(plugin)) => {
             transport_host = plugin.host.clone();
@@ -160,10 +174,10 @@ fn plugin_link(def: &ProxyDef, opts: &SsOpts, ctx: &BuildCtx) -> Result<Link, Bu
     Ok(Link {
         tls,
         sni_fallback: sni,
-        stack: TransportStack::new(layers),
+        stack: TransportStack::new(layers, ctx.tasks.clone()),
         transport_host,
         env_slot,
-        ..Link::plain(def, &opts.server, opts.port)
+        ..Link::plain(def, &opts.server, opts.port, &ctx.tasks)
     })
 }
 
@@ -172,6 +186,9 @@ pub(crate) fn build(
     opts: &SsOpts,
     ctx: &BuildCtx,
 ) -> Result<Arc<dyn Outbound>, BuildError> {
+    if matches!(opts.cipher.as_str(), "chacha20" | "xchacha20") {
+        return legacy::build(def, opts, ctx);
+    }
     let kind = parse_method(&opts.cipher)?;
     let key = SsKey::new(kind, &opts.password)?;
     if !key.identity_keys().is_empty()
@@ -190,16 +207,7 @@ pub(crate) fn build(
         shadowsocks::relay::tcprelay::set_clock(Box::new(move || clock()));
     }
     let link = plugin_link(def, opts, ctx)?;
-    let version = match opts.udp_over_tcp_version {
-        0 | uot::LEGACY_VERSION => uot::LEGACY_VERSION,
-        2 => 2,
-        other => {
-            return Err(BuildError::invalid(format!(
-                "ss {} unknown udp over tcp protocol version: {other}",
-                opts.server
-            )));
-        }
-    };
+    let version = uot_version(opts)?;
     let uot = opts.udp_over_tcp.then_some(version);
     Ok(Arc::new(Shadowsocks {
         info: info_for(
@@ -215,4 +223,15 @@ pub(crate) fn build(
         uot,
         clock: ctx.clock.clone(),
     }))
+}
+
+fn uot_version(opts: &SsOpts) -> Result<u8, BuildError> {
+    match opts.udp_over_tcp_version {
+        0 | uot::LEGACY_VERSION => Ok(uot::LEGACY_VERSION),
+        2 => Ok(2),
+        other => Err(BuildError::invalid(format!(
+            "ss {} unknown udp over tcp protocol version: {other}",
+            opts.server
+        ))),
+    }
 }

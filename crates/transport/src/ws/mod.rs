@@ -8,8 +8,8 @@ use std::task::{Context, Poll};
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use concord_common::BoxStream;
 use concord_common::layered::{Layered, ReadLayer, WriteLayer};
+use concord_common::{BoxStream, Tasks};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::http1::{
@@ -266,7 +266,12 @@ impl WriteLayer for Passthrough {
     }
 }
 
-pub(crate) async fn apply(io: BoxStream, opts: &WsOptions, host: &str) -> io::Result<BoxStream> {
+pub(crate) async fn apply(
+    io: BoxStream,
+    opts: &WsOptions,
+    host: &str,
+    tasks: &Tasks,
+) -> io::Result<BoxStream> {
     let max = resolve(opts)?.max_early_data;
     if max > 0 {
         return Ok(Box::new(LazyWs::new(
@@ -274,6 +279,7 @@ pub(crate) async fn apply(io: BoxStream, opts: &WsOptions, host: &str) -> io::Re
             opts.clone(),
             host.to_string(),
             max,
+            tasks.clone(),
         )));
     }
     connect(io, opts, host, None).await

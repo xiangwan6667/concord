@@ -68,9 +68,11 @@ fn mapped_or_equal(found: IpAddr, wanted: IpAddr) -> bool {
 }
 
 pub fn select(entries: &[ProcNetEntry], src: SocketAddr, how: Match) -> Option<ProcNetEntry> {
+    // A TIME_WAIT row carries neither an inode nor a uid and may share its port with a live
+    // connection.
     let same_port = entries
         .iter()
-        .filter(|entry| entry.local.port() == src.port());
+        .filter(|entry| entry.local.port() == src.port() && (entry.inode != 0 || entry.uid != 0));
     let exact = same_port
         .clone()
         .find(|entry| mapped_or_equal(entry.local.ip(), src.ip()));
@@ -170,6 +172,19 @@ mod tests {
         assert_eq!(
             select(&entries, other_ip, Match::Loose).map(|e| e.uid),
             Some(1000)
+        );
+    }
+
+    #[test]
+    fn a_time_wait_row_on_the_same_address_is_skipped() {
+        let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+            0: 0100007F:C350 0200007F:1F90 06 00000000:00000000 03:00001770 00000000     0        0 0 3 0\n\
+            1: 0100007F:C350 0300007F:1F91 01 00000000:00000000 00:00000000 00000000  1000        0 77777 1 0 20 4\n";
+        let entries = parse_table(table, false);
+        let src: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        assert_eq!(
+            select(&entries, src, Match::Exact).map(|e| (e.uid, e.inode)),
+            Some((1000, 77777))
         );
     }
 }

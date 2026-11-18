@@ -4,6 +4,8 @@ mod device;
 mod dns;
 mod options;
 #[cfg(any(target_os = "linux", target_os = "android"))]
+pub mod provision;
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod reactor;
 pub mod route;
 mod runner;

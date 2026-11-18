@@ -11,6 +11,7 @@ pub mod hosts;
 pub mod keys;
 pub mod lenient;
 pub mod merge;
+pub mod mitm;
 pub mod net;
 pub mod ntp;
 pub mod profile;
@@ -33,6 +34,7 @@ pub use merge::{
     ProfileBase, ProfileOutbound, ProfileOutbounds, is_match_rule, merge_document, merge_profile,
     profile_base, profile_outbounds,
 };
+pub use mitm::MitmDef;
 pub use profile::{LoadOptions, Profile, load, load_raw, load_str};
 pub use provider::parse_provider_content;
 pub use proxy::{Capabilities, ProxyDef, ProxyKind, ProxyParse, Quarantined, parse_proxy};

@@ -1,20 +1,14 @@
-use crate::text::{quote, quote_char};
+use concord_config::mitm::{HostEntryDef, LineError};
+
+use crate::view::{HostEntryView, HostsView, LineView};
 
 const HTTPS_PORT: u16 = 443;
 const HTTP_PORT: u16 = 80;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct HostEntry {
-    pattern: String,
-    exclude: bool,
-    bare: bool,
-    port: u16,
-}
-
 /// Surge's `[MITM] hostname`: entries match in order, so an exclusion has to
 /// come before the wider entry it carves out of.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct HostList(Vec<HostEntry>);
+pub struct HostList(Vec<HostEntryDef>);
 
 impl HostList {
     pub fn parse(lines: &[String]) -> (HostList, Vec<String>) {
@@ -39,19 +33,46 @@ impl HostList {
         self.find(host, port, true)
     }
 
+    /// Whether the first entry that covers `host` on `port` carves it out.
+    pub fn excludes(&self, host: &str, port: u16) -> bool {
+        self.first(host, port, false)
+            .is_some_and(|entry| entry.exclude)
+    }
+
     pub fn includes_any(&self) -> bool {
         self.0.iter().any(|entry| !entry.exclude)
     }
 
     fn find(&self, host: &str, port: u16, sniffed: bool) -> bool {
+        self.first(host, port, sniffed)
+            .is_some_and(|entry| !entry.exclude)
+    }
+
+    fn first(&self, host: &str, port: u16, sniffed: bool) -> Option<&HostEntryDef> {
         let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
         if host.is_empty() {
-            return false;
+            return None;
         }
         self.0
             .iter()
-            .find(|entry| entry.covers(port, sniffed) && glob(&entry.pattern, &host))
-            .is_some_and(|entry| !entry.exclude)
+            .find(|entry| covers(entry, port, sniffed) && glob(&entry.pattern, &host))
+    }
+
+    /// `None` while the list has no entry, as a line none of whose items could be read.
+    pub(crate) fn view(&self) -> Option<LineView> {
+        (!self.0.is_empty()).then(|| {
+            LineView::Hosts(HostsView {
+                entries: self
+                    .0
+                    .iter()
+                    .map(|entry| HostEntryView {
+                        host: entry.pattern.clone(),
+                        port: (!entry.bare).then_some(entry.port),
+                        exclude: entry.exclude,
+                    })
+                    .collect(),
+            })
+        })
     }
 
     pub(crate) fn extend(&mut self, other: HostList) {
@@ -59,78 +80,23 @@ impl HostList {
     }
 }
 
-impl HostEntry {
-    fn covers(&self, port: u16, sniffed: bool) -> bool {
-        if self.bare {
-            return self.exclude || sniffed || port == HTTPS_PORT || port == HTTP_PORT;
-        }
-        self.port == 0 || self.port == port
+fn covers(entry: &HostEntryDef, port: u16, sniffed: bool) -> bool {
+    if entry.bare {
+        return entry.exclude || sniffed || port == HTTPS_PORT || port == HTTP_PORT;
     }
+    entry.port == 0 || entry.port == port
 }
 
-/// One error per bad item; the caller joins them with newlines when it needs a line's message.
-pub(crate) fn parse_host_line(line: &str) -> (HostList, Vec<String>) {
-    let mut list = HostList::default();
-    let mut errors = Vec::new();
-    for item in line.split(',') {
-        let item = item.trim();
-        if item.is_empty() {
-            continue;
-        }
-        match parse_host_entry(item) {
-            Ok(entry) => list.0.push(entry),
-            Err(err) => errors.push(format!("{}: {err}", quote(item))),
-        }
-    }
-    (list, errors)
+/// One error per bad item, naming it; the entries of the good items apply all the same.
+pub(crate) fn parse_host_line(line: &str) -> (HostList, Vec<LineError>) {
+    let (entries, errors) = concord_config::mitm::parse_host_line(line);
+    (HostList(entries), errors)
 }
 
-fn parse_host_entry(item: &str) -> Result<HostEntry, String> {
-    let (exclude, item) = match item.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, item),
-    };
-    let (host, port) = split_host_pattern(item)?;
-    if host.is_empty() {
-        return Err("empty host".to_string());
+impl From<Vec<HostEntryDef>> for HostList {
+    fn from(entries: Vec<HostEntryDef>) -> HostList {
+        HostList(entries)
     }
-    if let Some(bad) = host.chars().find(|c| !is_host_pattern_char(*c)) {
-        return Err(format!("unsupported character {}", quote_char(bad)));
-    }
-    Ok(HostEntry {
-        pattern: host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase(),
-        exclude,
-        bare: port.is_none(),
-        port: port.unwrap_or(0),
-    })
-}
-
-fn split_host_pattern(item: &str) -> Result<(&str, Option<u16>), String> {
-    if let Some(rest) = item.strip_prefix('[') {
-        let end = rest.find(']').ok_or("unclosed bracket")?;
-        let (host, tail) = (&rest[..end], &rest[end + 1..]);
-        if tail.is_empty() {
-            return Ok((host, None));
-        }
-        let port = tail
-            .strip_prefix(':')
-            .ok_or_else(|| format!("unexpected {} after the address", quote(tail)))?;
-        return Ok((host, Some(parse_port(port)?)));
-    }
-    if item.matches(':').count() != 1 {
-        return Ok((item, None));
-    }
-    let (host, port) = item.split_once(':').unwrap_or((item, ""));
-    Ok((host, Some(parse_port(port)?)))
-}
-
-pub(crate) fn parse_port(text: &str) -> Result<u16, String> {
-    text.parse::<u16>()
-        .map_err(|_| format!("invalid port {}", quote(text)))
-}
-
-fn is_host_pattern_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || "-._*?:".contains(c)
 }
 
 /// `*` and `?` over bytes; the name is already lower-case.

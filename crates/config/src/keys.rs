@@ -7,7 +7,98 @@ pub enum Tier {
     T0,
     T1,
     T2,
+    Inert,
 }
+
+pub struct Tiers {
+    pub t0: &'static [&'static str],
+    pub t1: &'static [&'static str],
+    pub t2: &'static [&'static str],
+    pub inert: &'static [&'static str],
+}
+
+impl Tiers {
+    pub fn of(&self, key: &str) -> Option<Tier> {
+        [
+            (self.t0, Tier::T0),
+            (self.t1, Tier::T1),
+            (self.t2, Tier::T2),
+            (self.inert, Tier::Inert),
+        ]
+        .into_iter()
+        .find(|(keys, _)| keys.contains(&key))
+        .map(|(_, tier)| tier)
+    }
+}
+
+const fn tiers(
+    t0: &'static [&'static str],
+    t1: &'static [&'static str],
+    t2: &'static [&'static str],
+    inert: &'static [&'static str],
+) -> Tiers {
+    Tiers { t0, t1, t2, inert }
+}
+
+/// mihomo's `geodata.SetLoader` only picks how much of a `.dat` file stays in memory.
+const TOP_INERT: &[&str] = &["geodata-loader"];
+
+/// The host saves the selected nodes and hands them back with each profile it applies.
+const PROFILE_INERT: &[&str] = &["store-selected"];
+
+pub const TOP: Tiers = tiers(TOP_T0, TOP_T1, TOP_T2, TOP_INERT);
+pub const DNS: Tiers = tiers(DNS_T0, DNS_T1, &[], &[]);
+pub const FALLBACK_FILTER_TIERS: Tiers = tiers(FALLBACK_FILTER, &[], &[], &[]);
+pub const TUN: Tiers = tiers(TUN_T0, TUN_T1, TUN_T2, &[]);
+pub const SNIFFER: Tiers = tiers(SNIFFER_T0, SNIFFER_T1, SNIFFER_T2, &[]);
+pub const NTP: Tiers = tiers(NTP_KEYS, &[], &[], &[]);
+pub const GEOX: Tiers = tiers(GEOX_KEYS, &[], GEOX_T2, &[]);
+pub const PROFILE: Tiers = tiers(&["store-fake-ip"], &[], &[], PROFILE_INERT);
+pub const GROUP: Tiers = tiers(
+    GROUP_T0,
+    &[],
+    &["routing-mark", "interface-name", "dialer-proxy"],
+    &[],
+);
+
+pub const GROUP_T0: &[&str] = &[
+    "name",
+    "type",
+    "proxies",
+    "use",
+    "use-position",
+    "url",
+    "interval",
+    "timeout",
+    "max-failed-times",
+    "empty-fallback",
+    "lazy",
+    "disable-udp",
+    "filter",
+    "exclude-filter",
+    "exclude-type",
+    "expected-status",
+    "include-all",
+    "include-all-proxies",
+    "include-all-providers",
+    "hidden",
+    "icon",
+    "tolerance",
+    "default-selected",
+    "strategy",
+    "hash-key",
+];
+
+pub const SECTIONS: [(&str, &Tiers); 8] = [
+    ("", &TOP),
+    ("dns", &DNS),
+    ("dns.fallback-filter", &FALLBACK_FILTER_TIERS),
+    ("tun", &TUN),
+    ("sniffer", &SNIFFER),
+    ("ntp", &NTP),
+    ("geox-url", &GEOX),
+    ("profile", &PROFILE),
+];
 
 pub const TOP_T0: &[&str] = &[
     "mixed-port",
@@ -40,7 +131,6 @@ pub const TOP_T0: &[&str] = &[
     "geox-url",
     "geo-auto-update",
     "geo-update-interval",
-    "geodata-loader",
     "profile",
     "mitm",
 ];
@@ -54,6 +144,10 @@ pub const TOP_T1: &[&str] = &[
     "experimental",
     "external-controller",
     "secret",
+    "external-controller-cors",
+    "bind-address",
+    "lan-allowed-ips",
+    "lan-disallowed-ips",
 ];
 
 pub const TOP_T2: &[&str] = &[
@@ -67,13 +161,9 @@ pub const TOP_T2: &[&str] = &[
     "clash-for-android",
     "inbound-tfo",
     "inbound-mptcp",
-    "bind-address",
-    "lan-allowed-ips",
-    "lan-disallowed-ips",
     "external-controller-pipe",
     "external-controller-unix",
     "external-controller-tls",
-    "external-controller-cors",
     "external-controller-routing-mark",
     "external-ui",
     "external-ui-url",
@@ -143,6 +233,10 @@ pub const TUN_T1: &[&str] = &[
     "exclude-uid",
     "exclude-src-port",
     "exclude-dst-port",
+    "inet4-route-address",
+    "inet6-route-address",
+    "inet4-route-exclude-address",
+    "inet6-route-exclude-address",
 ];
 
 pub const TUN_T2: &[&str] = &[
@@ -170,13 +264,24 @@ pub const TUN_T2: &[&str] = &[
     "endpoint-independent-nat",
     "icmp-timeout",
     "file-descriptor",
-    "inet4-route-address",
-    "inet6-route-address",
-    "inet4-route-exclude-address",
-    "inet6-route-exclude-address",
     "recvmsgx",
     "sendmsgx",
     "processors-per-channel",
+];
+
+/// TUN_T2 keys that narrow or widen what the TUN captures.
+pub const TUN_SCOPE: &[&str] = &[
+    "route-address-set",
+    "route-exclude-address-set",
+    "include-uid-range",
+    "exclude-uid-range",
+    "exclude-src-port-range",
+    "exclude-dst-port-range",
+    "include-android-user",
+    "include-package",
+    "exclude-package",
+    "include-mac-address",
+    "exclude-mac-address",
 ];
 
 pub const SNIFFER_T0: &[&str] = &[
@@ -210,33 +315,7 @@ pub const NTP_KEYS: &[&str] = &[
 pub const GEOX_KEYS: &[&str] = &["mmdb", "asn", "geosite"];
 pub const GEOX_T2: &[&str] = &["geoip"];
 
-pub const PROFILE_KEYS: &[&str] = &["store-selected", "store-fake-ip"];
-
 pub const DEFAULT_GLOBAL_UA: &str = "clash.meta/1.10.0";
-
-pub fn top_tier(key: &str) -> Option<Tier> {
-    if TOP_T0.contains(&key) {
-        Some(Tier::T0)
-    } else if TOP_T1.contains(&key) {
-        Some(Tier::T1)
-    } else if TOP_T2.contains(&key) {
-        Some(Tier::T2)
-    } else {
-        None
-    }
-}
-
-pub fn tier_in(key: &str, t0: &[&str], t1: &[&str], t2: &[&str]) -> Option<Tier> {
-    if t0.contains(&key) {
-        Some(Tier::T0)
-    } else if t1.contains(&key) {
-        Some(Tier::T1)
-    } else if t2.contains(&key) {
-        Some(Tier::T2)
-    } else {
-        None
-    }
-}
 
 pub fn general_defaults() -> Map {
     let value = json!({
@@ -248,6 +327,9 @@ pub fn general_defaults() -> Map {
         "authentication": [],
         "skip-auth-prefixes": null,
         "allow-lan": false,
+        "bind-address": "*",
+        "lan-allowed-ips": ["0.0.0.0/0", "::/0"],
+        "lan-disallowed-ips": null,
         "mode": "rule",
         "unified-delay": false,
         "log-level": "info",
@@ -338,6 +420,14 @@ pub fn sniffer_defaults() -> Map {
     }))
 }
 
+pub fn default_number<T: TryFrom<i128> + Default>(defaults: &Map, key: &str) -> T {
+    defaults
+        .get(key)
+        .and_then(crate::lenient::to_i128)
+        .and_then(|number| T::try_from(number).ok())
+        .unwrap_or_default()
+}
+
 pub fn ntp_defaults() -> Map {
     into_map(json!({
         "enable": false,
@@ -407,6 +497,7 @@ fn into_map(value: Value) -> Map {
     }
 }
 
+/// A null keeps any default but a list, as go-yaml leaves a scalar or struct field alone and clears a slice.
 pub fn overlay(defaults: &Map, user: Map) -> Map {
     let mut out = defaults.clone();
     for (key, value) in user {
@@ -420,7 +511,10 @@ pub fn overlay(defaults: &Map, user: Map) -> Map {
                     out.insert(key, Value::Object(top));
                 }
             },
-            Value::Null if matches!(out.get(&key), Some(Value::Object(_))) => {}
+            Value::Null
+                if out
+                    .get(&key)
+                    .is_some_and(|default| !matches!(default, Value::Array(_) | Value::Null)) => {}
             value => {
                 out.insert(key, value);
             }

@@ -82,7 +82,9 @@ pub(crate) fn cond_payload(cond: &Cond) -> String {
         Cond::Network(NetworkKind::Tcp) => "tcp".to_string(),
         Cond::Network(NetworkKind::Udp) => "udp".to_string(),
         Cond::Uid(r) => uids(r),
-        Cond::InType(list) | Cond::InUser(list) | Cond::InName(list) => list.join("/"),
+        Cond::InType(list) | Cond::InUser(list) | Cond::InName(list) | Cond::RematchName(list) => {
+            list.join("/")
+        }
         Cond::And(children) => logic(children, " && "),
         Cond::Or(children) => logic(children, " || "),
         Cond::Not(child) => format!("(!{})", part(child)),

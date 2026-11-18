@@ -5,7 +5,8 @@ use percent_encoding::percent_decode_str;
 
 use crate::Map;
 use crate::error::{ConfigError, Result};
-use crate::lenient::Fields;
+use crate::keys::{default_number, dns_defaults};
+use crate::lenient::{Fields, Ignored};
 use crate::net::IpCidr;
 use crate::rule::{self, Cond, RuleDef};
 
@@ -211,9 +212,45 @@ pub fn parse_upstream(server: &str) -> Result<Upstream> {
     Ok(upstream)
 }
 
-pub fn parse_upstreams(servers: &[String], what: &str) -> Result<Vec<Upstream>> {
+/// A tailscale or easytier server is reached through a node of that type, which this core sets
+/// aside, so the server is skipped; a list left with none answers REFUSED rather than letting the
+/// names go to another resolver.
+fn overlay(server: &str) -> bool {
+    let scheme = server.split_once("://").map_or("", |(scheme, _)| scheme);
+    ["ts", "tailscale", "et", "easytier"].contains(&scheme.to_ascii_lowercase().as_str())
+}
+
+fn fake_ip_range(text: &str, key: &str, v4: bool) -> Result<Option<IpCidr>> {
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let cidr = crate::net::parse_cidr(text).map_err(|err| err.prefixed(&format!("dns.{key}: ")))?;
+    if cidr.is_ipv4() != v4 {
+        let family = if v4 { "IPv4" } else { "IPv6" };
+        return Err(ConfigError::new(format!(
+            "dns.{key} must be a {family} prefix"
+        )));
+    }
+    Ok(Some(cidr))
+}
+
+pub fn parse_upstreams(
+    servers: &[String],
+    what: &str,
+    notes: &mut Vec<Ignored>,
+) -> Result<Vec<Upstream>> {
     let mut out: Vec<Upstream> = Vec::with_capacity(servers.len());
+    let mut skipped = false;
     for (index, server) in servers.iter().enumerate() {
+        if overlay(server) {
+            skipped = true;
+            notes.push(Ignored {
+                code: "not_applied",
+                key: format!("{what}[{index}]"),
+                why: format!("{server}: tailscale and easytier DNS are not supported by this core"),
+            });
+            continue;
+        }
         let upstream = parse_upstream(server)
             .map_err(|err| {
                 ConfigError::new(format!(
@@ -225,6 +262,9 @@ pub fn parse_upstreams(servers: &[String], what: &str) -> Result<Vec<Upstream>> 
         if !out.iter().any(|existing| existing.same_target(&upstream)) {
             out.push(upstream);
         }
+    }
+    if skipped && out.is_empty() {
+        out.push(parse_upstream("rcode://refused")?);
     }
     Ok(out)
 }
@@ -270,14 +310,18 @@ fn policy_keys(key: &str) -> Vec<PolicyKey> {
     vec![PolicyKey::Domain(key.to_string())]
 }
 
-pub fn parse_policy(map: Option<&Map>, what: &str) -> Result<Vec<PolicyEntry>> {
+pub fn parse_policy(
+    map: Option<&Map>,
+    what: &str,
+    notes: &mut Vec<Ignored>,
+) -> Result<Vec<PolicyEntry>> {
     let Some(map) = map else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
     for (key, value) in map {
         let servers = crate::lenient::value_to_strings(value);
-        let upstreams = parse_upstreams(&servers, what)?;
+        let upstreams = parse_upstreams(&servers, &format!("{what}[{key}]"), notes)?;
         for policy_key in policy_keys(key) {
             out.push(PolicyEntry {
                 key: policy_key,
@@ -360,7 +404,9 @@ fn parse_enhanced(text: &str) -> Result<EnhancedMode> {
         "normal" => Ok(EnhancedMode::Normal),
         "fake-ip" => Ok(EnhancedMode::FakeIp),
         "redir-host" | "" => Ok(EnhancedMode::RedirHost),
-        _ => Err(ConfigError::new("invalid mode")),
+        _ => Err(ConfigError::new(format!(
+            "dns.enhanced-mode: invalid mode \"{text}\""
+        ))),
     }
 }
 
@@ -369,7 +415,9 @@ fn parse_filter_mode(text: &str) -> Result<FakeIpFilterMode> {
         "blacklist" | "" => Ok(FakeIpFilterMode::Blacklist),
         "whitelist" => Ok(FakeIpFilterMode::Whitelist),
         "rule" => Ok(FakeIpFilterMode::Rule),
-        _ => Err(ConfigError::new("invalid mode")),
+        _ => Err(ConfigError::new(format!(
+            "dns.fake-ip-filter-mode: invalid mode \"{text}\""
+        ))),
     }
 }
 
@@ -465,7 +513,15 @@ impl DnsConfig {
         found
     }
 
-    pub fn from_map(map: &Map) -> Result<DnsConfig> {
+    pub fn from_map(map: &Map, ipv6: bool) -> Result<DnsConfig> {
+        Ok(DnsConfig::read(map, ipv6)?.0)
+    }
+
+    /// With `ipv6` off mihomo drops `fake-ip-range6` before reading it (`parseIPV6`). A number
+    /// out of range takes its default, returned as a note.
+    pub fn read(map: &Map, ipv6: bool) -> Result<(DnsConfig, Vec<Ignored>)> {
+        let defaults = dns_defaults();
+        let mut notes = Vec::new();
         let mut f = Fields::new(map, "dns", false);
         let enable = f.boolean("enable")?;
         let respect_rules = f.boolean("respect-rules")?;
@@ -489,26 +545,33 @@ impl DnsConfig {
             use_system_hosts: f.boolean("use-system-hosts")?,
             ipv6: f.boolean("ipv6")?,
             prefer_h3: f.boolean("prefer-h3")?,
-            ipv6_timeout: f.u32("ipv6-timeout")?,
-            fake_ip_ttl: f.u32("fake-ip-ttl")?,
+            ipv6_timeout: f.loose("ipv6-timeout", default_number(&defaults, "ipv6-timeout"))?,
+            fake_ip_ttl: f.loose("fake-ip-ttl", default_number(&defaults, "fake-ip-ttl"))?,
             fake_ip_filter_mode: parse_filter_mode(&f.string("fake-ip-filter-mode")?)?,
             fallback_lazy_query: f.boolean("fallback-lazy-query")?,
             direct_nameserver_follow_policy: f.boolean("direct-nameserver-follow-policy")?,
             cache_algorithm: f.string("cache-algorithm")?,
-            cache_max_size: f.i32("cache-max-size")?,
+            cache_max_size: f.loose("cache-max-size", 0)?,
             listen: f.string("listen")?,
-            listen_routing_mark: f.u32("listen-routing-mark")?,
+            listen_routing_mark: f.mark("listen-routing-mark")?,
             ..DnsConfig::default()
         };
-        dns.nameserver = parse_upstreams(&nameserver_text, "dns.nameserver")?;
-        dns.fallback = parse_upstreams(&f.strings("fallback")?, "dns.fallback")?;
-        dns.nameserver_policy =
-            parse_policy(f.object("nameserver-policy")?, "dns.nameserver-policy")?;
-        dns.proxy_server_nameserver =
-            parse_upstreams(&proxy_server_text, "dns.proxy-server-nameserver")?;
+        dns.nameserver = parse_upstreams(&nameserver_text, "dns.nameserver", &mut notes)?;
+        dns.fallback = parse_upstreams(&f.strings("fallback")?, "dns.fallback", &mut notes)?;
+        dns.nameserver_policy = parse_policy(
+            f.object("nameserver-policy")?,
+            "dns.nameserver-policy",
+            &mut notes,
+        )?;
+        dns.proxy_server_nameserver = parse_upstreams(
+            &proxy_server_text,
+            "dns.proxy-server-nameserver",
+            &mut notes,
+        )?;
         dns.proxy_server_nameserver_policy = parse_policy(
             f.object("proxy-server-nameserver-policy")?,
             "dns.proxy-server-nameserver-policy",
+            &mut notes,
         )?;
         if !dns.proxy_server_nameserver_policy.is_empty() && dns.proxy_server_nameserver.is_empty()
         {
@@ -516,33 +579,29 @@ impl DnsConfig {
                 "disallow empty `proxy-server-nameserver` when `proxy-server-nameserver-policy` is set",
             ));
         }
-        dns.direct_nameserver =
-            parse_upstreams(&f.strings("direct-nameserver")?, "dns.direct-nameserver")?;
+        dns.direct_nameserver = parse_upstreams(
+            &f.strings("direct-nameserver")?,
+            "dns.direct-nameserver",
+            &mut notes,
+        )?;
         let defaults = f.strings("default-nameserver")?;
         if defaults.is_empty() {
             return Err(ConfigError::new(
                 "default nameserver should have at least one nameserver",
             ));
         }
-        dns.default_nameserver = parse_upstreams(&defaults, "dns.default-nameserver")?;
-        if dns.default_nameserver.iter().any(|ns| !ns.is_pure_ip()) {
-            return Err(ConfigError::new("default nameserver should be pure IP"));
-        }
-        let range = f.string("fake-ip-range")?;
-        if !range.is_empty() {
-            let cidr = crate::net::parse_cidr(&range)?;
-            if !cidr.is_ipv4() {
-                return Err(ConfigError::new("dns.fake-ip-range must be a IPv4 prefix"));
+        dns.default_nameserver = parse_upstreams(&defaults, "dns.default-nameserver", &mut notes)?;
+        for (index, text) in defaults.iter().enumerate() {
+            if !parse_upstream(text).is_ok_and(|ns| ns.is_pure_ip()) {
+                return Err(ConfigError::new(format!(
+                    "dns.default-nameserver[{index}]: default nameserver should be pure IP: {text}"
+                )));
             }
-            dns.fake_ip_range = Some(cidr);
         }
+        dns.fake_ip_range = fake_ip_range(&f.string("fake-ip-range")?, "fake-ip-range", true)?;
         let range6 = f.string("fake-ip-range6")?;
-        if !range6.is_empty() {
-            let cidr = crate::net::parse_cidr(&range6)?;
-            if cidr.is_ipv4() {
-                return Err(ConfigError::new("dns.fake-ip-range6 must be a IPv6 prefix"));
-            }
-            dns.fake_ip_range6 = Some(cidr);
+        if ipv6 {
+            dns.fake_ip_range6 = fake_ip_range(&range6, "fake-ip-range6", false)?;
         }
         dns.fake_ip_filter = f.strings("fake-ip-filter")?;
         if dns.enhanced_mode == EnhancedMode::FakeIp {
@@ -555,7 +614,10 @@ impl DnsConfig {
                 ));
             }
         }
-        if let Some(mut filter) = f.sub("fallback-filter")? {
+        if let Some(mut filter) = f
+            .sub("fallback-filter")?
+            .filter(|_| !dns.fallback.is_empty())
+        {
             dns.fallback_filter.geoip = filter.boolean("geoip")?;
             dns.fallback_filter.geoip_code = filter.string("geoip-code")?;
             dns.fallback_filter.geosite = filter.strings("geosite")?;
@@ -571,7 +633,8 @@ impl DnsConfig {
                     })?);
             }
         }
-        Ok(dns)
+        notes.extend(f.take_ignored());
+        Ok((dns, notes))
     }
 
     pub fn upstream_proxy_names(&self) -> impl Iterator<Item = &str> {
@@ -605,12 +668,31 @@ mod tests {
                 map.insert(key, value);
             }
         }
-        DnsConfig::from_map(&map)
+        DnsConfig::from_map(&map, true)
+    }
+
+    #[test]
+    fn what_mihomo_never_reads_is_not_checked() {
+        let filter = serde_json::json!({"fallback-filter": {"ipcidr": ["bogus"]}});
+        assert!(dns_with(filter.clone()).is_ok());
+        let mut with_fallback = filter;
+        with_fallback["fallback"] = serde_json::json!(["8.8.8.8"]);
+        assert!(dns_with(with_fallback).is_err());
+
+        let mut map = dns_defaults();
+        map.insert("fake-ip-range6".into(), "fc00::/18x".into());
+        assert!(
+            DnsConfig::from_map(&map, false)
+                .unwrap()
+                .fake_ip_range6
+                .is_none()
+        );
+        assert!(DnsConfig::from_map(&map, true).is_err());
     }
 
     #[test]
     fn defaults_parse() {
-        let dns = DnsConfig::from_map(&dns_defaults()).unwrap();
+        let dns = DnsConfig::from_map(&dns_defaults(), true).unwrap();
         assert!(!dns.enable);
         assert_eq!(dns.nameserver.len(), 2);
         assert_eq!(dns.nameserver[0].scheme, UpstreamScheme::Https);
@@ -663,6 +745,14 @@ mod tests {
         assert_eq!(up.params.get("ecs").map(String::as_str), Some("1.2.3.0/24"));
         let up = parse_upstream("1.1.1.1#proxy").unwrap();
         assert_eq!(up.proxy.as_deref(), Some("proxy"));
+        let up = parse_upstream("https://1.1.1.1/dns-query#DIRECT&h3=true").unwrap();
+        assert_eq!(up.proxy.as_deref(), Some("DIRECT"));
+        assert_eq!(up.params.get("h3").map(String::as_str), Some("true"));
+        let up = parse_upstream("quic://dns.adguard.com#DIRECT").unwrap();
+        assert_eq!(
+            (up.scheme, up.proxy.as_deref()),
+            (UpstreamScheme::Quic, Some("DIRECT"))
+        );
         let up = parse_upstream("tls://[2606:4700::1111]:853").unwrap();
         assert_eq!((up.host.as_str(), up.port), ("2606:4700::1111", 853));
     }
@@ -718,7 +808,6 @@ mod tests {
         assert!(dns_with(json!({"fake-ip-range": "fc00::/64"})).is_err());
         assert!(dns_with(json!({"enhanced-mode": "fake-ip", "fake-ip-range": ""})).is_err());
         assert!(dns_with(json!({"enhanced-mode": "mapping"})).is_err());
-        assert!(dns_with(json!({"nameserver": ["ts://node"]})).is_err());
         assert!(dns_with(json!({"proxy-server-nameserver-policy": {"a.com": "1.1.1.1"}})).is_err());
     }
 

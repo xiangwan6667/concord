@@ -13,25 +13,26 @@ use crate::client::{
 };
 use crate::dialer::{Connector, Cx};
 use crate::doh::DohTarget;
+use crate::shared_dial::SharedDial;
 
 const ALPN: &str = "h3";
 const MAX_BODY: usize = 65_535;
 
 type Requests = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 
+#[derive(Clone)]
 struct Session {
     _endpoint: quinn::Endpoint,
     conn: quinn::Connection,
     requests: Requests,
 }
 
-/// `https://` over HTTP/3. The QUIC socket comes from the `SocketFactory`, so a
-/// proxy route is not supported.
+/// `https://` over HTTP/3.
 pub(crate) struct Doh3Client {
     target: DohTarget,
     connector: Arc<Connector>,
     config: quinn::ClientConfig,
-    session: Mutex<Option<Session>>,
+    session: SharedDial<Session>,
 }
 
 impl Doh3Client {
@@ -56,34 +57,19 @@ impl Doh3Client {
             target,
             connector,
             config: quinn::ClientConfig::new(Arc::new(crypto)),
-            session: Mutex::new(None),
+            session: SharedDial::new(),
         })
     }
 
-    fn cached(&self) -> Option<Requests> {
-        let slot = lock(&self.session);
-        let session = slot.as_ref()?;
-        session
-            .conn
-            .close_reason()
-            .is_none()
-            .then(|| session.requests.clone())
-    }
-
-    async fn dial(&self, cx: Cx) -> io::Result<Requests> {
-        let Some((sock, peer)) = self
+    async fn dial(&self, cx: Cx) -> io::Result<Session> {
+        let (socket, peer) = self
             .connector
             .quic_socket(&self.target.host, self.target.port, cx)
-            .await?
-        else {
-            return Err(io::Error::other(
-                "DNS over HTTP/3 cannot go through a proxy",
-            ));
-        };
-        let mut endpoint = quinn::Endpoint::new(
+            .await?;
+        let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
             quinn::EndpointConfig::default(),
             None,
-            sock.into_std()?,
+            socket,
             Arc::new(quinn::TokioRuntime),
         )?;
         endpoint.set_default_client_config(self.config.clone());
@@ -98,15 +84,11 @@ impl Doh3Client {
         tokio::spawn(async move {
             let _ = driver.wait_idle().await;
         });
-        {
-            let mut slot = lock(&self.session);
-            *slot = Some(Session {
-                _endpoint: endpoint,
-                conn,
-                requests: requests.clone(),
-            });
-        }
-        Ok(requests)
+        Ok(Session {
+            _endpoint: endpoint,
+            conn,
+            requests,
+        })
     }
 
     async fn round_trip(&self, mut requests: Requests, query: &[u8]) -> io::Result<Message> {
@@ -145,15 +127,16 @@ impl Client for Doh3Client {
         with_timeout(async {
             let mut reused = true;
             loop {
-                let requests = match self.cached() {
-                    Some(requests) => requests,
-                    None => {
-                        reused = false;
-                        self.dial(cx).await?
-                    }
-                };
+                let session = self
+                    .session
+                    .get(
+                        |session| session.conn.close_reason().is_none(),
+                        self.dial(cx),
+                    )
+                    .await?;
+                reused &= session.reused;
                 let answer = self
-                    .round_trip(requests, &bytes)
+                    .round_trip(session.value.requests, &bytes)
                     .await
                     .and_then(|resp| checked(&query, resp));
                 match answer {
@@ -162,7 +145,7 @@ impl Client for Doh3Client {
                         return Ok(resp);
                     }
                     Err(err) => {
-                        self.reset();
+                        close(self.session.take());
                         if !reused {
                             return Err(err);
                         }
@@ -179,10 +162,13 @@ impl Client for Doh3Client {
     }
 
     fn reset(&self) {
-        let taken = lock(&self.session).take();
-        if let Some(session) = taken {
-            session.conn.close(0u32.into(), b"");
-        }
+        close(self.session.reset());
+    }
+}
+
+fn close(session: Option<Session>) {
+    if let Some(session) = session {
+        session.conn.close(0u32.into(), b"");
     }
 }
 

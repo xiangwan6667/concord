@@ -49,6 +49,27 @@ impl<'p> Run<'p> {
         }
     }
 
+    /// Restarts at a named list; unknown names use the main list, as `getRules` does.
+    pub fn restart(&mut self, sub_rule: Option<&str>) {
+        let prog = sub_rule
+            .and_then(|name| {
+                self.program
+                    .sub_rule_names
+                    .iter()
+                    .position(|n| &**n == name)
+            })
+            .map_or(0, |index| index as u32 + 1);
+        self.frames.clear();
+        self.frames.push(Frame {
+            prog,
+            op: 0,
+            pos: 0,
+        });
+        self.pending = None;
+        self.replay = 0;
+        self.root = 0;
+    }
+
     /// Leaves an empty record behind.
     pub fn take_observed(&mut self) -> Observed {
         std::mem::take(&mut self.observed)
@@ -174,15 +195,22 @@ impl<'p> Run<'p> {
                         .table
                         .target(idx)
                         .map_or("", |id| program.target_name(id));
-                    let rule = RuleRef(if self.frames.len() > 1 {
-                        self.root
-                    } else {
-                        idx
-                    });
+                    let rule = self.rule_ref(idx);
                     return Step::Candidate { target, rule };
                 }
             }
         }
+    }
+
+    fn rule_ref(&self, index: u32) -> RuleRef {
+        RuleRef(
+            if self.frames.len() > 1 {
+                self.root
+            } else {
+                index
+            },
+            self.frames.first().map_or(0, |frame| frame.prog),
+        )
     }
 
     fn yielded(&mut self, why: Yield) -> Step<'static> {

@@ -203,7 +203,7 @@ const PROTOCOLS: [&str; 6] = [
     "auth_chain_a",
     "auth_chain_b",
 ];
-const CIPHERS: [&str; 9] = [
+const CIPHERS: [&str; 11] = [
     "none",
     "rc4-md5",
     "aes-128-ctr",
@@ -213,6 +213,8 @@ const CIPHERS: [&str; 9] = [
     "aes-192-cfb",
     "aes-256-cfb",
     "chacha20-ietf",
+    "chacha20",
+    "xchacha20",
 ];
 
 #[tokio::test]
@@ -324,15 +326,6 @@ fn unsupported_and_invalid_options_are_reported() {
     );
     assert!(!err.is_unsupported());
 
-    let mut xchacha = base.clone();
-    xchacha.cipher = "xchacha20";
-    assert!(
-        client(&proxy(1, &xchacha, ("", "")))
-            .err()
-            .unwrap()
-            .is_unsupported()
-    );
-
     let mut obfs = base.clone();
     obfs.obfs = "nope";
     assert!(client(&proxy(1, &obfs, ("", ""))).is_err());
@@ -406,5 +399,62 @@ async fn mihomo_client_talks_to_the_loopback_server() {
             binary.clone(),
         )
         .await;
+    }
+}
+
+/// IV, then 300 bytes `i * 7` under the `ssr-test-password` key, from the ChaCha20 mihomo's
+/// stream ciphers call (`metacubex/chacha` v0.1.5 `NewChaCha20IgnoreCounterOverflow`).
+const CHACHA_KAT: &str = include_str!("tests/chacha-kat.txt");
+
+#[test]
+fn djb_chacha20_and_xchacha20_match_mihomo_on_the_wire() {
+    use super::stream::Layer as _;
+
+    let plain: Vec<u8> = (0..300u32).map(|i| (i * 7) as u8).collect();
+    for line in CHACHA_KAT.lines() {
+        let (iv_len, wire) = line.split_once(' ').unwrap();
+        let name = if iv_len == "8" {
+            "chacha20"
+        } else {
+            "xchacha20"
+        };
+        let wire = hex::decode(wire).unwrap();
+        let cipher = SsrCipher::pick(name, "ssr-test-password").unwrap();
+        assert_eq!(cipher.iv_len().to_string(), iv_len);
+
+        let mut packet = PacketBuf::from_slice(&wire);
+        cipher.open_packet(&mut packet).unwrap();
+        assert_eq!(packet.as_slice(), plain, "{name} datagram");
+
+        let mut layer = cipher.layer().unwrap();
+        let mut decoded = bytes::BytesMut::new();
+        let mut input = bytes::BytesMut::new();
+        for piece in wire.chunks(5) {
+            input.extend_from_slice(piece);
+            layer
+                .decode(&mut input, &mut decoded, &mut Vec::new())
+                .unwrap();
+        }
+        assert_eq!(&decoded[..], plain, "{name} stream");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs CONCORD_SSRCLIENT, a build of mihomo's own ssr client"]
+async fn legacy_chacha_streams_talk_to_mihomo_ssr_client() {
+    let binary = concord_test_support::peer("CONCORD_SSRCLIENT");
+    for cipher in ["chacha20", "xchacha20"] {
+        for protocol in PROTOCOLS {
+            go_client_against(
+                Combo {
+                    cipher,
+                    obfs: "plain",
+                    protocol,
+                },
+                ("", ""),
+                binary.clone(),
+            )
+            .await;
+        }
     }
 }

@@ -111,7 +111,7 @@ async fn run(
     let program = rig
         .runtime
         .compile("test.js", source.as_bytes())
-        .map_err(ScriptError)?;
+        .map_err(|err| ScriptError(err.0))?;
     tokio::time::timeout(Duration::from_secs(10), program.run(invocation))
         .await
         .expect("the script did not finish")
@@ -320,7 +320,7 @@ async fn failures_name_what_went_wrong() {
         assert!(err.0.contains(want), "{source}: {}", err.0);
     }
     let err = rig.runtime.compile("bad.js", b"function (").err().unwrap();
-    assert!(err.contains("SyntaxError"), "{err}");
+    assert!(err.0.contains("SyntaxError"), "{err}");
     assert!(
         run(&rig, "throw 1; $done({})", request_invocation())
             .await

@@ -270,6 +270,9 @@ pub(super) fn packet_pair(stream: ClientStream, with_addr: bool) -> (PacketReade
 impl PacketWriter {
     /// `to` is required on a [`SingMuxClient::listen_packet`] pair and ignored
     /// on a [`SingMuxClient::connect_udp`] pair.
+    ///
+    /// [`SingMuxClient::listen_packet`]: super::SingMuxClient::listen_packet
+    /// [`SingMuxClient::connect_udp`]: super::SingMuxClient::connect_udp
     pub async fn send(&mut self, payload: &[u8], to: Option<&Address>) -> io::Result<()> {
         let len = u16::try_from(payload.len()).map_err(|_| invalid("packet larger than 65535"))?;
         let mut frame = Vec::with_capacity(payload.len() + 24);

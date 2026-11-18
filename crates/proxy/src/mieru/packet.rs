@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use concord_common::addr::unmap;
 use concord_common::packet::{PacketSession, recv_packet, send_packet};
-use concord_common::{Address, PacketBuf};
+use concord_common::{Address, PacketBuf, Tasks};
 use rand::Rng;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -105,9 +105,14 @@ pub(super) struct PacketUnderlay {
     idle_limit: Duration,
     volume_limit: u64,
     bytes: AtomicU64,
+    pub(super) tasks: Tasks,
 }
 
 impl PacketUnderlay {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the carrier, its credentials, its limits and its owner, each given once"
+    )]
     pub(super) fn start(
         socket: impl Into<Carrier>,
         server: SocketAddr,
@@ -116,6 +121,7 @@ impl PacketUnderlay {
         pattern: Arc<Pattern>,
         mtu: usize,
         factor: usize,
+        tasks: &Tasks,
     ) -> Arc<PacketUnderlay> {
         let underlay = Arc::new_cyclic(|me| PacketUnderlay {
             me: me.clone(),
@@ -126,14 +132,15 @@ impl PacketUnderlay {
             user: user.to_string(),
             mtu,
             sessions: Mutex::new(HashMap::new()),
-            die: CancellationToken::new(),
+            die: tasks.child_token(),
             born: Instant::now(),
             last_used: Mutex::new(Instant::now()),
             idle_limit: IDLE_BASE + Duration::from_secs(rand::rng().random_range(0..61)),
             volume_limit: (512u64 << 20) << factor.min(8),
             bytes: AtomicU64::new(0),
+            tasks: tasks.clone(),
         });
-        tokio::spawn(read_loop(underlay.clone()));
+        tasks.spawn(read_loop(underlay.clone()));
         underlay
     }
 
@@ -380,7 +387,8 @@ impl Wire for PacketUnderlay {
         sessions.insert(id, Handle { inbound, out });
         drop(sessions);
         *lock(&self.last_used) = Instant::now();
-        tokio::spawn(Session::new(me, id, events, out_rx, inbound_rx).run());
+        self.tasks
+            .spawn(Session::new(me, id, events, out_rx, inbound_rx).run());
         Ok(events_rx)
     }
 
@@ -398,10 +406,8 @@ impl Wire for PacketUnderlay {
         else {
             return;
         };
-        if let Err(mpsc::error::TrySendError::Full(out)) = sender.try_send(out)
-            && let Ok(runtime) = tokio::runtime::Handle::try_current()
-        {
-            runtime.spawn(async move {
+        if let Err(mpsc::error::TrySendError::Full(out)) = sender.try_send(out) {
+            self.tasks.spawn_detached(async move {
                 let _ = sender.send(out).await;
             });
         }

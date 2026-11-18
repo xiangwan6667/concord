@@ -1,13 +1,16 @@
 //! Holds the published tree to what a reader outside the project can use. The docs state the current
 //! rule, choice or number: no commit hash of this repository, no date, and no pointer into the
 //! git-ignored `docs/private/` beyond one line in `AGENTS.md`. No tracked file outside `vendor/` names
-//! a home directory, and no tracked file that is not Rust source names a public IPv4 host outside the
-//! documentation ranges and the public resolvers. When `docs/private/public-tree-deny.txt` exists, the
-//! docs must not use the names it lists either.
+//! a home directory or the project's internal coordination (`internal_marks`), and no tracked file that
+//! is not Rust source names a public IPv4 host outside the documentation ranges and the public
+//! resolvers. When `docs/private/public-tree-deny.txt` exists, no such file uses the names it lists
+//! either.
 
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::process::{Command, Stdio};
+
+use crate::internal_marks;
 
 const DOC_FILES: &[&str] = &[
     "AGENTS.md",
@@ -23,7 +26,8 @@ const DENY_FILE: &str = "docs/private/public-tree-deny.txt";
 /// Years a dated note could carry; a date outside them is a spec example, such as `1900-01-01`.
 const HISTORY_YEARS: std::ops::RangeInclusive<u16> = 2020..=2039;
 const HOMES: &[&str] = &["/Users/", "/home/"];
-const SELF: &str = "xtask/src/public_tree.rs";
+/// The checks themselves, which spell out what they look for.
+const EXEMPT: &[&str] = &["xtask/src/public_tree.rs", "xtask/src/internal_marks.rs"];
 const PUBLIC_RESOLVERS: &[Ipv4Addr] = &[
     Ipv4Addr::new(1, 1, 1, 1),
     Ipv4Addr::new(1, 0, 0, 1),
@@ -68,16 +72,19 @@ pub(crate) fn check(root: &Path) -> Result<(), String> {
     let commits = concord_commits(root, &candidates);
     let deny = load_deny(root)?;
     for (path, text) in &docs {
-        problems.extend(doc_problems(path, text, &commits, &deny));
+        problems.extend(doc_problems(path, text, &commits));
     }
     for path in tracked(root) {
-        if path.starts_with("vendor/") || path.ends_with("Cargo.lock") || path == SELF {
+        if path.starts_with("vendor/")
+            || path.ends_with("Cargo.lock")
+            || EXEMPT.contains(&path.as_str())
+        {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(root.join(&path)) else {
             continue;
         };
-        problems.extend(file_problems(&path, &text));
+        problems.extend(file_problems(&path, &text, &deny));
     }
     if problems.is_empty() {
         Ok(())
@@ -86,7 +93,7 @@ pub(crate) fn check(root: &Path) -> Result<(), String> {
     }
 }
 
-/// A name the private deny list keeps out of the docs. A pattern ending in `_` or `-` matches a word
+/// A name the private deny list keeps out of the tree. A pattern ending in `_` or `-` matches a word
 /// that starts with it, one ending in `/` a path that starts with it, and any other a whole word.
 struct Deny {
     pattern: String,
@@ -101,7 +108,7 @@ impl Deny {
             });
         }
         let prefix = self.pattern.ends_with(['_', '-']);
-        words(line).any(|word| {
+        internal_marks::words(line).any(|word| {
             if prefix {
                 word.len() > self.pattern.len() && word.starts_with(self.pattern.as_str())
             } else {
@@ -138,7 +145,7 @@ fn load_deny(root: &Path) -> Result<Vec<Deny>, String> {
         .collect())
 }
 
-fn doc_problems(path: &str, text: &str, commits: &[String], deny: &[Deny]) -> Vec<String> {
+fn doc_problems(path: &str, text: &str, commits: &[String]) -> Vec<String> {
     let mut problems = Vec::new();
     let mut pointers = 0;
     for (index, line) in text.lines().enumerate() {
@@ -149,9 +156,6 @@ fn doc_problems(path: &str, text: &str, commits: &[String], deny: &[Deny]) -> Ve
                     "{at}: `{word}` is a Concord commit; state what it changed or measured"
                 ));
             }
-        }
-        for name in deny.iter().filter(|name| name.matches(line)) {
-            problems.push(format!("{at}: `{}` is {}", name.pattern, name.category));
         }
         if let Some(date) = date(line) {
             problems.push(format!(
@@ -170,11 +174,19 @@ fn doc_problems(path: &str, text: &str, commits: &[String], deny: &[Deny]) -> Ve
     problems
 }
 
-fn file_problems(path: &str, text: &str) -> Vec<String> {
+fn file_problems(path: &str, text: &str, deny: &[Deny]) -> Vec<String> {
     let mut problems = Vec::new();
     let is_rust = path.ends_with(".rs");
     for (index, line) in text.lines().enumerate() {
         let at = format!("{path}:{}", index + 1);
+        for (name, kind) in internal_marks::internal_marks(line) {
+            problems.push(format!(
+                "{at}: `{name}` is {kind}; say what it is, not where the project keeps it"
+            ));
+        }
+        for name in deny.iter().filter(|name| name.matches(line)) {
+            problems.push(format!("{at}: `{}` is {}", name.pattern, name.category));
+        }
         for home in HOMES {
             if line.contains(home) {
                 problems.push(format!(
@@ -194,12 +206,6 @@ fn file_problems(path: &str, text: &str) -> Vec<String> {
         }
     }
     problems
-}
-
-fn words(line: &str) -> impl Iterator<Item = &str> {
-    line.split(|c: char| !(c.is_ascii_alphanumeric() || "_-.".contains(c)))
-        .map(|word| word.trim_matches('.'))
-        .filter(|word| !word.is_empty())
 }
 
 fn hex_words(text: &str) -> impl Iterator<Item = &str> {
@@ -352,7 +358,11 @@ mod tests {
     }
 
     fn doc(path: &str, text: &str) -> Vec<String> {
-        doc_problems(path, text, &["abc1234".to_string()], &fake_deny())
+        doc_problems(path, text, &["abc1234".to_string()])
+    }
+
+    fn denied(line: &str) -> Vec<String> {
+        file_problems("crates/x/src/lib.rs", line, &fake_deny())
     }
 
     #[test]
@@ -397,6 +407,22 @@ mod tests {
     }
 
     #[test]
+    fn every_tracked_file_is_held_to_the_internal_names() {
+        for (line, kind) in internal_marks::tests::INTERNAL_LINES {
+            let found = file_problems("crates/x/src/lib.rs", line, &[]);
+            assert_eq!(found.len(), 1, "{line}: {found:?}");
+            assert!(found[0].contains(kind), "{line}: {found:?}");
+        }
+        for line in internal_marks::tests::PUBLIC_LINES {
+            assert_eq!(
+                file_problems("crates/x/src/lib.rs", line, &[]),
+                Vec::<String>::new(),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
     fn the_private_deny_list_reports_its_names_by_category() {
         for (line, category) in [
             ("`zzq_rec_land_2`", "an internal run name"),
@@ -406,7 +432,7 @@ mod tests {
             ("the `zzq-ledger.md` entry", "a private name"),
             ("see ZZQPLAN-T-TUN.md", "a coordination file"),
         ] {
-            let found = doc("x.md", line);
+            let found = denied(line);
             assert_eq!(found.len(), 1, "{line}");
             assert!(found[0].ends_with(category), "{line}: {found:?}");
         }
@@ -417,7 +443,7 @@ mod tests {
             "`zzqx_run`",
             "ZZQPLAN-",
         ] {
-            assert_eq!(doc("x.md", line), Vec::<String>::new(), "{line}");
+            assert_eq!(denied(line), Vec::<String>::new(), "{line}");
         }
     }
 
@@ -429,9 +455,9 @@ mod tests {
 
     #[test]
     fn home_directories_are_reported_everywhere() {
-        assert!(!file_problems("a.rs", "let p = \"/Users/someone/x\";").is_empty());
-        assert!(!file_problems("ci.yaml", "cd /home/someone").is_empty());
-        assert!(file_problems("ci.yaml", "cd $HOME/x").is_empty());
+        assert!(!file_problems("a.rs", "let p = \"/Users/someone/x\";", &[]).is_empty());
+        assert!(!file_problems("ci.yaml", "cd /home/someone", &[]).is_empty());
+        assert!(file_problems("ci.yaml", "cd $HOME/x", &[]).is_empty());
     }
 
     #[test]
@@ -444,9 +470,13 @@ mod tests {
             "10.0.0.2 127.0.0.1 100.64.0.1 0.0.0.0",
             "build 10.0.26300.9818, v1.19.33.1",
         ] {
-            assert_eq!(file_problems("c.yaml", ok), Vec::<String>::new(), "{ok}");
+            assert_eq!(
+                file_problems("c.yaml", ok, &[]),
+                Vec::<String>::new(),
+                "{ok}"
+            );
         }
-        assert!(file_problems("c.yaml", "server: 45.77.10.3")[0].contains("public host"));
-        assert!(file_problems("a.rs", "server: 45.77.10.3").is_empty());
+        assert!(file_problems("c.yaml", "server: 45.77.10.3", &[])[0].contains("public host"));
+        assert!(file_problems("a.rs", "server: 45.77.10.3", &[]).is_empty());
     }
 }

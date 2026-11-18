@@ -1,9 +1,7 @@
 //! A connection whose bytes the stack moves to and from an outbound socket itself, so no
 //! relay task sits between them.
 
-#[cfg(not(target_os = "linux"))]
-use std::io::Write;
-use std::io::{self, IoSlice, IoSliceMut, Read};
+use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::net::Shutdown;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -11,8 +9,8 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use concord_common::sync::lock;
 use concord_common::{Attached, OwnedTcp};
+use concord_platform::{TRY_SEND_VECTORED, try_send_vectored};
 use futures_util::task::AtomicWaker;
-#[cfg(target_os = "linux")]
 use tokio::net::TcpStream;
 
 use crate::buffer::ChunkPool;
@@ -25,22 +23,16 @@ const SLICES: usize = 8;
 fn try_write(socket: &Socket, parts: &[IoSlice<'_>]) -> io::Result<usize> {
     match socket {
         Socket::Owned { stream, ready, .. } => ready.try_write(|| {
-            #[cfg(target_os = "linux")]
-            {
-                concord_platform::try_send_vectored(stream.as_ref(), parts)
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
+            if TRY_SEND_VECTORED {
+                try_send_vectored(stream.as_ref(), parts)
+            } else {
                 (&**stream).write_vectored(parts)
             }
         }),
         Socket::Tokio(socket) => {
-            #[cfg(target_os = "linux")]
-            {
-                concord_platform::try_send_vectored(socket.stream(), parts)
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
+            if TRY_SEND_VECTORED {
+                try_send_vectored(socket.stream(), parts)
+            } else {
                 socket.try_write_vectored(parts)
             }
         }
@@ -71,10 +63,13 @@ impl Socket {
                 _guard: guard,
             });
         }
-        #[cfg(target_os = "linux")]
-        let socket = {
+        // Moved to this runtime's reactor, the socket has no readiness yet; only a write that
+        // skips readiness can use it at once.
+        let socket = if TRY_SEND_VECTORED {
             let duplicate = socket2::SockRef::from(socket.stream()).try_clone()?;
             socket.share_guard(TcpStream::from_std(duplicate.into())?)
+        } else {
+            socket
         };
         Ok(Self::Tokio(socket))
     }
@@ -119,17 +114,7 @@ impl Socket {
     fn send_space(&self) -> Option<usize> {
         match self {
             Self::Tokio(socket) => concord_platform::send_space(socket.stream()),
-            Self::Owned { stream, .. } => {
-                #[cfg(any(target_os = "linux", target_os = "android"))]
-                {
-                    concord_platform::send_space(stream.as_ref())
-                }
-                #[cfg(not(any(target_os = "linux", target_os = "android")))]
-                {
-                    let _ = stream;
-                    None
-                }
-            }
+            Self::Owned { stream, .. } => concord_platform::send_space(stream.as_ref()),
         }
     }
 }

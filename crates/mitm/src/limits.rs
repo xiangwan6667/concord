@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use concord_common::sync::lock;
-use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub(crate) const DEFAULT_MAX_BODY_SIZE: i64 = 4 << 20;
@@ -19,30 +18,7 @@ const PRESSURE_HOLD: Duration = Duration::from_secs(60);
 
 pub(crate) const BODY_WAIT: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", default)]
-pub struct RawLimits {
-    #[serde(skip_serializing_if = "is_zero")]
-    pub max_body_size: i64,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub body_buffer: i64,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub certificate_cache: i64,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub max_sessions: i64,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub script_concurrency: i64,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub script_memory: i64,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub capture_entries: i64,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub capture_bytes: i64,
-}
-
-fn is_zero(value: &i64) -> bool {
-    *value == 0
-}
+pub use concord_config::mitm::MitmLimits as RawLimits;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -56,8 +32,13 @@ pub struct Limits {
     pub capture_bytes: i64,
 }
 
-impl RawLimits {
-    pub fn resolve(self) -> Limits {
+/// The limits in force for those written, each default standing in for one left out.
+pub trait Resolve {
+    fn resolve(self) -> Limits;
+}
+
+impl Resolve for RawLimits {
+    fn resolve(self) -> Limits {
         let positive = |value: i64, default: i64| if value <= 0 { default } else { value };
         let max_body_size = positive(self.max_body_size, DEFAULT_MAX_BODY_SIZE);
         let body_buffer = positive(self.body_buffer, DEFAULT_BODY_BUFFER).max(max_body_size);

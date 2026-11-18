@@ -159,6 +159,7 @@ pub fn merge_document(
     if !no_rules(added.as_ref()) {
         merged.lines.rules.clear();
     }
+    merged.lines.mitm = overlay.lines.mitm;
     let rules = match (merged.rules.take(), merged.root.remove("rules")) {
         (Some(lines), _) => Some(rules_after(added, lines)?),
         (None, Some(value)) => {

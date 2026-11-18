@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 
-use aes::Aes128;
+use aes_cfb::Aes128;
 use concord_common::stream_buffer::{self, BufferRequirements, OwnedDrain, StreamBuffer};
 use concord_common::{Address, BoxRead, BoxStream, BoxWrite, Stream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};

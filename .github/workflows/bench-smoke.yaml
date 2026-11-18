@@ -1,0 +1,39 @@
+name: bench-smoke
+
+# Proves the bench harness still runs end to end: one short round of the quick tier against mihomo. A hosted runner
+# is noisy and shared, so no number from this run is read or compared (`.agents/performance.md`, How To Measure).
+on:
+  schedule:
+    - cron: "17 7 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: Bench smoke
+    if: ${{ !github.event.repository.fork }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Fetch mihomo
+        uses: ./.github/actions/mihomo
+
+      - name: Run the quick tier once
+        run: >-
+          cargo xtask bench --quick --no-baseline --mihomo "$CONCORD_MIHOMO"
+          --rounds 1 --secs 1 --crr-conns 100

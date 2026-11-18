@@ -27,7 +27,7 @@ impl Tcb {
         }
     }
 
-    fn segment_options(&mut self, now: u64, syn: bool) -> TcpOptions {
+    fn segment_options(&mut self, now: u64, syn: bool, payload: usize) -> TcpOptions {
         let mut options = TcpOptions::default();
         if syn {
             options.mss = Some(mss_for(self.config.mtu, self.remote).min(65_535) as u16);
@@ -60,6 +60,10 @@ impl Tcb {
             }
             options.sack_len = blocks.len().min(limit) as u8;
             self.sack_scratch = blocks;
+            let fixed = self.ip_header() + TCP_HEADER + payload;
+            while options.sack_len > 0 && fixed + options_len(&options) > self.config.mtu {
+                options.sack_len -= 1;
+            }
         }
         options
     }
@@ -88,7 +92,11 @@ impl Tcb {
         segment: u32,
     ) -> bool {
         let syn = flags & FLAG_SYN != 0;
-        let options = self.segment_options(now, syn);
+        let per_packet = match segment as usize {
+            0 => payload,
+            segment => payload.min(segment),
+        };
+        let options = self.segment_options(now, syn, per_packet);
         let window = if syn {
             let window = self.rcv_cap.min(65_535);
             if self.state == State::SynReceived {
@@ -162,12 +170,16 @@ impl Tcb {
         self.last_send = now;
     }
 
-    pub(super) fn payload_room(&self, sack_blocks: usize) -> u32 {
-        let ip = if self.remote.is_ipv4() {
+    fn ip_header(&self) -> usize {
+        if self.remote.is_ipv4() {
             IPV4_HEADER
         } else {
             IPV6_HEADER
-        };
+        }
+    }
+
+    pub(super) fn payload_room(&self, sack_blocks: usize) -> u32 {
+        let ip = self.ip_header();
         let mut options = TcpOptions::default();
         if self.ts_ok {
             options.timestamp = Some((0, 0));
@@ -235,10 +247,7 @@ impl Tcb {
         } else {
             self.snd_nxt
         };
-        if self.ack_now && !self.emit(egress, state, ack_seq, 0, FLAG_ACK, now) {
-            return false;
-        }
-        true
+        !self.ack_now || self.emit(egress, state, ack_seq, 0, FLAG_ACK, now)
     }
 
     fn retransmit_lost(&mut self, now: u64, state: &SharedState, egress: &mut dyn Egress) -> bool {

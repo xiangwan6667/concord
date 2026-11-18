@@ -1,5 +1,11 @@
 mod bench;
+mod commits;
+#[cfg(test)]
+mod doc_paths;
+mod internal_marks;
+mod interop_peers;
 mod layers;
+mod mihomo_keys;
 #[cfg(test)]
 mod public_tree;
 #[cfg(test)]
@@ -10,6 +16,8 @@ mod schema;
 mod size;
 #[cfg(test)]
 mod stream_policy;
+#[cfg(test)]
+mod task_owner;
 #[cfg(test)]
 mod tunables;
 #[cfg(test)]
@@ -26,8 +34,12 @@ fn main() -> ExitCode {
         Some("schema") => schema::run(args.next().as_deref() == Some("--check")),
         Some("check-size") => size::check(args.next().as_deref(), args.next().as_deref()),
         Some("bench") => bench::run(args.collect()),
+        Some("check-commits") => commits::check(&args.collect::<Vec<_>>()),
+        Some("mihomo-keys") => mihomo_keys::run(args.next().as_deref()),
+        Some("check-interop-peers") => interop_peers::check(),
         _ => Err(
             "usage: xtask check-layers | schema [--check] | check-size <file> <max-bytes> \
+             | check-commits <git log revisions> | mihomo-keys <mihomo checkout> | check-interop-peers \
              | bench [--quick|--full] [--base <rev>|--no-baseline] [--mihomo <path>] [concord-bench run options]"
                 .to_string(),
         ),

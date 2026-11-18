@@ -11,7 +11,8 @@ use tokio::sync::OwnedSemaphorePermit;
 
 use crate::body::{Body, Tap, empty, from_incoming, full};
 use crate::capture::Cap;
-use crate::headers::{remove_hop_by_hop, text, to_list, with_host};
+use crate::headers::{remove_hop_by_hop, request_head, text, to_list, version_text, with_host};
+use crate::heads::Heads;
 use crate::rules::{UrlAction, tiny_gif};
 use crate::session::{ActivityGuard, Session};
 use crate::target::{TargetUrl, default_port};
@@ -56,6 +57,8 @@ pub(crate) struct Target {
     pub rewritten: bool,
     /// An upgrade, a WebSocket, which HTTP/2 cannot carry upstream.
     pub http1: bool,
+    /// The version the client spoke, as a head's first line writes it.
+    pub version: &'static str,
     pub id: String,
     pub answer: Option<Answer>,
     pub abort: bool,
@@ -114,16 +117,6 @@ pub(crate) fn new_request_id() -> String {
     let mut id = [0u8; 8];
     rand::rng().fill_bytes(&mut id);
     hex::encode(id)
-}
-
-fn version_text(version: Version) -> &'static str {
-    match version {
-        Version::HTTP_09 => "HTTP/0.9",
-        Version::HTTP_10 => "HTTP/1.0",
-        Version::HTTP_2 => "HTTP/2.0",
-        Version::HTTP_3 => "HTTP/3.0",
-        _ => "HTTP/1.1",
-    }
 }
 
 pub(crate) fn has_response_body(method: &Method, status: StatusCode) -> bool {
@@ -201,6 +194,67 @@ impl Session {
         }
     }
 
+    /// The answer a URL rewrite or Map Local gives in place of the server's, or `None` when
+    /// the request goes on, perhaps to the URL a rewrite moved it to.
+    fn answer_locally(
+        &self,
+        heads: &Heads<'_>,
+        target: &mut Target,
+    ) -> Option<(StatusCode, HeaderMap, Vec<u8>)> {
+        let rules = &self.core.config.rules;
+        if let Some((rule, replaced)) = rules.rewrite_url(&target.url.raw, heads) {
+            match rule.action {
+                UrlAction::Redirect302 | UrlAction::Redirect307 => {
+                    target.cap.note("url-rewrite", "", rule.action.name());
+                    self.answered(target, ANSWER_REDIRECT);
+                    tracing::info!(
+                        "[MITM] {} {} --> {replaced}",
+                        rule.action.name(),
+                        target.url.raw
+                    );
+                    let mut headers = HeaderMap::new();
+                    if let Ok(location) = HeaderValue::from_str(&replaced) {
+                        headers.insert(LOCATION, location);
+                    }
+                    let status = if rule.action == UrlAction::Redirect307 {
+                        StatusCode::TEMPORARY_REDIRECT
+                    } else {
+                        StatusCode::FOUND
+                    };
+                    return Some((status, headers, Vec::new()));
+                }
+                UrlAction::Header => match TargetUrl::parse_http(&replaced) {
+                    Some(rewritten) => {
+                        target.cap.note("url-rewrite", "", rule.action.name());
+                        tracing::info!("[MITM] rewrite {} --> {}", target.url.raw, rewritten.raw);
+                        target.url = rewritten;
+                        target.rewritten = true;
+                    }
+                    None => tracing::warn!(
+                        "[MITM] rewrite of {} gave {replaced:?}, which is not an http or https URL",
+                        target.url.raw
+                    ),
+                },
+                action => {
+                    target.cap.note("url-rewrite", "", action.name());
+                    self.answered(target, ANSWER_REJECT);
+                    tracing::info!("[MITM] {} {}", action.name(), target.url.raw);
+                    let (status, content_type, data) = reject_response(action);
+                    let mut headers = HeaderMap::new();
+                    if let Some(content_type) = content_type {
+                        headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+                    }
+                    return Some((status, headers, data));
+                }
+            }
+        }
+        let rule = rules.map_local(&target.url.raw, heads)?;
+        target.cap.note("map-local", "", "");
+        self.answered(target, ANSWER_MAP_LOCAL);
+        tracing::info!("[MITM] map local {}", target.url.raw);
+        Some((rule.status, rule.header.clone(), rule.body.clone()))
+    }
+
     pub(crate) async fn handle(
         self: Arc<Self>,
         mut request: Request<Incoming>,
@@ -243,71 +297,20 @@ impl Session {
             url,
             rewritten: false,
             http1: upgrading,
+            version: version_text(parts.version),
             id: String::new(),
             answer: None,
             abort: false,
             reserved: Vec::new(),
             cap: cap.clone(),
         };
+        let head = || request_head(&parts, &in_host, version_text(parts.version));
+        if let Some((status, headers, data)) =
+            self.answer_locally(&Heads::new(Some(&head), None), &mut target)
+        {
+            return Ok(local(&cap, status, headers, data, guard));
+        }
         let rules = &self.core.config.rules;
-        if let Some((rule, replaced)) = rules.rewrite_url(&target.url.raw) {
-            match rule.action {
-                UrlAction::Redirect302 | UrlAction::Redirect307 => {
-                    cap.note("url-rewrite", "", rule.action.name());
-                    self.answered(&target, ANSWER_REDIRECT);
-                    tracing::info!(
-                        "[MITM] {} {} --> {replaced}",
-                        rule.action.name(),
-                        target.url.raw
-                    );
-                    let mut headers = HeaderMap::new();
-                    if let Ok(location) = HeaderValue::from_str(&replaced) {
-                        headers.insert(LOCATION, location);
-                    }
-                    let status = if rule.action == UrlAction::Redirect307 {
-                        StatusCode::TEMPORARY_REDIRECT
-                    } else {
-                        StatusCode::FOUND
-                    };
-                    return Ok(local(&cap, status, headers, Vec::new(), guard));
-                }
-                UrlAction::Header => match TargetUrl::parse_http(&replaced) {
-                    Some(rewritten) => {
-                        cap.note("url-rewrite", "", rule.action.name());
-                        tracing::info!("[MITM] rewrite {} --> {}", target.url.raw, rewritten.raw);
-                        target.url = rewritten;
-                        target.rewritten = true;
-                    }
-                    None => tracing::warn!(
-                        "[MITM] rewrite of {} gave {replaced:?}, which is not an http or https URL",
-                        target.url.raw
-                    ),
-                },
-                action => {
-                    cap.note("url-rewrite", "", action.name());
-                    self.answered(&target, ANSWER_REJECT);
-                    tracing::info!("[MITM] {} {}", action.name(), target.url.raw);
-                    let (status, content_type, data) = reject_response(action);
-                    let mut headers = HeaderMap::new();
-                    if let Some(content_type) = content_type {
-                        headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
-                    }
-                    return Ok(local(&cap, status, headers, data, guard));
-                }
-            }
-        }
-        if let Some(rule) = rules.map_local(&target.url.raw) {
-            cap.note("map-local", "", "");
-            self.answered(&target, ANSWER_MAP_LOCAL);
-            tracing::info!("[MITM] map local {}", target.url.raw);
-            return Ok(local(
-                &cap,
-                rule.status,
-                rule.header.clone(),
-                rule.body.clone(),
-                guard,
-            ));
-        }
         if !rules.scripts.is_empty() {
             target.id = new_request_id();
         }

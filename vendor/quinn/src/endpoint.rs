@@ -39,6 +39,8 @@ use crate::{
     connection::Connecting, incoming::Incoming, work_limiter::WorkLimiter,
 };
 
+mod recv_buffer;
+
 /// A QUIC endpoint.
 ///
 /// An endpoint corresponds to a single UDP socket, may host many connections, and may act as both
@@ -739,7 +741,7 @@ impl std::ops::Deref for EndpointRef {
 struct RecvState {
     incoming: VecDeque<proto::Incoming>,
     connections: ConnectionSet,
-    recv_buf: Box<[u8]>,
+    recv_buf_len: usize,
     recv_limiter: WorkLimiter,
 }
 
@@ -749,12 +751,10 @@ impl RecvState {
         max_receive_segments: usize,
         endpoint: &proto::Endpoint,
     ) -> Self {
-        let recv_buf = vec![
-            0;
-            endpoint.config().get_max_udp_payload_size().min(64 * 1024) as usize
-                * max_receive_segments
-                * BATCH_SIZE
-        ];
+        // Concord: borrow this full-capacity scratch only while polling, not for endpoint lifetime.
+        let recv_buf_len = endpoint.config().get_max_udp_payload_size().min(64 * 1024) as usize
+            * max_receive_segments
+            * BATCH_SIZE;
         Self {
             connections: ConnectionSet {
                 senders: FxHashMap::default(),
@@ -762,7 +762,7 @@ impl RecvState {
                 close: None,
             },
             incoming: VecDeque::new(),
-            recv_buf: recv_buf.into(),
+            recv_buf_len,
             recv_limiter: WorkLimiter::new(RECV_TIME_BOUND),
         }
     }
@@ -776,13 +776,13 @@ impl RecvState {
     ) -> Result<PollProgress, io::Error> {
         let mut received_connection_packet = false;
         let mut metas = [RecvMeta::default(); BATCH_SIZE];
+        let mut recv_buf = recv_buffer::get(self.recv_buf_len);
         let mut iovs: [IoSliceMut; BATCH_SIZE] = {
-            let mut bufs = self
-                .recv_buf
-                .chunks_mut(self.recv_buf.len() / BATCH_SIZE)
+            let mut bufs = recv_buf
+                .chunks_mut(self.recv_buf_len / BATCH_SIZE)
                 .map(IoSliceMut::new);
 
-            // expect() safe as self.recv_buf is chunked into BATCH_SIZE items
+            // expect() safe as recv_buf is chunked into BATCH_SIZE items
             // and iovs will be of size BATCH_SIZE, thus from_fn is called
             // exactly BATCH_SIZE times.
             std::array::from_fn(|_| bufs.next().expect("BATCH_SIZE elements"))
@@ -864,7 +864,6 @@ impl fmt::Debug for RecvState {
         f.debug_struct("RecvState")
             .field("incoming", &self.incoming)
             .field("connections", &self.connections)
-            // recv_buf too large
             .field("recv_limiter", &self.recv_limiter)
             .finish_non_exhaustive()
     }

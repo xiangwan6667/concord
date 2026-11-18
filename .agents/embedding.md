@@ -39,19 +39,45 @@ glue, its class names and attaching core threads to the JVM are the host's. `bin
 Callbacks may run on any core thread; a `release` callback runs once the core lets go of its context. The doc comments
 on the exported functions are the contract.
 
+### Privileged TUN
+
+A host that keeps the core in its unprivileged app process can still have a TUN device without Android's
+`VpnService`: a root helper process loads the same `libconcord.so`, calls these without `concord_start`, and passes
+the descriptor to the app, which hands it to the core with `concord_adopt_fd`.
+
+| Function | Purpose |
+|---|---|
+| `concord_tun_provision(request, len, fd, error, capacity)` | Open a TUN device, give it the request's MTU and addresses and install sing-tun's Android policy routing (`route::plan_android`, plus an IPv6 rule for the unspecified source that sing-tun lacks there): routes in table 2022, rules from priority 9000, ahead of netd's. Local port 53 in both families, IPv6 included when the request has no IPv6 address, goes to table 2023, which holds only a default route to the device: system resolvers on the LAN or on IPv6 would otherwise miss a `routeAddress` that leaves private ranges out, and the core would never see the queries. sing-tun means the same with `not dport 53 lookup main suppress_prefixlength 0`, which it skips on Android: there each network routes from its own table, chosen by fwmark, and `main` is nearly empty, so a rule against `main` keeps nothing. Without an IPv6 address only IPv6 port 53 enters the device, as a `VpnService` takes every system query; sing-tun instead blocks IPv6 with `unreachable` under `strictRoute` and leaves it off the device otherwise. Writes the descriptor to `fd` and keeps no copy; returns a handle, or 0 with the reason in `error` as a NUL-terminated string cut to fit `capacity`. Rules a crashed run left in the priority range are removed first |
+| `concord_tun_release(handle)` | Remove the routes and rules, then the device once no process holds it; returns how many steps failed, -1 for an unknown handle |
+| `concord_tun_clean_stale()` | Remove the rules a provision left in the default priority range, and the routes in tables 2022 and 2023, when its process was killed before its release; returns how many, -1 on failure |
+| `concord_socket_uid(protocol, source)` | The uid owning the local TCP (6) or UDP (17) socket at `host:port`, from sock_diag or `/proc/net`; -1 when none. Stands in for `getConnectionOwnerUid`, which answers only the VPN owner |
+
+The request is camelCase JSON: `mtu`, `inet4Address` and optionally `device`, `inet6Address`, `routeAddress`,
+`routeExcludeAddress`, `strictRoute`, `includeUid`, `excludeUid`, `includePackage`, `excludePackage`. Packages are
+read from `/data/system/packages.list` and expanded to every user in `/data/user`, as sing-tun's `include-package`;
+a request whose included packages are all missing is refused. Rules left by a killed helper are inert once the device is gone: the
+tables they point to are empty, so lookups fall through to netd's rules. The exception is `strictRoute` with one address family
+missing, whose `unreachable` rule for that family keeps blocking it until the next provision or `concord_tun_clean_stale`. The app's own uid belongs in `excludeUid`: its core's
+sockets are not protected by a `VpnService`, so that rule is what keeps them off the device.
+
 ## Session
 
-A host sends `core.hello` (version and capabilities) and `core.init` (its home directory, and the SDK level on
-Android), applies a profile with `config.apply`, and opens listeners and TUN with `engine.start`. Streams (`traffic`, `connection`, `log`, `dns`,
-`route`, `events`, `proxy`) are opened with a `*.watch` call and paced by the host's credit; each declares one policy
-(`latest`, `drop_oldest`, `resync`) and never blocks core work. Engine state and the route counters are the Core's;
-the host keeps no shadow copy.
+A host sends `core.hello` (version and capabilities) and `core.init` (its home directory, and the SDK level on Android),
+applies a profile with `config.apply`, and opens listeners and TUN with `engine.start`. Streams (`traffic`,
+`connection`, `log`, `dns`, `route`, `events`, `proxy`) are opened with a `*.watch` call and paced by the host's credit;
+each declares one policy (`latest`, `drop_oldest`, `resync`) and never blocks core work. The `log` stream's lowest level
+is `debug`: release builds of `concord` and `libconcord.so` compile out `trace` records, Concord's and its dependencies'
+(`tracing` and `log` with `release_max_level_debug`), and other builds send them as `debug`. Engine state and the route
+counters are the Core's; the host keeps no shadow copy.
 
 ## External Controller And State Sync
 
-`config.patch` with `externalController` (and `secret`) opens mihomo's REST API at that address through
-`concord-controller`; an empty address closes it, and a change moves it, ending the sessions on the old address. The
-profile's `external-controller` and `secret` are ignored while a host drives the core (`host_owned_key` warning).
+`config.patch` with `externalController` (and `secret`) opens the Clash REST API at that address through
+`concord-controller`; an empty address closes it, and a change moves it, ending the sessions on the old address.
+`externalControllerCors` (`allowOrigins`, `allowPrivateNetwork`) says which browser origins may call it; an absent
+field takes mihomo's default (every origin, private network allowed), and `allowOrigins: []` refuses every
+cross-origin request, which a profile cannot ask for. The profile's `external-controller`, `secret` and
+`external-controller-cors` are ignored while a host drives the core (`host_owned_key` warning).
 
 A dashboard may change what the host keeps: a group's pick (`PUT /proxies/:name`, `DELETE` to clear a fixed pick)
 and the general settings `PATCH /configs` reaches (`mode`, `log-level`, `ipv6`, `allow-lan`, `mixed-port`,

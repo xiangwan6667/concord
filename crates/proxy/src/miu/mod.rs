@@ -106,7 +106,7 @@ impl Outbound for Miu {
         hint: &Address,
     ) -> io::Result<Arc<dyn PacketSession>> {
         let stream = self.open(cx, &uot::destination(2), true).await?;
-        uot::session(stream, 2, hint)
+        uot::session(stream, 2, hint, self.link.tasks())
     }
 
     fn reset_sessions(&self) {
@@ -132,7 +132,7 @@ pub(crate) fn build(
         ),
         link: Arc::new(link),
         token,
-        pool: Pool::new(opts.idle_session_timeout, padding),
+        pool: Pool::new(opts.idle_session_timeout, padding, ctx.tasks.clone()),
         min_idle: if opts.min_idle_session == 0 {
             2
         } else {

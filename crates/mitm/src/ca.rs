@@ -391,23 +391,9 @@ pub fn generate_ca(home: &HomeDir) -> Result<Ca, CaError> {
     let cert_pem = certificate.pem();
     let key_pem = key.serialize_pem();
     home.create_dir_all(AUTHORITY_DIR)?;
-    home.write_atomic_with(authority_path(KEY_FILE_NAME), |file| {
-        restrict_to_owner(file)?;
-        io::Write::write_all(file, key_pem.as_bytes())
-    })?;
+    home.write_private(authority_path(KEY_FILE_NAME), key_pem.as_bytes())?;
     home.write_atomic(authority_path(CERT_FILE_NAME), cert_pem.as_bytes())?;
     parse_ca(&cert_pem, &key_pem)
-}
-
-#[cfg(unix)]
-pub(crate) fn restrict_to_owner(file: &std::fs::File) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-pub(crate) fn restrict_to_owner(_file: &std::fs::File) -> io::Result<()> {
-    Ok(())
 }
 
 struct AuthorityState {
@@ -548,7 +534,7 @@ mod tests {
 
     #[test]
     fn a_generated_ca_reloads_and_keeps_its_key_private() {
-        #[cfg_attr(not(unix), allow(unused_variables))]
+        #[cfg_attr(not(unix), allow(unused_variables, reason = "Unix mode check"))]
         let (dir, home) = home();
         let ca = generate_ca(&home).unwrap();
         let loaded = load_ca(&home).unwrap();

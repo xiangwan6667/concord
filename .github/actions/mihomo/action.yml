@@ -1,0 +1,39 @@
+name: mihomo
+description: >-
+  Fetches the mihomo release `.agents/reference-choices.md` names as the CI peer, pinned by hash per architecture,
+  and sets CONCORD_MIHOMO to it.
+
+runs:
+  using: composite
+  steps:
+    - name: Cache mihomo
+      id: cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/mihomo-dl
+        key: mihomo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/actions/mihomo/action.yml') }}
+
+    - name: Fetch mihomo
+      shell: bash
+      env:
+        MIHOMO_VERSION: v1.19.34
+        MIHOMO_SHA256_X64: 0c07340a01408d033dda4088ea2a4c1e4d82aeed7b2f84f7c046e93b6ff3290c
+        MIHOMO_SHA256_ARM64: daaf78a6240a282cdfd75bcbf98fe321f6bd52765cc29e79f344191198f0b50f
+      run: |
+        case "$(uname -m)" in
+          x86_64) asset=mihomo-linux-amd64-v1-$MIHOMO_VERSION.gz sum=$MIHOMO_SHA256_X64 ;;
+          aarch64) asset=mihomo-linux-arm64-$MIHOMO_VERSION.gz sum=$MIHOMO_SHA256_ARM64 ;;
+          *) echo "no pinned mihomo for $(uname -m)" >&2; exit 1 ;;
+        esac
+        download=$RUNNER_TEMP/mihomo-dl/$asset
+        if [ ! -f "$download" ]; then
+          mkdir -p "$RUNNER_TEMP/mihomo-dl"
+          curl -fsSL --retry 3 -o "$download" \
+            "https://github.com/MetaCubeX/mihomo/releases/download/$MIHOMO_VERSION/$asset"
+        fi
+        echo "$sum  $download" | sha256sum -c -
+        peer=$RUNNER_TEMP/mihomo
+        gunzip -c "$download" > "$peer"
+        chmod +x "$peer"
+        "$peer" -v
+        echo "CONCORD_MIHOMO=$peer" >> "$GITHUB_ENV"

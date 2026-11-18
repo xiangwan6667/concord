@@ -7,7 +7,7 @@ use concord_common::{
     CoreError, FindProcessMode, Initiator, IpVersion, LookupIps, Network, Outbound, TunnelMode,
 };
 use concord_group::{Resolved, Touch};
-use concord_rules::{MatchCtx, Step};
+use concord_rules::{MatchCtx, RuleInfo, Step};
 use rand::seq::IndexedRandom;
 use tokio::time::timeout;
 
@@ -47,6 +47,7 @@ impl Decision {
                 exit_group,
                 rule,
             }),
+            Resolved::Rematch(leaf) => Ok(rematch_decision(target, leaf, rule)),
             Resolved::Rejected(reason) => Err(CoreError::Rejected(reason.to_string()).into()),
             Resolved::Pass | Resolved::PassRule | Resolved::Unknown => {
                 Err(CoreError::UnknownNode(target.to_string()).into())
@@ -176,12 +177,25 @@ pub(crate) async fn route(
         TunnelMode::Rule => {}
     }
 
+    match_rules(flow, runtime, touch, host_key).await
+}
+
+async fn match_rules(
+    flow: &mut FlowState,
+    runtime: &Runtime,
+    touch: Touch,
+    host_key: Option<&str>,
+) -> io::Result<Decision> {
     let ctx = MatchCtx {
         geo: &runtime.geo,
         dscp: flow.dscp,
     };
     let mut state = flow.route_state();
     let mut run = runtime.program.start();
+    if state.special_rules.is_some() {
+        run.restart(state.special_rules.as_deref());
+    }
+    let mut rematch_chain = Vec::new();
     loop {
         match run.step(&flow.meta, &state, &ctx) {
             Step::Done => {
@@ -206,6 +220,19 @@ pub(crate) async fn route(
                     .outbounds
                     .resolve(target, &flow.meta, host_key, Touch::No);
                 let (target, candidate) = match candidate {
+                    Resolved::Rematch(leaf) => {
+                        if rematch(flow, &mut state, leaf.as_ref(), &mut rematch_chain) {
+                            run.restart(state.special_rules.as_deref());
+                            continue;
+                        }
+                        flow.observed = run.take_observed();
+                        let name = leaf.info().name.clone();
+                        return Ok(rematch_decision(
+                            &name,
+                            leaf,
+                            Some(matched_rule(runtime.program.rule_at(rule))),
+                        ));
+                    }
                     Resolved::Unknown | Resolved::Pass => {
                         run.skip();
                         continue;
@@ -235,14 +262,62 @@ pub(crate) async fn route(
                     candidate
                 };
                 flow.observed = run.take_observed();
-                let info = runtime.program.rule_at(rule);
-                let matched = MatchedRule {
-                    type_name: Arc::from(info.type_name),
-                    payload: Arc::from(info.payload),
-                };
+                let matched = matched_rule(runtime.program.rule_at(rule));
                 return Decision::of(target, resolved, Some(matched));
             }
         }
+    }
+}
+
+fn matched_rule(info: RuleInfo<'_>) -> MatchedRule {
+    MatchedRule {
+        type_name: Arc::from(info.type_name),
+        payload: Arc::from(info.payload),
+    }
+}
+
+fn rematch_decision(target: &str, leaf: Arc<dyn Outbound>, rule: Option<MatchedRule>) -> Decision {
+    let name = leaf.info().name.clone();
+    Decision {
+        target: target.to_string(),
+        provider_chain: vec![
+            leaf.info()
+                .provider
+                .clone()
+                .unwrap_or_else(|| Arc::from("")),
+        ]
+        .into(),
+        leaf,
+        chain: vec![name].into(),
+        exit_group: None,
+        rule,
+    }
+}
+
+fn rematch(
+    flow: &mut FlowState,
+    state: &mut concord_common::RouteState,
+    leaf: &dyn Outbound,
+    chain: &mut Vec<Arc<str>>,
+) -> bool {
+    let Some(update) = leaf.rematch() else {
+        return false;
+    };
+    let cycle = chain.contains(&leaf.info().name);
+    if let Some(name) = &update.name {
+        state.rematch_name = Some(name.clone());
+        flow.rematch_name = Some(name.clone());
+    }
+    if let Some(sub_rule) = &update.sub_rule {
+        state.special_rules = Some(sub_rule.clone());
+        flow.special_rules = Some(sub_rule.clone());
+    }
+    if cycle {
+        tracing::warn!("[Rule] rematch cycle detected on {}", leaf.info().name);
+        false
+    } else {
+        chain.push(leaf.info().name.clone());
+        true
     }
 }
 

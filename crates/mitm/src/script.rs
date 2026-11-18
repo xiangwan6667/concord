@@ -7,32 +7,22 @@ use std::time::Duration;
 use async_trait::async_trait;
 use concord_common::BoxStream;
 use concord_common::sync::lock;
+use concord_config::mitm::{IssueKind, LineError, ScriptDef};
 use sha2::{Digest, Sha256};
 
+pub use concord_config::mitm::{
+    EVENT_ENGINE_STARTED, EVENT_NETWORK_CHANGED, EVENT_PROFILE_RELOADED, ScriptKind,
+};
+
 use crate::cron::CronSchedule;
+use crate::heads::HeadConditions;
 use crate::pattern::Pattern;
 use crate::rules::read_resource;
-use crate::text::{quote, split_fields};
+use crate::view::{LineView, ScriptView, ScriptViewKind};
 
-pub const EVENT_NETWORK_CHANGED: &str = "network-changed";
-pub const EVENT_ENGINE_STARTED: &str = "engine-started";
-pub const EVENT_PROFILE_RELOADED: &str = "profile-reloaded";
-
-const DEFAULT_SCRIPT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const DEFAULT_SCRIPT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SCRIPT_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_TASK_TIMEOUT: Duration = Duration::from_secs(3600);
-const LOON_NETWORK_CHANGED: &str = "network-changed";
-
-const SCRIPT_TYPES: &[&str] = &[
-    "http-request",
-    "http-response",
-    "cron",
-    "event",
-    "generic",
-    "dns",
-    "rule",
-    LOON_NETWORK_CHANGED,
-];
 
 /// Header names in their canonical spelling, each with every value it carries.
 pub type HeaderList = BTreeMap<String, Vec<String>>;
@@ -121,8 +111,19 @@ impl ScriptInvocation {
 #[error("{0}")]
 pub struct ScriptError(pub String);
 
+/// The interpreter's own message for a script it cannot compile.
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct CompileError(pub String);
+
+impl From<CompileError> for LineError {
+    fn from(err: CompileError) -> LineError {
+        LineError::new(IssueKind::Script, err.0)
+    }
+}
+
 pub trait ScriptRuntime: Send + Sync {
-    fn compile(&self, name: &str, source: &[u8]) -> Result<Arc<dyn ScriptProgram>, String>;
+    fn compile(&self, name: &str, source: &[u8]) -> Result<Arc<dyn ScriptProgram>, CompileError>;
 }
 
 /// Compiled once and run concurrently. The future must stop its work when it
@@ -164,10 +165,10 @@ impl ScriptHost {
         &self,
         resources: &Path,
         name: &str,
-    ) -> Result<(Arc<dyn ScriptProgram>, [u8; 32]), String> {
+    ) -> Result<(Arc<dyn ScriptProgram>, [u8; 32]), LineError> {
         let runtime = lock(&self.runtime)
             .clone()
-            .ok_or("this build runs no scripts")?;
+            .ok_or_else(|| LineError::unsupported("this build runs no scripts"))?;
         let source = read_resource(resources, "script-path", name)?;
         let key: [u8; 32] = Sha256::digest(&source).into();
         let cached = lock(&self.programs).get(&key).cloned();
@@ -190,32 +191,12 @@ impl ScriptHost {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScriptKind {
-    HttpRequest,
-    HttpResponse,
-    Cron,
-    Event,
-    Generic,
-}
-
-impl ScriptKind {
-    pub fn name(self) -> &'static str {
-        match self {
-            ScriptKind::HttpRequest => "http-request",
-            ScriptKind::HttpResponse => "http-response",
-            ScriptKind::Cron => "cron",
-            ScriptKind::Event => "event",
-            ScriptKind::Generic => "generic",
-        }
-    }
-}
-
 pub struct Script {
     pub name: String,
     pub path: String,
     pub kind: ScriptKind,
     pattern: Option<Pattern>,
+    pub(crate) conditions: HeadConditions,
     pub requires_body: bool,
     pub binary_body: bool,
     pub max_size: i64,
@@ -239,10 +220,7 @@ impl std::fmt::Debug for Script {
 
 impl Script {
     pub fn is_task(&self) -> bool {
-        matches!(
-            self.kind,
-            ScriptKind::Cron | ScriptKind::Event | ScriptKind::Generic
-        )
+        self.kind.is_task()
     }
 
     pub(crate) fn matches_http(&self, url: &str, response: bool) -> bool {
@@ -254,6 +232,35 @@ impl Script {
         self.kind == kind && self.pattern.as_ref().is_some_and(|p| p.is_match(url))
     }
 
+    /// `name` is the one `run_script` and `script_names` know the script by.
+    pub(crate) fn view(&self) -> LineView {
+        let (request_head, response_head) = self.conditions.sources();
+        let given = |text: &str| (!text.is_empty()).then(|| text.to_string());
+        LineView::Script(ScriptView {
+            name: self.name.clone(),
+            kind: match self.kind {
+                ScriptKind::HttpRequest => ScriptViewKind::HttpRequest,
+                ScriptKind::HttpResponse => ScriptViewKind::HttpResponse,
+                ScriptKind::Cron => ScriptViewKind::Cron,
+                ScriptKind::Event => ScriptViewKind::Event,
+                ScriptKind::Generic => ScriptViewKind::Generic,
+            },
+            path: self.path.clone(),
+            pattern: self
+                .pattern
+                .as_ref()
+                .map(|pattern| pattern.source().to_string()),
+            request_head,
+            response_head,
+            cronexp: given(&self.cronexp),
+            event: given(&self.event),
+            requires_body: self.requires_body,
+            binary_body: self.binary_body,
+            max_size: (self.max_size > 0).then_some(self.max_size),
+            timeout_ms: u64::try_from(self.timeout.as_millis()).unwrap_or(u64::MAX),
+        })
+    }
+
     pub(crate) fn body_limit(&self, max_body_size: i64) -> i64 {
         if self.max_size > 0 && self.max_size < max_body_size {
             self.max_size
@@ -263,296 +270,54 @@ impl Script {
     }
 }
 
-type Params = HashMap<String, String>;
+/// A script line's script: its pattern and cron expression compiled, the file it names read
+/// from the resources directory and compiled by `host`.
+pub(crate) fn compile_script(
+    def: &ScriptDef,
+    resources: &Path,
+    host: &ScriptHost,
+) -> Result<Script, LineError> {
+    let cron = match def.kind {
+        ScriptKind::Cron => Some(CronSchedule::parse(&def.cronexp)?),
+        _ => None,
+    };
+    let limit = if def.kind.is_task() {
+        MAX_TASK_TIMEOUT
+    } else {
+        MAX_SCRIPT_TIMEOUT
+    };
+    let timeout = def.timeout.map_or(DEFAULT_SCRIPT_TIMEOUT, |seconds| {
+        Duration::from_secs_f64(seconds.min(limit.as_secs_f64()))
+    });
+    let pattern = def.pattern.as_deref().map(Pattern::new).transpose()?;
+    let conditions = HeadConditions::compile(&def.conditions)?;
+    let (program, key) = host.compile(resources, &def.path)?;
+    Ok(Script {
+        name: def.name.clone(),
+        path: def.path.clone(),
+        kind: def.kind,
+        pattern,
+        conditions,
+        requires_body: def.requires_body,
+        binary_body: def.binary_body,
+        max_size: def.max_size,
+        cronexp: def.cronexp.clone(),
+        cron,
+        event: def.event.clone(),
+        timeout,
+        argument: def.argument.clone(),
+        program,
+        key,
+    })
+}
 
-/// Reads Surge's line and Loon's legacy one; the script is a file in the resources directory.
+#[cfg(test)]
 pub(crate) fn parse_script(
     line: &str,
     resources: &Path,
     host: &ScriptHost,
-) -> Result<Script, String> {
-    let (name, kind, params) = split_script_line(line)?;
-    let param = |key: &str| params.get(key).cloned().unwrap_or_default();
-    let kind = match kind.as_str() {
-        "http-request" => ScriptKind::HttpRequest,
-        "http-response" => ScriptKind::HttpResponse,
-        "cron" => ScriptKind::Cron,
-        "event" => ScriptKind::Event,
-        "generic" => ScriptKind::Generic,
-        other if SCRIPT_TYPES.contains(&other) => {
-            return Err(format!("{other} scripts are not supported"));
-        }
-        other => return Err(format!("unknown type {}", quote(other))),
-    };
-    let path = param("script-path");
-    if path.is_empty() {
-        return Err("script-path is missing".to_string());
-    }
-    let name = if name.is_empty() {
-        Path::new(&path)
-            .file_name()
-            .map(|base| base.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.clone())
-    } else {
-        name
-    };
-    let mut script = ScriptDraft {
-        name,
-        path,
-        kind,
-        pattern: None,
-        requires_body: false,
-        binary_body: false,
-        max_size: 0,
-        cronexp: String::new(),
-        cron: None,
-        event: String::new(),
-        timeout: DEFAULT_SCRIPT_TIMEOUT,
-        argument: None,
-    };
-    match kind {
-        ScriptKind::HttpRequest | ScriptKind::HttpResponse => script.read_http(&params)?,
-        ScriptKind::Cron => {
-            script.cronexp = param("cronexp");
-            if script.cronexp.is_empty() {
-                return Err("cronexp is missing".to_string());
-            }
-            script.cron = Some(CronSchedule::parse(&script.cronexp)?);
-        }
-        ScriptKind::Event => {
-            script.event = param("event-name");
-            match script.event.as_str() {
-                EVENT_NETWORK_CHANGED | EVENT_ENGINE_STARTED | EVENT_PROFILE_RELOADED => {}
-                "" => return Err("event-name is missing".to_string()),
-                other => return Err(format!("the {other} event is not supported")),
-            }
-        }
-        ScriptKind::Generic => {}
-    }
-    if let Some(text) = params.get("timeout") {
-        let seconds = text
-            .parse::<f64>()
-            .ok()
-            .filter(|seconds| *seconds > 0.0 && seconds.is_finite())
-            .ok_or_else(|| format!("invalid timeout {}", quote(text)))?;
-        let limit = if matches!(
-            kind,
-            ScriptKind::Cron | ScriptKind::Event | ScriptKind::Generic
-        ) {
-            MAX_TASK_TIMEOUT
-        } else {
-            MAX_SCRIPT_TIMEOUT
-        };
-        script.timeout = Duration::from_secs_f64(seconds.min(limit.as_secs_f64()));
-    }
-    if let Some(text) = params.get("argument-json") {
-        let value = serde_json::from_str(text).map_err(|err| format!("argument-json: {err}"))?;
-        script.argument = Some(value);
-    } else if let Some(text) = params.get("argument") {
-        script.argument = Some(serde_json::Value::String(text.clone()));
-    }
-    let (program, key) = host.compile(resources, &script.path)?;
-    Ok(script.finish(program, key))
-}
-
-struct ScriptDraft {
-    name: String,
-    path: String,
-    kind: ScriptKind,
-    pattern: Option<Pattern>,
-    requires_body: bool,
-    binary_body: bool,
-    max_size: i64,
-    cronexp: String,
-    cron: Option<CronSchedule>,
-    event: String,
-    timeout: Duration,
-    argument: Option<serde_json::Value>,
-}
-
-impl ScriptDraft {
-    fn read_http(&mut self, params: &Params) -> Result<(), String> {
-        let pattern = params.get("pattern").cloned().unwrap_or_default();
-        if pattern.is_empty() {
-            return Err("pattern is missing".to_string());
-        }
-        self.requires_body = script_bool(params, "requires-body")?;
-        self.binary_body = script_bool(params, "binary-body-mode")?;
-        if script_bool(params, "full-header-mode").unwrap_or(true) {
-            return Err("full-header-mode is not supported".to_string());
-        }
-        if let Some(text) = params.get("max-size") {
-            let size = text
-                .parse::<i64>()
-                .ok()
-                .filter(|size| *size >= -1)
-                .ok_or_else(|| format!("invalid max-size {}", quote(text)))?;
-            if size > 0 {
-                self.max_size = size;
-            }
-        }
-        self.pattern = Some(Pattern::new(&pattern)?);
-        Ok(())
-    }
-
-    fn finish(self, program: Arc<dyn ScriptProgram>, key: [u8; 32]) -> Script {
-        Script {
-            name: self.name,
-            path: self.path,
-            kind: self.kind,
-            pattern: self.pattern,
-            requires_body: self.requires_body,
-            binary_body: self.binary_body,
-            max_size: self.max_size,
-            cronexp: self.cronexp,
-            cron: self.cron,
-            event: self.event,
-            timeout: self.timeout,
-            argument: self.argument,
-            program,
-            key,
-        }
-    }
-}
-
-/// A line with a type parameter is Surge's form, so that a name may start with
-/// a type; any other is Loon's legacy one.
-fn split_script_line(line: &str) -> Result<(String, String, Params), String> {
-    let (name, rest) = match line.split_once('=') {
-        Some((name, rest)) => (Some(name), Some(rest)),
-        None => (None, None),
-    };
-    let parsed = rest.map(script_params);
-    let typed =
-        matches!(&parsed, Some(Ok(params)) if params.get("type").is_some_and(|t| !t.is_empty()));
-    if !typed && let Some(at) = line.find([' ', '\t']).filter(|at| *at > 0) {
-        let head = line.get(..at).unwrap_or_default().to_ascii_lowercase();
-        if SCRIPT_TYPES.contains(&head.as_str()) {
-            return split_legacy_script(&head, line.get(at..).unwrap_or_default());
-        }
-    }
-    let (Some(name), Some(parsed)) = (name, parsed) else {
-        return Err("expected name = parameters".to_string());
-    };
-    let params = parsed?;
-    let mut kind = params
-        .get("type")
-        .cloned()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if kind.is_empty() {
-        kind = "generic".to_string();
-    }
-    Ok((name.trim().to_string(), kind, params))
-}
-
-/// Files the value after the type where Surge's form keeps it.
-fn split_legacy_script(kind: &str, rest: &str) -> Result<(String, String, Params), String> {
-    let fields = split_fields(rest)?;
-    let mut value = String::new();
-    let mut from = 0;
-    if let Some(first) = fields.first() {
-        let http = kind == "http-request" || kind == "http-response";
-        if http || !first.text.contains('=') {
-            value = first.text.clone();
-            from = first.to;
-        }
-    }
-    let mut params = script_params(rest.get(from..).unwrap_or_default())?;
-    let mut name = params.get("tag").cloned().unwrap_or_default();
-    let mut kind = kind.to_string();
-    match kind.as_str() {
-        "http-request" | "http-response" => {
-            if value.is_empty() {
-                return Err("expected a pattern".to_string());
-            }
-            params.insert("pattern".to_string(), value);
-        }
-        "cron" => {
-            params.insert("cronexp".to_string(), value);
-        }
-        "event" => {
-            params.insert("event-name".to_string(), value);
-        }
-        LOON_NETWORK_CHANGED => {
-            kind = "event".to_string();
-            params.insert("event-name".to_string(), EVENT_NETWORK_CHANGED.to_string());
-        }
-        _ => {
-            if name.is_empty() {
-                name = value;
-            }
-        }
-    }
-    Ok((name, kind, params))
-}
-
-/// Splits on the commas outside quotes, groups and character classes, so an
-/// unquoted `{1,3}` or Loon's `argument=[{a},{b}]` stays one value.
-fn script_params(text: &str) -> Result<Params, String> {
-    let mut params = Params::new();
-    let mut add = |item: &str| -> Result<(), String> {
-        let item = item.trim();
-        if item.is_empty() {
-            return Ok(());
-        }
-        let (key, value) = item
-            .split_once('=')
-            .ok_or_else(|| format!("expected key=value, got {}", quote(item)))?;
-        let mut value = value.trim().to_string();
-        if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
-            value = value
-                .get(1..value.len() - 1)
-                .unwrap_or_default()
-                .replace("\\\"", "\"");
-        }
-        params.insert(key.trim().to_ascii_lowercase(), value);
-        Ok(())
-    };
-    let bytes = text.as_bytes();
-    let (mut quoted, mut class, mut depth, mut from) = (false, false, 0usize, 0usize);
-    let mut i = 0;
-    while let Some(&c) = bytes.get(i) {
-        if quoted {
-            if c == b'\\' && bytes.get(i + 1) == Some(&b'"') {
-                i += 1;
-            } else if c == b'"' {
-                quoted = false;
-            }
-        } else if c == b'\\' {
-            i += 1;
-        } else if c == b'"' {
-            quoted = true;
-        } else if class {
-            class = c != b']';
-        } else if c == b'[' {
-            class = true;
-        } else if c == b'(' || c == b'{' {
-            depth += 1;
-        } else if (c == b')' || c == b'}') && depth > 0 {
-            depth -= 1;
-        } else if c == b',' && depth == 0 {
-            add(text.get(from..i).unwrap_or_default())?;
-            from = i + 1;
-        }
-        i += 1;
-    }
-    if quoted {
-        return Err("unclosed quote".to_string());
-    }
-    add(text.get(from.min(text.len())..).unwrap_or_default())?;
-    Ok(params)
-}
-
-fn script_bool(params: &Params, key: &str) -> Result<bool, String> {
-    let Some(text) = params.get(key) else {
-        return Ok(false);
-    };
-    match text.to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" => Ok(true),
-        "false" | "0" | "no" | "" => Ok(false),
-        _ => Err(format!("invalid {key} {}", quote(text))),
-    }
+) -> Result<Script, LineError> {
+    compile_script(&concord_config::mitm::parse_script(line)?, resources, host)
 }
 
 #[cfg(test)]
@@ -594,12 +359,16 @@ pub(crate) mod testkit {
     pub struct FakeRuntime(pub HashMap<String, Arc<dyn ScriptProgram>>);
 
     impl ScriptRuntime for FakeRuntime {
-        fn compile(&self, _name: &str, source: &[u8]) -> Result<Arc<dyn ScriptProgram>, String> {
+        fn compile(
+            &self,
+            _name: &str,
+            source: &[u8],
+        ) -> Result<Arc<dyn ScriptProgram>, CompileError> {
             let key = String::from_utf8_lossy(source).into_owned();
             self.0
                 .get(&key)
                 .cloned()
-                .ok_or_else(|| format!("SyntaxError: {key}"))
+                .ok_or_else(|| CompileError(format!("SyntaxError: {key}")))
         }
     }
 
@@ -645,8 +414,8 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &again), "the program was cached");
         host.set_runtime(None);
         assert_eq!(
-            host.compile(&resources, "a.js").err().as_deref(),
-            Some("this build runs no scripts")
+            host.compile(&resources, "a.js").err(),
+            Some(LineError::unsupported("this build runs no scripts"))
         );
     }
 
@@ -828,6 +597,25 @@ mod tests {
     }
 
     #[test]
+    fn script_lines_read_head_conditions() {
+        let (_home, resources, host) = setup();
+        let script = parse_script(
+            r#"Ads = type=http-response,pattern=^https://a\.com/,request-head="^(?=POST )",response-head=" 200\r\n",script-path=a.js"#,
+            &resources,
+            &host,
+        )
+        .unwrap();
+        assert!(script.conditions.request.is_some() && script.conditions.response.is_some());
+        let plain = parse_script(
+            r"Ads = type=http-response,pattern=^https://a\.com/,script-path=a.js",
+            &resources,
+            &host,
+        )
+        .unwrap();
+        assert!(plain.conditions.request.is_none() && plain.conditions.response.is_none());
+    }
+
+    #[test]
     fn script_lines_reject_what_they_cannot_run() {
         let (_home, resources, host) = setup();
         let cases = [
@@ -891,10 +679,18 @@ mod tests {
                 "X = type=http-request,pattern=a,script-path=a.js,requires-body=sometimes",
                 "invalid requires-body",
             ),
+            (
+                "X = type=http-request,pattern=a,script-path=a.js,response-head=200",
+                "response-head needs an http-response rule",
+            ),
+            (
+                r#"X = type=http-response,pattern=a,script-path=a.js,request-head="(""#,
+                "parenthesis",
+            ),
         ];
         for (line, want) in cases {
             let err = parse_script(line, &resources, &host).expect_err(line);
-            assert!(err.contains(want), "{line}: {err}, want {want}");
+            assert!(err.message.contains(want), "{line}: {err}, want {want}");
         }
         host.set_runtime(None);
         assert!(
@@ -905,22 +701,5 @@ mod tests {
             )
             .is_err()
         );
-    }
-
-    #[test]
-    fn script_params_keep_what_they_quote() {
-        let params = script_params(
-            r#"pattern="^https://a\.com/\"q\",x",argument=[{a},{b}],max=\d{1,3},class=[,],json="{\"k\":\"a\\"b\"}""#,
-        )
-        .unwrap();
-        for (key, want) in [
-            ("pattern", r#"^https://a\.com/"q",x"#),
-            ("argument", "[{a},{b}]"),
-            ("max", r"\d{1,3}"),
-            ("class", "[,]"),
-            ("json", r#"{"k":"a\"b"}"#),
-        ] {
-            assert_eq!(params.get(key).map(String::as_str), Some(want), "{key}");
-        }
     }
 }

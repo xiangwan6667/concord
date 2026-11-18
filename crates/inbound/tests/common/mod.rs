@@ -5,6 +5,7 @@
 )]
 
 use std::future::poll_fn;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -81,9 +82,32 @@ pub struct Running {
     pub spec: ListenSpec,
 }
 
+/// Port 0 gives a TCP listener a port from the system, and the UDP socket of a mixed or SOCKS
+/// listener then binds the same number, which another socket on the host may already hold.
+const FRESH_PORT_ATTEMPTS: usize = 8;
+
+/// `reconcile`, binding again on a fresh port while a port 0 listener's UDP side collides.
+pub async fn open(
+    listeners: &Listeners,
+    spec: &ListenSpec,
+    handler: Arc<dyn FlowHandler>,
+) -> Vec<ListenError> {
+    let collided = |error: &ListenError| {
+        spec.port(error.kind) == Some(0) && error.source.kind() == io::ErrorKind::AddrInUse
+    };
+    let mut errors = listeners.reconcile(spec, handler.clone()).await;
+    for _ in 1..FRESH_PORT_ATTEMPTS {
+        if !errors.iter().any(collided) {
+            break;
+        }
+        errors = listeners.reconcile(spec, handler.clone()).await;
+    }
+    errors
+}
+
 pub async fn start(spec: ListenSpec, fake: Arc<Fake>) -> Running {
     let listeners = Listeners::new();
-    let errors = listeners.reconcile(&spec, fake.clone()).await;
+    let errors = open(&listeners, &spec, fake.clone()).await;
     assert!(errors.is_empty(), "{errors:?}");
     Running {
         listeners,
@@ -93,10 +117,7 @@ pub async fn start(spec: ListenSpec, fake: Arc<Fake>) -> Running {
 }
 
 pub async fn reconcile(running: &Running, spec: &ListenSpec) -> Vec<ListenError> {
-    running
-        .listeners
-        .reconcile(spec, running.fake.clone())
-        .await
+    open(&running.listeners, spec, running.fake.clone()).await
 }
 
 impl Running {

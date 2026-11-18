@@ -1,7 +1,10 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use concord_common::NodeDialer;
+
 use super::*;
+use crate::GroupError;
 
 fn connects(rig: &Rig, name: &str) -> usize {
     rig.book.get(name).connects.load(Ordering::SeqCst)
@@ -46,6 +49,26 @@ proxy-groups:
     rig.out.select("g", "z").await;
     assert!(dial(&rig, "x").await.is_ok());
     assert_eq!((connects(&rig, "y"), connects(&rig, "z")), (0, 1));
+}
+
+#[tokio::test]
+async fn pass_outbounds_return_a_typed_dial_error() {
+    let rig = Rig::new("proxies: []\n");
+    let env = rig.out.env();
+    let cx = DialCx::new(&env, Initiator::Other, None);
+    let dst = Address::new("example.com", 80);
+    for name in ["PASS", "PASS-RULE"] {
+        let dial = rig.out.dial_via(name, &cx, &dst).await.err().unwrap();
+        let associate = rig.out.associate_via(name, &cx, &dst).await.err().unwrap();
+        for err in [dial, associate] {
+            assert_eq!(err.kind(), io::ErrorKind::Other);
+            assert_eq!(err.to_string(), format!("{name} cannot be dialed"));
+            let typed = err
+                .get_ref()
+                .and_then(|err| err.downcast_ref::<GroupError>());
+            assert!(matches!(typed, Some(GroupError::CannotDial(node)) if node == name));
+        }
+    }
 }
 
 #[tokio::test(start_paused = true)]

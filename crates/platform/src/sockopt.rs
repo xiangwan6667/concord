@@ -4,13 +4,24 @@ use std::net::IpAddr;
 use concord_common::RawSocket;
 use socket2::{Protocol, Socket};
 
+/// Whether a vectored TCP write goes through [`send_tcp_vectored`] instead of the stream's
+/// own: on Linux std's vectored TCP write uses writev, unlike its signal-safe scalar send.
+pub const SEND_TCP_VECTORED: bool = cfg!(any(target_os = "linux", target_os = "android"));
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn send_tcp_vectored(
     stream: &tokio::net::TcpStream,
     buffers: &[io::IoSlice<'_>],
 ) -> io::Result<usize> {
-    // std's vectored TCP write uses writev, unlike its signal-safe scalar send.
     socket2::SockRef::from(stream).send_vectored_with_flags(buffers, libc::MSG_NOSIGNAL)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn send_tcp_vectored(
+    _stream: &tokio::net::TcpStream,
+    _buffers: &[io::IoSlice<'_>],
+) -> io::Result<usize> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
 #[cfg(unix)]
@@ -37,9 +48,16 @@ pub fn send_space(stream: &impl std::os::fd::AsFd) -> Option<usize> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub fn send_space(_stream: &tokio::net::TcpStream) -> Option<usize> {
+pub fn send_space<T: ?Sized>(_stream: &T) -> Option<usize> {
     None
 }
+
+/// Whether TCP keep-alive may be turned on; mihomo keeps it off on Android whatever the profile
+/// says (`component/keepalive/tcp_keepalive.go::SetDisableKeepAlive`).
+pub const KEEP_ALIVE: bool = !cfg!(target_os = "android");
+
+/// Whether a nonblocking TCP write goes through [`try_send_vectored`] instead of the stream's own.
+pub const TRY_SEND_VECTORED: bool = cfg!(target_os = "linux");
 
 /// Attempts a nonblocking TCP write even before its new reactor reports readiness.
 #[cfg(target_os = "linux")]
@@ -49,6 +67,11 @@ pub fn try_send_vectored(
 ) -> io::Result<usize> {
     socket2::SockRef::from(stream)
         .send_vectored_with_flags(bufs, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn try_send_vectored<T: ?Sized>(_stream: &T, _bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
 pub fn is_global_unicast(ip: IpAddr) -> bool {

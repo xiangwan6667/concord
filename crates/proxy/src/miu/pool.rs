@@ -5,7 +5,7 @@ use arc_swap::ArcSwap;
 #[cfg(test)]
 use concord_common::BoxStream;
 use concord_common::sync::lock;
-use concord_common::{DialCx, DialEnv, Initiator};
+use concord_common::{DialCx, DialEnv, Initiator, Tasks};
 use concord_tls::TlsConn;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -68,10 +68,11 @@ pub(super) struct Pool {
     warmers: Mutex<Vec<JoinHandle<()>>>,
     changed: Arc<Notify>,
     pub(super) padding: ArcSwap<Padding>,
+    pub(super) tasks: Tasks,
 }
 
 impl Pool {
-    pub(super) fn new(timeout: u64, padding: Padding) -> Arc<Self> {
+    pub(super) fn new(timeout: u64, padding: Padding, tasks: Tasks) -> Arc<Self> {
         Arc::new(Self {
             idle: Mutex::new(State::default()),
             timeout: Duration::from_secs(if timeout == 0 { 30 } else { timeout }),
@@ -79,6 +80,7 @@ impl Pool {
             warmers: Mutex::new(Vec::new()),
             changed: Arc::new(Notify::new()),
             padding: ArcSwap::from_pointee(padding),
+            tasks,
         })
     }
 
@@ -195,7 +197,7 @@ impl Pool {
             let link = link.clone();
             let env = env.clone();
             let padding = self.padding.load_full();
-            warmers.push(tokio::spawn(async move {
+            warmers.push(self.tasks.spawn(async move {
                 let timeout = Duration::from_secs(10);
                 let cx = DialCx::new(&env, Initiator::Proxy, Some(Instant::now() + timeout));
                 let lane = tokio::time::timeout(timeout, dial_lane(&link, &token, &padding, &cx))
@@ -233,7 +235,7 @@ impl Pool {
         }
         let weak = Arc::downgrade(self);
         let changed = self.changed.clone();
-        *cleaner = Some(tokio::spawn(async move {
+        *cleaner = Some(self.tasks.spawn(async move {
             loop {
                 let next = match weak.upgrade() {
                     Some(pool) => pool.next_expiry(),
@@ -267,7 +269,11 @@ mod tests {
     use super::*;
 
     fn pool() -> Arc<Pool> {
-        Pool::new(30, crate::miu::padding::derive(&[7; 32]).unwrap())
+        Pool::new(
+            30,
+            crate::miu::padding::derive(&[7; 32]).unwrap(),
+            Tasks::default(),
+        )
     }
 
     #[tokio::test(start_paused = true)]

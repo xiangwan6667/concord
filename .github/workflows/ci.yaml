@@ -9,7 +9,8 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Every push to main keeps its result; a newer push to a pull request replaces the older run.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
@@ -18,23 +19,19 @@ env:
   CARGO_TERM_COLOR: always
   # The release budget in bytes for the desktop binary, `concord`. The design target is 15 MB.
   CORE_MAX_BYTES: 30000000
-  # Pinned by hash, so a new bundle from https://curl.se/docs/caextract.html is a reviewed bump.
-  CA_BUNDLE: cacert-2026-09-25.pem
-  CA_BUNDLE_SHA256: a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505
-  # FlClash's `cargoCore` builds `libconcord.so` with this NDK and API level.
-  ANDROID_NDK_VERSION: 28.2.13676358
-  ANDROID_API: 24
 
 jobs:
-  check:
-    name: Check
+  lint:
+    name: Lint
     # A private repository pays for its Actions minutes, so it runs the checks only when started by hand.
     if: github.event_name == 'workflow_dispatch' || !github.event.repository.private
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -46,11 +43,22 @@ jobs:
         with:
           tool: cargo-deny@0.20.2
 
-      - name: Fetch CA certificates
+      - name: Check commit messages
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
         run: |
-          bundle=assets/ca-certificates.crt
-          curl -fsSL --retry 3 -o "$bundle" "https://curl.se/ca/$CA_BUNDLE"
-          echo "$CA_BUNDLE_SHA256  $bundle" | sha256sum -c -
+          if [ "$EVENT" = pull_request ]; then
+            range="$PR_BASE..$PR_HEAD"
+          elif [ "$EVENT" = push ] && git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
+            range="$PUSH_BEFORE..$GITHUB_SHA"
+          else
+            range="-1 $GITHUB_SHA"
+          fi
+          # shellcheck disable=SC2086
+          cargo run --locked -p xtask -- check-commits $range
 
       - name: Check format
         run: cargo fmt --check
@@ -58,8 +66,17 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Run tests
-        run: cargo test --workspace --locked
+      # The workspace build turns these features on, so only a crate built alone goes without them.
+      - name: Clippy crates without their optional features
+        run: |
+          for crate in concord-common concord-engine concord-mitm; do
+            cargo clippy -p "$crate" --no-default-features --all-targets --locked -- -D warnings
+          done
+
+      - name: Check documentation
+        run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
 
       - name: Check crate layers
         run: cargo run --locked -p xtask -- check-layers
@@ -67,11 +84,60 @@ jobs:
       - name: Check generated schema
         run: cargo run --locked -p xtask -- schema --check
 
+      - name: Check that the interop job has every peer
+        run: cargo run --locked -p xtask -- check-interop-peers
+
       - name: Check dependencies
         run: cargo deny check
 
       - name: Check fuzz targets
         run: cargo check --locked --manifest-path fuzz/Cargo.toml
+
+      - name: Check that no tracked file changed
+        run: git diff --exit-code
+
+  test:
+    name: Test
+    if: github.event_name == 'workflow_dispatch' || !github.event.repository.private
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+      - name: Test crates without their optional features
+        run: |
+          for crate in concord-common concord-engine concord-mitm; do
+            cargo test -p "$crate" --no-default-features --locked
+          done
+
+      - name: Check that no tracked file changed
+        run: git diff --exit-code
+
+  release:
+    name: Release build
+    if: github.event_name == 'workflow_dispatch' || !github.event.repository.private
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install CA certificates
+        uses: ./.github/actions/ca-bundle
 
       - name: Build release core
         run: cargo build --release --locked -p concord-desktop
@@ -81,6 +147,48 @@ jobs:
 
       - name: Check that no tracked file changed
         run: git diff --exit-code -- . ':!assets/ca-certificates.crt'
+
+  interop:
+    name: Interop
+    if: github.event_name == 'workflow_dispatch' || !github.event.repository.private
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Fetch mihomo
+        uses: ./.github/actions/mihomo
+
+      - name: Fetch gost
+        uses: ./.github/actions/gost
+
+      - name: Fetch Xray
+        uses: ./.github/actions/xray
+
+      # hysteria_talks_to_the_reference_server needs a server built from the Hysteria v1 core, which mihomo does
+      # not provide and this job does not build.
+      - name: Run the interop tests
+        run: >-
+          cargo test --locked -p concord-proxy --test interop --
+          --ignored --skip hysteria_talks_to_the_reference_server
+
+      - name: Compare the controller with mihomo's
+        run: cargo test --locked -p concord-desktop --test controller -- --ignored
+
+      - name: Run the OpenSSH interop test
+        run: |
+          if [ ! -x /usr/sbin/sshd ]; then
+            sudo apt-get update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server
+          fi
+          export CONCORD_SSHD=/usr/sbin/sshd CONCORD_SSH_KEYGEN=/usr/bin/ssh-keygen
+          cargo test --locked -p concord-proxy --lib ssh::tests::talks_to_openssh -- --ignored --exact
 
   macos:
     name: macOS
@@ -103,10 +211,26 @@ jobs:
         run: cargo test --workspace --locked
 
   android:
-    name: Android clippy
+    name: Android (${{ matrix.target }})
     if: github.event_name == 'workflow_dispatch' || !github.event.repository.private
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      # The three ABIs FlClash's `cargoCore` builds, with the clang prefix and CMake ABI it gives each.
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            clang: aarch64-linux-android
+            abi: arm64-v8a
+            # The release `libconcord.so` budget in bytes: about 20% above its size when it was set.
+            budget: 31000000
+          - target: armv7-linux-androideabi
+            clang: armv7a-linux-androideabi
+            abi: armeabi-v7a
+          - target: x86_64-linux-android
+            clang: x86_64-linux-android
+            abi: x86_64
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -114,37 +238,36 @@ jobs:
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          key: ${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install the NDK
-        run: |
-          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$ANDROID_NDK_VERSION" > /dev/null
-          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
-
-      # The variables FlClash's `cargoCore` sets for `aarch64-linux-android`.
-      - name: Point cargo at the NDK
-        run: |
-          ndk=$ANDROID_NDK_ROOT
-          host=$(ls -d "$ndk"/toolchains/llvm/prebuilt/*/)
-          clang=${host}bin/aarch64-linux-android$ANDROID_API-clang
-          toolchain=$RUNNER_TEMP/android.toolchain.cmake
-          printf 'set(ANDROID_ABI "arm64-v8a")\nset(ANDROID_PLATFORM "android-%s")\ninclude("%s")\n' \
-            "$ANDROID_API" "$ndk/build/cmake/android.toolchain.cmake" > "$toolchain"
-          {
-            echo "ANDROID_NDK_HOME=$ndk"
-            echo "CC_aarch64_linux_android=$clang"
-            echo "CXX_aarch64_linux_android=$clang++"
-            echo "AR_aarch64_linux_android=${host}bin/llvm-ar"
-            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$clang"
-            echo "CMAKE_TOOLCHAIN_FILE_aarch64_linux_android=$toolchain"
-            echo "BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android=--sysroot=${host}sysroot --target=aarch64-linux-android$ANDROID_API"
-            echo "BORING_BSSL_RUST_CPPLIB=c++_static"
-          } >> "$GITHUB_ENV"
+      - name: Set up the NDK
+        uses: ./.github/actions/android-ndk
+        with:
+          target: ${{ matrix.target }}
+          clang: ${{ matrix.clang }}
+          abi: ${{ matrix.abi }}
 
       - name: Clippy
         run: >-
-          cargo clippy --workspace --all-targets --locked --target aarch64-linux-android --
+          cargo clippy --workspace --all-targets --locked --target ${{ matrix.target }} --
           -D warnings -A clippy::missing_const_for_thread_local
+
+      # The fat-LTO release build takes minutes, so only the main ABI checks its budget on every change;
+      # `platforms.yaml` checks the other two weekly.
+      - name: Install CA certificates
+        if: matrix.budget
+        uses: ./.github/actions/ca-bundle
+
+      - name: Build release libconcord.so
+        if: matrix.budget
+        run: cargo build --release --locked --target ${{ matrix.target }} -p concord-android
+
+      - name: Check library size
+        if: matrix.budget
+        run: >-
+          cargo run --locked -p xtask --
+          check-size target/${{ matrix.target }}/release/libconcord.so ${{ matrix.budget }}
 
   windows:
     name: Windows clippy
@@ -167,8 +290,8 @@ jobs:
         shell: bash
         run: |
           choco install nasm --no-progress -y > /dev/null
-          echo 'C:\Program Files\NASM' >> "$GITHUB_PATH"
-          echo 'LIBCLANG_PATH=C:\Program Files\LLVM\bin' >> "$GITHUB_ENV"
+          printf '%s\n' 'C:\Program Files\NASM' >> "$GITHUB_PATH"
+          printf '%s\n' 'LIBCLANG_PATH=C:\Program Files\LLVM\bin' >> "$GITHUB_ENV"
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings

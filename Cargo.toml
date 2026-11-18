@@ -30,12 +30,12 @@ members = [
     "tools/bench",
     "xtask",
 ]
-exclude = ["vendor/blake3", "vendor/boring", "vendor/h2", "vendor/mio", "vendor/quinn", "vendor/quinn-proto", "vendor/rustls", "vendor/shadowsocks", "vendor/tun-rs"]
+exclude = ["vendor/blake3", "vendor/boring", "vendor/h3", "vendor/h2", "vendor/mio", "vendor/quinn", "vendor/quinn-proto", "vendor/rustls", "vendor/shadowsocks", "vendor/tun-rs"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99"
+rust-version = "1.100"
 license = "GPL-3.0-or-later"
 publish = false
 repository = "https://github.com/chen08209/concord"
@@ -133,15 +133,15 @@ sha2 = "0.10"
 md-5 = "0.10"
 psl = "2"
 hmac = "0.12"
-hkdf = "0.12"
 blake2 = "0.10"
 blake3 = "1"
 ctr = "0.9"
 aes = "0.8"
+aes-cfb = { package = "aes", version = "0.9" }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
-cfb-mode = "0.8"
+cfb-mode = "0.9"
 crc32fast = "1"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "reduced-round"] }
 chacha20 = { version = "0.9", default-features = false, features = ["std"] }
 
@@ -155,7 +155,7 @@ rtnetlink = "0.23"
 # Misc
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive", "env"] }
-compact_str = { version = "0.9", features = ["serde"] }
+compact_str = { version = "0.10", features = ["serde"] }
 hex = "0.4"
 log = "0.4"
 num-bigint = { version = "0.4", default-features = false }
@@ -176,6 +176,9 @@ rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "
 brotli-decompressor = "5"
 x509-parser = { version = "0.18", default-features = false }
 rquickjs = { version = "0.14", default-features = false }
+jaq-core = { version = "3.1", default-features = false, features = ["std"] }
+jaq-std = { version = "3.0", default-features = false, features = ["std", "format", "log", "math", "regex", "time"] }
+jaq-json = { version = "2.0", default-features = false, features = ["std", "sync"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [workspace.lints.rust]
@@ -276,8 +279,12 @@ opt-level = 3
 [profile.release.package.aws-lc-sys]
 opt-level = 3
 
+[profile.release.package.boring-sys]
+opt-level = 3
+
 [patch.crates-io]
 blake3 = { path = "vendor/blake3" }
+h3 = { path = "vendor/h3" }
 boring = { path = "vendor/boring" }
 h2 = { path = "vendor/h2" }
 tun-rs = { path = "vendor/tun-rs" }

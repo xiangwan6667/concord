@@ -479,3 +479,25 @@ past about a thousand the emulator's main loop spins in `select` and the whole d
 local socket: `wire` the bytes `connection.watch` sends for 1000 connections idle and under churn, `rtt` the
 round-trip percentiles of a few cheap methods, and `subs` the memory each idle subscription holds. Run it in release
 (`cargo run --release -p api-bench -- wire`) on Linux or macOS; it needs Unix sockets.
+
+## Gost peers
+
+The `ss-gost` case uses gost v2 (`CONCORD_GOST2`) as its Shadowsocks-over-WebSocket/smux server.
+Set the variable to a binary for the measurement platform. The harness starts it in the server's CPU/network
+placement and includes its CPU in the server counters. For example, after building the bench and cores:
+
+```sh
+CONCORD_GOST2=/path/to/gost-v2 cargo xtask bench --quick --only ss-gost --rounds 1 --no-baseline --mihomo /path/to/mihomo
+```
+
+This is an opt-in case, excluded from both tiers; select it with `--only ss-gost` and set `CONCORD_GOST2`. The upstream interop test
+`gost::gost_plugin_round_trips_with_upstream_gost_and_mihomo` uses `CONCORD_GOST2` and `CONCORD_MIHOMO` and
+checks WebSocket with and without TLS and smux, forwarding to mihomo's Shadowsocks listener.
+
+The `gost-relay` case similarly uses gost v3 (`CONCORD_GOST3`), with TCP and UDP. It is also excluded from both
+tiers; select it with `--only gost-relay` and set `CONCORD_GOST3`.
+The relay server is launched with `nodelay=true`: mihomo and Concord both await CONNECT before application data.
+Its interop test is `gost_relay::gost_relay_round_trips_with_upstream_gost`; it covers authenticated relay,
+forward mode, TLS, smux, TCP and destination-bound UDP against upstream gost v3.
+CI's interop job runs both tests against gost v2.12.0 and v3.3.3, the releases they were written against
+(`.github/actions/gost`).

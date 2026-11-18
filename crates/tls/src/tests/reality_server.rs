@@ -38,6 +38,8 @@ pub struct MockReality {
     pub suite: u16,
     pub client_version: [u8; 3],
     pub mldsa: Option<PqdsaKeyPair>,
+    pub jls: bool,
+    pub fragmented: bool,
 }
 
 impl MockReality {
@@ -59,6 +61,8 @@ impl MockReality {
             suite: 0x1301,
             client_version: [1, 8, 2],
             mldsa: None,
+            jls: false,
+            fragmented: false,
         }
     }
 }
@@ -195,32 +199,54 @@ impl MockReality {
             return Ok(());
         }
 
-        let ecdh = agreement::agree(
-            &self.private,
-            UnparsedPublicKey::new(&X25519, &client_x),
-            (),
-            |s| Ok(s.to_vec()),
-        )
-        .map_err(|()| bad("agree"))?;
-        let auth_key = expand(
-            &extract(Hash::Sha256, &parsed.random[..20], &ecdh),
-            b"REALITY",
-            32,
-        );
-        let mut zeroed = hello.clone();
-        zeroed[39..71].fill(0);
-        let aead = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &auth_key).unwrap());
-        let mut sealed = parsed.session_id.clone();
-        let plain = aead
-            .open_in_place(
-                Nonce::assume_unique_for_key(parsed.random[20..32].try_into().unwrap()),
-                Aad::from(zeroed.as_slice()),
-                &mut sealed,
+        let auth_key = if self.jls {
+            use aes_gcm::aead::{
+                Aead, KeyInit, generic_array::GenericArray, generic_array::typenum::U32,
+            };
+            use sha2::{Digest, Sha256};
+            let mut zeroed = hello.clone();
+            zeroed[6..38].fill(0);
+            let key = Sha256::digest([b"secret".as_slice(), &zeroed].concat());
+            let nonce = Sha256::digest([b"name".as_slice(), &zeroed].concat());
+            let cipher =
+                aes_gcm::AesGcm::<aes_gcm::aes::Aes256, U32>::new(GenericArray::from_slice(&key));
+            if cipher
+                .decrypt(GenericArray::from_slice(&nonce), &hello[6..38])
+                .is_err()
+            {
+                return Err(bad("jls client random does not authenticate"));
+            }
+            vec![0; 32]
+        } else {
+            let ecdh = agreement::agree(
+                &self.private,
+                UnparsedPublicKey::new(&X25519, &client_x),
+                (),
+                |s| Ok(s.to_vec()),
             )
-            .map_err(|_| bad("session id does not open"))?;
-        if plain[..3] != self.client_version || plain[8..16] != self.short_id {
-            return Err(bad("unknown client"));
-        }
+            .map_err(|()| bad("agree"))?;
+            let auth_key = expand(
+                &extract(Hash::Sha256, &parsed.random[..20], &ecdh),
+                b"REALITY",
+                32,
+            );
+            let mut zeroed = hello.clone();
+            zeroed[39..71].fill(0);
+            let aead = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &auth_key).unwrap());
+            let mut sealed = parsed.session_id.clone();
+            let plain = aead
+                .open_in_place(
+                    Nonce::assume_unique_for_key(parsed.random[20..32].try_into().unwrap()),
+                    Aad::from(zeroed.as_slice()),
+                    &mut sealed,
+                )
+                .map_err(|_| bad("session id does not open"))?;
+            if plain[..3] != self.client_version || plain[8..16] != self.short_id {
+                return Err(bad("unknown client"));
+            }
+
+            auth_key
+        };
 
         let xs = agreement::PrivateKey::generate(&X25519).unwrap();
         let xpub = xs.compute_public_key().unwrap();
@@ -274,8 +300,29 @@ impl MockReality {
         exts.extend_from_slice(&share);
         sh.extend_from_slice(&u16::try_from(exts.len()).unwrap().to_be_bytes());
         sh.extend_from_slice(&exts);
-        let server_hello = message(2, &sh);
-        io.write_all(&record(CT_HANDSHAKE, &server_hello)).await?;
+        let mut server_hello = message(2, &sh);
+        if self.jls && self.fault != Fault::HelloRetry {
+            use aes_gcm::aead::{
+                Aead, KeyInit, generic_array::GenericArray, generic_array::typenum::U32,
+            };
+            use sha2::{Digest, Sha256};
+            server_hello[6..38].fill(0);
+            let key = Sha256::digest([b"secret".as_slice(), &server_hello].concat());
+            let nonce = Sha256::digest([b"name".as_slice(), &server_hello].concat());
+            let cipher =
+                aes_gcm::AesGcm::<aes_gcm::aes::Aes256, U32>::new(GenericArray::from_slice(&key));
+            let random = cipher
+                .encrypt(GenericArray::from_slice(&nonce), [7; 16].as_slice())
+                .unwrap();
+            server_hello[6..38].copy_from_slice(&random);
+        }
+        for chunk in server_hello.chunks(if self.fragmented {
+            1
+        } else {
+            server_hello.len()
+        }) {
+            io.write_all(&record(CT_HANDSHAKE, chunk)).await?;
+        }
         io.write_all(&[20, 3, 3, 0, 1, 1]).await?;
         let Some(suite) = Suite::from_id(cipher) else {
             return Ok(());

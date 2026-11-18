@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "The mihomo REST and WebSocket API over Concord's control surface, for dashboards"
+description = "The Clash REST and WebSocket API over Concord's control surface, for dashboards"
 repository.workspace = true
 
 [lib]

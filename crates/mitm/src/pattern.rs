@@ -1,30 +1,46 @@
+use concord_config::mitm::{IssueKind, LineError};
 use fancy_regex::{Captures, Regex};
 
 /// A backtracking regex, as Surge's and Loon's patterns need. fancy-regex's default step
 /// limit stands in for a match timeout; a pattern that exceeds it matches nothing.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct PatternError(String);
+
+impl From<PatternError> for LineError {
+    fn from(err: PatternError) -> LineError {
+        LineError::new(IssueKind::Pattern, err.0)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Pattern {
     regex: Regex,
 }
 
 impl Pattern {
-    pub fn new(pattern: &str) -> Result<Pattern, String> {
+    pub fn new(pattern: &str) -> Result<Pattern, PatternError> {
         Self::build(pattern, false)
     }
 
-    pub fn multiline(pattern: &str) -> Result<Pattern, String> {
+    pub fn multiline(pattern: &str) -> Result<Pattern, PatternError> {
         Self::build(pattern, true)
     }
 
-    fn build(pattern: &str, multiline: bool) -> Result<Pattern, String> {
+    fn build(pattern: &str, multiline: bool) -> Result<Pattern, PatternError> {
         let source = if multiline {
-            format!("(?m){pattern}")
+            concord_config::mitm::multiline(pattern)
         } else {
             pattern.to_string()
         };
         Regex::new(&source)
             .map(|regex| Pattern { regex })
-            .map_err(|err| err.to_string())
+            .map_err(|err| PatternError(err.to_string()))
+    }
+
+    /// The regex as compiled, `(?m)` included for a multiline one.
+    pub(crate) fn source(&self) -> &str {
+        self.regex.as_str()
     }
 
     pub fn is_match(&self, text: &str) -> bool {

@@ -70,6 +70,9 @@ dto! {
         pub tproxy_port: u16,
         pub mixed_port: u16,
         pub allow_lan: bool,
+        pub bind_address: String,
+        pub lan_allowed_ips: Vec<String>,
+        pub lan_disallowed_ips: Vec<String>,
         /// User names only.
         pub authentication: Vec<String>,
         pub skip_auth_prefixes: Vec<String>,

@@ -54,6 +54,7 @@ regex = { workspace = true }
 
 [dev-dependencies]
 concord-test-support = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
 tempfile = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }

@@ -1,0 +1,92 @@
+[
+  {
+    "mode": "native",
+    "aes": true,
+    "config": "mlkem768x25519plus.native.0rtt.E75P6uryBMf9M1j8nAByGIHRdCeBKCJ-xnTzf3_pe20.V9tLNZ8jrl4Ubk4lEgVnBHIlBjSMFQwUdT0Mkz0E1CE",
+    "iv": "000102030405060708090a0b0c0d0e0f",
+    "ephemeral": [
+      "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d"
+    ],
+    "pfs": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+    "ticket": "003c42434445464748494a4b4c4d4e4f",
+    "payload": "564c45535320656e6372797074696f6e207769726520766563746f72",
+    "hello": "000102030405060708090a0b0c0d0e0f73b2d8b76aa9b53660032bc8f5d8bee3a3ae4e3b3a7fd49ade81f7347a34aa68dd60d9df1e0b3b10bd2ba59beef905932605d9f3321095b6f3ac25c68c4317040756727780a1e890417e684b19496bc637943a5a94bcf5beea00d1764fb0e4ab62e3e17797de4726f1b46d4d0b7945b3b59b34d9c238d32307d7de4392194a957e77b7bc2d33874808e8aeff7f27064b9fab",
+    "record": "170303002ce2faee2a700e06df9098fba8f332cc5b887af1f95db9b201bda83276a6b3424ff7776adff2d7f71a56eaa6ad"
+  },
+  {
+    "mode": "native",
+    "aes": false,
+    "config": "mlkem768x25519plus.native.0rtt.E75P6uryBMf9M1j8nAByGIHRdCeBKCJ-xnTzf3_pe20.V9tLNZ8jrl4Ubk4lEgVnBHIlBjSMFQwUdT0Mkz0E1CE",
+    "iv": "000102030405060708090a0b0c0d0e0f",
+    "ephemeral": [
+      "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d"
+    ],
+    "pfs": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+    "ticket": "003c42434445464748494a4b4c4d4e4f",
+    "payload": "564c45535320656e6372797074696f6e207769726520766563746f72",
+    "hello": "000102030405060708090a0b0c0d0e0f73b2d8b76aa9b53660032bc8f5d8bee3a3ae4e3b3a7fd49ade81f7347a34aa68dd60d9df1e0b3b10bd2ba59beef905932605d9f3321095b6f3ac25c68c4317040756727780a1e890417e684b19496bc637943a5a94bcf5beea00d1764fb0e4ab80a94165abe4da92d6f1fddb943a6401033265dfc86202f2ab7179ca92d175ee953494a71e4ecf3507b61d38fa5f87a28b23",
+    "record": "170303002c58c01b4dbe07c3a08491d60a322c66f3bf34540035c8eba140e2fef427c36e4fa57671915423327af26444a2"
+  },
+  {
+    "mode": "xorpub",
+    "aes": true,
+    "config": "mlkem768x25519plus.xorpub.0rtt.E75P6uryBMf9M1j8nAByGIHRdCeBKCJ-xnTzf3_pe20.V9tLNZ8jrl4Ubk4lEgVnBHIlBjSMFQwUdT0Mkz0E1CE",
+    "iv": "000102030405060708090a0b0c0d0e0f",
+    "ephemeral": [
+      "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d"
+    ],
+    "pfs": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+    "ticket": "003c42434445464748494a4b4c4d4e4f",
+    "payload": "564c45535320656e6372797074696f6e207769726520766563746f72",
+    "hello": "000102030405060708090a0b0c0d0e0feb5dcf1ea469faaa0a53ea3f0e271ae22d69db9779eb0e121a03fb4c57c67799dd60d9df1e0b3b10bd2ba59beef905932605d9f3321095b6f3ac25c68c431704e7ed1d29106724d27c69350ee64adc238fc11ec5e56b062f776f4cb241b6338762e3e17797de4726f1b46d4d0b7945b3b59b34d9c238d32307d7de4392194a957e77b7bc2d33874808e8aeff7f27064b9fab",
+    "record": "170303002ce2faee2a700e06df9098fba8f332cc5b887af1f95db9b201bda83276a6b3424ff7776adff2d7f71a56eaa6ad"
+  },
+  {
+    "mode": "xorpub",
+    "aes": false,
+    "config": "mlkem768x25519plus.xorpub.0rtt.E75P6uryBMf9M1j8nAByGIHRdCeBKCJ-xnTzf3_pe20.V9tLNZ8jrl4Ubk4lEgVnBHIlBjSMFQwUdT0Mkz0E1CE",
+    "iv": "000102030405060708090a0b0c0d0e0f",
+    "ephemeral": [
+      "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d"
+    ],
+    "pfs": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+    "ticket": "003c42434445464748494a4b4c4d4e4f",
+    "payload": "564c45535320656e6372797074696f6e207769726520766563746f72",
+    "hello": "000102030405060708090a0b0c0d0e0feb5dcf1ea469faaa0a53ea3f0e271ae22d69db9779eb0e121a03fb4c57c67799dd60d9df1e0b3b10bd2ba59beef905932605d9f3321095b6f3ac25c68c431704e7ed1d29106724d27c69350ee64adc238fc11ec5e56b062f776f4cb241b6338780a94165abe4da92d6f1fddb943a6401033265dfc86202f2ab7179ca92d175ee953494a71e4ecf3507b61d38fa5f87a28b23",
+    "record": "170303002c58c01b4dbe07c3a08491d60a322c66f3bf34540035c8eba140e2fef427c36e4fa57671915423327af26444a2"
+  },
+  {
+    "mode": "random",
+    "aes": true,
+    "config": "mlkem768x25519plus.random.0rtt.E75P6uryBMf9M1j8nAByGIHRdCeBKCJ-xnTzf3_pe20.V9tLNZ8jrl4Ubk4lEgVnBHIlBjSMFQwUdT0Mkz0E1CE",
+    "iv": "000102030405060708090a0b0c0d0e0f",
+    "ephemeral": [
+      "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d"
+    ],
+    "pfs": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+    "ticket": "003c42434445464748494a4b4c4d4e4f",
+    "payload": "564c45535320656e6372797074696f6e207769726520766563746f72",
+    "hello": "000102030405060708090a0b0c0d0e0feb5dcf1ea469faaa0a53ea3f0e271ae22d69db9779eb0e121a03fb4c57c67799dd60d9df1e0b3b10bd2ba59beef905932605d9f3321095b6f3ac25c68c431704e7ed1d29106724d27c69350ee64adc238fc11ec5e56b062f776f4cb241b6338762e3e17797de4726f1b46d4d0b7945b3b59b34d9c238d32307d7de4392194a957e77b7bc2d33874808e8aeff7f27064b9fab",
+    "record": "4ec5410fafe2faee2a700e06df9098fba8f332cc5b887af1f95db9b201bda83276a6b3424ff7776adff2d7f71a56eaa6ad"
+  },
+  {
+    "mode": "random",
+    "aes": false,
+    "config": "mlkem768x25519plus.random.0rtt.E75P6uryBMf9M1j8nAByGIHRdCeBKCJ-xnTzf3_pe20.V9tLNZ8jrl4Ubk4lEgVnBHIlBjSMFQwUdT0Mkz0E1CE",
+    "iv": "000102030405060708090a0b0c0d0e0f",
+    "ephemeral": [
+      "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d"
+    ],
+    "pfs": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+    "ticket": "003c42434445464748494a4b4c4d4e4f",
+    "payload": "564c45535320656e6372797074696f6e207769726520766563746f72",
+    "hello": "000102030405060708090a0b0c0d0e0feb5dcf1ea469faaa0a53ea3f0e271ae22d69db9779eb0e121a03fb4c57c67799dd60d9df1e0b3b10bd2ba59beef905932605d9f3321095b6f3ac25c68c431704e7ed1d29106724d27c69350ee64adc238fc11ec5e56b062f776f4cb241b6338780a94165abe4da92d6f1fddb943a6401033265dfc86202f2ab7179ca92d175ee953494a71e4ecf3507b61d38fa5f87a28b23",
+    "record": "4ec5410faf58c01b4dbe07c3a08491d60a322c66f3bf34540035c8eba140e2fef427c36e4fa57671915423327af26444a2"
+  }
+]

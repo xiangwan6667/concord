@@ -70,9 +70,11 @@ fn non_empty(text: &str) -> Option<String> {
 }
 
 pub(crate) fn looks_up_ech(tls: &TlsOpts) -> bool {
-    tls.ech
-        .as_ref()
-        .is_some_and(|ech| ech.enable && ech.config.is_empty())
+    tls.jls.is_none()
+        && tls
+            .ech
+            .as_ref()
+            .is_some_and(|ech| ech.enable && ech.config.is_empty())
 }
 
 /// `env` is where the node's dials leave their environment; without it, `ech-opts` with no
@@ -83,7 +85,24 @@ pub(crate) fn tls_options(
     ctx: &BuildCtx,
     env: Option<&EnvSlot>,
 ) -> Result<TlsOptions, BuildError> {
-    let (ech_config_list, ech_lookup) = match tls.ech.as_ref().filter(|ech| ech.enable) {
+    if let Some(auth) = &tls.jls {
+        return Ok(TlsOptions {
+            server_name: non_empty(&spec.sni),
+            alpn: spec.alpn,
+            tasks: ctx.tasks.clone(),
+            client_fingerprint: client_fingerprint(&tls.client_fingerprint),
+            jls: Some(concord_tls::JlsAuth {
+                username: auth.username.clone(),
+                password: auth.password.clone(),
+            }),
+            ..TlsOptions::default()
+        });
+    }
+    let (ech_config_list, ech_lookup) = match tls
+        .ech
+        .as_ref()
+        .filter(|ech| ech.enable && tls.jls.is_none())
+    {
         None => (None, None),
         Some(ech) if ech.config.is_empty() => {
             let slot = env.ok_or_else(|| {
@@ -135,6 +154,7 @@ pub(crate) fn tls_options(
     Ok(TlsOptions {
         server_name: non_empty(&spec.sni),
         alpn: spec.alpn,
+        tasks: ctx.tasks.clone(),
         skip_cert_verify: tls.skip_cert_verify,
         name_cert_verify: non_empty(&tls.name_cert_verify),
         fingerprint: non_empty(&tls.fingerprint),
@@ -142,6 +162,7 @@ pub(crate) fn tls_options(
         private_key: client_identity(&tls.private_key, ctx)?,
         client_fingerprint: fingerprint,
         reality,
+        jls: None,
         ech_config_list,
         ech_lookup,
     })

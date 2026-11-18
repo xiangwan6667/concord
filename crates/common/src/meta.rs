@@ -139,6 +139,7 @@ pub struct RouteState {
     pub process: Option<Arc<ProcessInfo>>,
     pub process_looked_up: bool,
     pub special_rules: Option<Arc<str>>,
+    pub rematch_name: Option<Arc<str>>,
 }
 
 impl RouteState {

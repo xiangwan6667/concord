@@ -3,13 +3,15 @@ use std::fmt;
 #[derive(Debug, thiserror::Error)]
 pub enum GroupError {
     #[error("{0}")]
-    Config(String),
+    Config(#[from] concord_config::ConfigError),
     #[error("loop is detected in ProxyGroup, please check following ProxyGroups: {0:?}")]
     Cycle(Vec<String>),
     #[error("{group}: `use` or `proxies` missing")]
     MissingMembers { group: String },
     #[error("{group}: '{name}' not found")]
     NotFound { group: String, name: String },
+    #[error("{0} cannot be dialed")]
+    CannotDial(String),
     #[error("{group}: empty fallback proxy '{name}' not found")]
     EmptyFallback { group: String, name: String },
     #[error("proxy group {0}: the duplicate name")]
@@ -18,8 +20,6 @@ pub enum GroupError {
     DuplicateProvider { group: String },
     #[error("parse proxy provider {provider} error: {message}")]
     Provider { provider: String, message: String },
-    #[error("proxy {name}: {message}")]
-    Proxy { name: String, message: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

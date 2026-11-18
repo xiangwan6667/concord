@@ -19,16 +19,20 @@ tokio-util = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
 h2 = { workspace = true }
+h3 = { workspace = true }
+h3-quinn = { workspace = true }
+quinn = { workspace = true }
 bytes = { workspace = true }
 base64 = { workspace = true }
 rand = { workspace = true }
-hmac = { workspace = true }
-sha1 = { workspace = true }
+aws-lc-rs = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
+hmac = { workspace = true }
+sha1 = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }

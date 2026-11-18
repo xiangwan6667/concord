@@ -1,11 +1,13 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
+mod gost_plugin;
 mod gun;
 mod h2_transport;
-mod h2io;
+pub mod h2io;
 mod http1;
 mod http_obfs;
 mod outgoing;
+mod session_socket;
 mod shadowtls;
 mod simple_obfs;
 mod singmux;
@@ -16,13 +18,14 @@ mod xhttp;
 use std::io;
 use std::sync::Arc;
 
-use concord_common::BoxStream;
+use concord_common::{BoxStream, Tasks};
 use concord_tls::TlsConnector;
 use futures_util::future::BoxFuture;
 
 pub use gun::{GrpcOptions, GunClient};
 pub use h2_transport::H2Options;
 pub use http_obfs::HttpOptions;
+pub use session_socket::SessionSocket;
 pub use shadowtls::{DEFAULT_ALPN, ShadowTlsClient, ShadowTlsOptions, WS_ALPN};
 pub use simple_obfs::{ObfsMode, ObfsOptions};
 pub use singmux::{
@@ -30,7 +33,7 @@ pub use singmux::{
 };
 pub use v2ray_plugin::V2rayPluginOptions;
 pub use ws::WsOptions;
-pub use xhttp::{XhttpClient, XhttpDownload, XhttpOptions, XhttpReuse};
+pub use xhttp::{QuicDialFn, XhttpClient, XhttpDial, XhttpDownload, XhttpOptions, XhttpReuse};
 
 pub type DialFn = Arc<dyn Fn() -> BoxFuture<'static, io::Result<BoxStream>> + Send + Sync>;
 
@@ -63,6 +66,16 @@ pub fn tls_dial(
     })
 }
 
+/// `dial` with the ShadowTLS handshake run on each new connection.
+pub fn shadow_tls_dial(dial: DialFn, client: Arc<ShadowTlsClient>, host: String) -> DialFn {
+    Arc::new(move || {
+        let dial = dial.clone();
+        let client = client.clone();
+        let host = host.clone();
+        Box::pin(async move { client.connect(dial().await?, &host).await })
+    })
+}
+
 #[derive(Clone)]
 pub enum Layer {
     Ws(WsOptions),
@@ -74,22 +87,41 @@ pub enum Layer {
     Http(HttpOptions),
     SimpleObfs(ObfsOptions),
     V2rayPlugin(V2rayPluginOptions),
+    GostPlugin(V2rayPluginOptions),
+    /// One smux v1 stream with its own session.
+    Smux,
     Tls(Arc<TlsConnector>),
     ShadowTls(Arc<ShadowTlsClient>),
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TransportStack {
     layers: Vec<Layer>,
+    tasks: Tasks,
 }
 
 impl TransportStack {
-    pub fn new(layers: Vec<Layer>) -> Self {
-        TransportStack { layers }
+    pub fn new(layers: Vec<Layer>, tasks: Tasks) -> Self {
+        TransportStack { layers, tasks }
     }
 
     pub fn layers(&self) -> &[Layer] {
         &self.layers
+    }
+
+    pub fn tasks(&self) -> &Tasks {
+        &self.tasks
+    }
+
+    /// The stack with `layer` first, under the others.
+    pub fn under(self, layer: Layer) -> Self {
+        let mut layers = Vec::with_capacity(self.layers.len() + 1);
+        layers.push(layer);
+        layers.extend(self.layers);
+        TransportStack {
+            layers,
+            tasks: self.tasks,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -119,13 +151,21 @@ impl TransportStack {
                         "the stack has no stream to build on",
                     ));
                 }
-                (Layer::Ws(opts), Some(stream)) => ws::apply(stream, opts, target_host).await?,
-                (Layer::H2(opts), Some(stream)) => h2_transport::connect(stream, opts).await?,
+                (Layer::Ws(opts), Some(stream)) => {
+                    ws::apply(stream, opts, target_host, &self.tasks).await?
+                }
+                (Layer::H2(opts), Some(stream)) => {
+                    h2_transport::connect(stream, opts, &self.tasks).await?
+                }
                 (Layer::Http(opts), Some(stream)) => http_obfs::wrap(stream, opts, target_host),
                 (Layer::SimpleObfs(opts), Some(stream)) => simple_obfs::wrap(stream, opts),
                 (Layer::V2rayPlugin(opts), Some(stream)) => {
-                    v2ray_plugin::apply(stream, opts).await?
+                    v2ray_plugin::apply(stream, opts, &self.tasks).await?
                 }
+                (Layer::GostPlugin(opts), Some(stream)) => {
+                    gost_plugin::apply(stream, opts, &self.tasks).await?
+                }
+                (Layer::Smux, Some(stream)) => singmux::smux_stream(stream, &self.tasks).await?,
                 (Layer::Tls(connector), Some(stream)) => {
                     Box::new(connector.connect_unaligned(stream, target_host).await?)
                 }

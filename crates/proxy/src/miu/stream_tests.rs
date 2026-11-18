@@ -23,7 +23,11 @@ impl Wake for Signal {
 #[tokio::test]
 async fn reconnect_completion_wakes_both_io_directions() {
     for read_last in [false, true] {
-        let pool = Pool::new(30, Padding::parse(b"stop=0").unwrap());
+        let pool = Pool::new(
+            30,
+            Padding::parse(b"stop=0").unwrap(),
+            concord_common::Tasks::default(),
+        );
         let (client, _peer) = tokio::io::duplex(1024);
         let mut stream = MiuStream::new(IdleLane::new(Box::new(client), None), pool, 0);
         stream.recycling = true;
@@ -81,7 +85,11 @@ async fn reconnect_completion_wakes_both_io_directions() {
 #[tokio::test]
 async fn reconnect_completion_wakes_flush_and_shutdown_waiters() {
     for shutdown in [false, true] {
-        let pool = Pool::new(30, Padding::parse(b"stop=0").unwrap());
+        let pool = Pool::new(
+            30,
+            Padding::parse(b"stop=0").unwrap(),
+            concord_common::Tasks::default(),
+        );
         let (client, _peer) = tokio::io::duplex(1024);
         let mut stream = MiuStream::new(IdleLane::new(Box::new(client), None), pool, 0);
         stream.recycling = true;

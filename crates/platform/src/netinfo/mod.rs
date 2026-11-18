@@ -18,12 +18,25 @@ mod sockaddr;
 #[cfg(windows)]
 mod win;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use crate::InterfaceInfo;
 
 pub use resolv::parse_resolv_conf;
 pub use tables::{Cache, Tables};
+
+/// Every address on the host's interfaces, as Go's `net.InterfaceAddrs`.
+#[cfg(unix)]
+pub fn interface_addrs() -> Vec<IpAddr> {
+    let mut out = Vec::new();
+    ifaces::walk(|_, _, addr, _| out.push(addr));
+    out
+}
+
+#[cfg(windows)]
+pub fn interface_addrs() -> Vec<IpAddr> {
+    win::local_addrs()
+}
 
 #[cfg(unix)]
 pub fn interface_by_name(name: &str) -> Option<InterfaceInfo> {

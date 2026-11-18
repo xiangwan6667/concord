@@ -7,6 +7,9 @@ ignore = [
   # i18n-embed-fl); neither is linked into a binary, and neither has a fixed release to move to.
   { id = "RUSTSEC-2026-0374", reason = "basic-toml: unmaintained, compile-time only through age's i18n macros" },
   { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2: unmaintained, compile-time only through age's i18n-embed-fl macros" },
+  # russh-util 0.52, the latest, depends on chrono only for wasm32, a target Concord does not build; cargo-deny
+  # still reports it because it checks every target.
+  { id = "RUSTSEC-2026-0543", reason = "chrono: unmaintained, a wasm32-only dependency of russh-util and not built for any Concord target" },
 ]
 
 [licenses]

@@ -41,11 +41,14 @@ belongs in `.agents/`.
   even when a benchmark improves. An experiment that moves a number is evidence until its cause is known.
 - When Concord behaves differently from mihomo (wire defaults, padding, framing, queue sizes, edge cases), align it to
   mihomo unless the deviation is a clear improvement with no compatibility risk.
+- Whether a profile key takes effect is what `concord -t` reports and what `crates/config/tests/tiers.rs` proves for
+  its tier, never what a search for the field name suggests. A key joins the inert tier in `keys.rs` only when mihomo's
+  results ignore it too or the host owns it, with that reason beside its list and an entry in `docs/compatibility.md`.
 - Keep the layering: `cargo xtask check-layers` holds each crate to its exact dependencies and release `opt-level`.
   Every outbound socket goes through `concord_net::Sockets`; `clippy.toml` rejects the bypasses.
 - Before reporting a change done, run the full gate in `commands.md`. Name any check you could not run and why.
-- One target directory per checkout. Never point two Concord checkouts at the same `CARGO_TARGET_DIR`, and clean what
-  you build when you are done with it.
+- Worktrees share the main checkout's `target/`, each build under its own `--cfg` (Target Directory And Disk in
+  `commands.md`); clean what you build when you are done with it.
 - Comments carry only what the code cannot say; see `rules.md`. No agent trailers in commits, and no machine-local
   paths, user names, host names or personal emails anywhere in the repository.
 

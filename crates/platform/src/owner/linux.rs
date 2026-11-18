@@ -1,10 +1,14 @@
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
+#[cfg(target_os = "linux")]
 use std::path::Path;
 use std::time::Duration;
 
-use concord_common::{Network, ProcessInfo};
+use concord_common::Network;
+#[cfg(target_os = "linux")]
+use concord_common::ProcessInfo;
 use socket2::{Domain, Protocol, Socket, Type};
 
 use super::procnet::{self, Match};
@@ -17,7 +21,7 @@ const NLM_F_REQUEST_DUMP: u16 = 0x1 | 0x300;
 const HEADER: usize = 16;
 const DIAG_MSG: usize = 72;
 
-fn request(family: u8, protocol: u8) -> Vec<u8> {
+fn request(family: u8, protocol: u8, port: u16) -> Vec<u8> {
     let mut message = Vec::with_capacity(HEADER + 56);
     message.extend_from_slice(&((HEADER + 56) as u32).to_ne_bytes());
     message.extend_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
@@ -25,7 +29,8 @@ fn request(family: u8, protocol: u8) -> Vec<u8> {
     message.extend_from_slice(&[0; 8]);
     message.extend_from_slice(&[family, protocol, 0, 0]);
     message.extend_from_slice(&u32::MAX.to_ne_bytes());
-    message.extend_from_slice(&[0; 40]);
+    message.extend_from_slice(&port.to_be_bytes());
+    message.extend_from_slice(&[0; 38]);
     message.extend_from_slice(&[0xff; 8]);
     message
 }
@@ -52,7 +57,7 @@ fn parse_diag(data: &[u8]) -> Option<Diag> {
     })
 }
 
-fn dump(protocol: u8, family: u8) -> Option<Vec<Diag>> {
+fn dump(protocol: u8, family: u8, port: u16) -> Option<Vec<Diag>> {
     let socket = Socket::new(
         Domain::from(libc::AF_NETLINK),
         Type::RAW,
@@ -60,7 +65,7 @@ fn dump(protocol: u8, family: u8) -> Option<Vec<Diag>> {
     )
     .ok()?;
     socket.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    (&socket).write_all(&request(family, protocol)).ok()?;
+    (&socket).write_all(&request(family, protocol, port)).ok()?;
 
     let mut found = Vec::new();
     let mut buf = vec![0u8; 64 * 1024];
@@ -98,8 +103,10 @@ fn sock_diag(network: Network, src: SocketAddr) -> Option<Diag> {
     let wanted = src.ip();
     let mut wildcard = None;
     for &family in families {
-        for diag in dump(protocol, family).unwrap_or_default() {
-            if diag.local.port() != src.port() {
+        for diag in dump(protocol, family, src.port()).unwrap_or_default() {
+            // A socket no process holds any more (TIME_WAIT, or closed and still finishing
+            // its handshake) reports inode 0 and may share its port with a live connection.
+            if diag.local.port() != src.port() || diag.inode == 0 {
                 continue;
             }
             let ip = diag.local.ip();
@@ -118,6 +125,14 @@ fn sock_diag(network: Network, src: SocketAddr) -> Option<Diag> {
     wildcard
 }
 
+pub fn find_uid(network: Network, src: SocketAddr) -> Option<u32> {
+    match sock_diag(network, src) {
+        Some(diag) => Some(diag.uid),
+        None => procnet::lookup(network, src, Match::Exact).map(|entry| entry.uid),
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn socket_holder(inode: u64, uid: u32) -> Option<String> {
     let needle = format!("socket:[{inode}]");
     for entry in std::fs::read_dir("/proc").ok()?.flatten() {
@@ -147,6 +162,7 @@ fn socket_holder(inode: u64, uid: u32) -> Option<String> {
     None
 }
 
+#[cfg(target_os = "linux")]
 pub fn find(network: Network, src: SocketAddr) -> Option<ProcessInfo> {
     let (uid, inode) = match sock_diag(network, src) {
         Some(diag) => (diag.uid, u64::from(diag.inode)),
@@ -175,10 +191,11 @@ mod tests {
 
     #[test]
     fn the_request_is_a_dump_of_one_family() {
-        let message = request(2, 6);
+        let message = request(2, 6, 8080);
         assert_eq!(message.len(), 72);
         assert_eq!(u32::from_ne_bytes(message[..4].try_into().unwrap()), 72);
         assert_eq!(&message[16..20], &[2, 6, 0, 0]);
+        assert_eq!(&message[24..26], &8080u16.to_be_bytes());
     }
 
     #[test]
@@ -201,6 +218,20 @@ mod tests {
     }
 
     #[test]
+    fn a_listening_socket_belongs_to_this_uid() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let uid = std::fs::metadata("/proc/self").map(|meta| {
+            use std::os::unix::fs::MetadataExt;
+            meta.uid()
+        });
+        assert_eq!(
+            find_uid(Network::Tcp, listener.local_addr().unwrap()),
+            uid.ok()
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn this_process_owns_its_listening_socket() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let info = find(Network::Tcp, listener.local_addr().unwrap()).unwrap();
@@ -214,6 +245,34 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn a_closed_socket_on_the_same_port_is_not_the_owner() {
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let second = TcpListener::bind("127.0.0.1:0").unwrap();
+        let reusable = || {
+            let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+            socket.set_reuse_address(true).unwrap();
+            socket
+        };
+        let closed = reusable();
+        let any: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        closed.bind(&any.into()).unwrap();
+        closed.connect(&first.local_addr().unwrap().into()).unwrap();
+        let src = closed.local_addr().unwrap().as_socket().unwrap();
+        let _peer = first.accept().unwrap();
+        drop(closed);
+
+        let live = reusable();
+        live.bind(&src.into()).unwrap();
+        live.connect(&second.local_addr().unwrap().into()).unwrap();
+
+        let info = find(Network::Tcp, src).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(Path::new(&info.path).file_name(), exe.file_name());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn an_unresolvable_holder_leaves_no_owner() {
         assert_eq!(socket_holder(u64::MAX, u32::MAX), None);
     }

@@ -1,0 +1,44 @@
+name: feature-powerset
+
+# `ci` checks the default features and each crate that has optional ones without them. This checks every crate under
+# every combination of its features; no crate has more than one optional feature, so the run is short.
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  powerset:
+    name: Feature powerset
+    if: ${{ !github.event.repository.fork }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        with:
+          tool: cargo-hack@0.6.45
+
+      # `--no-dev-deps` edits the manifests for the run, so cargo cannot hold the lockfile; the diff below checks
+      # that it was put back.
+      - name: Check every feature combination
+        run: cargo hack check --workspace --feature-powerset --no-dev-deps --keep-going
+
+      - name: Check that no tracked file changed
+        run: git diff --exit-code

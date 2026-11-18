@@ -29,10 +29,13 @@ crate's directory, its `[patch.crates-io]` entry and its lines in `UPSTREAM.sha2
 |---|---|---|---|
 | blake3 | Byte-string key-derivation contexts | None | Propose the byte-slice counterpart of `hash_derive_key_context` to BLAKE3-team/BLAKE3 |
 | boring | Read-only `SslRef` record-layer accessors | None | None planned: the change stays in the vendored copy |
+| h3 | Bound frame and DATA read-ahead | hyperium/h3#344, `c916ed5a` (frame headers); #328 and #386 are related | Backport #344; propose the DATA-body extension to hyperium/h3 |
+| h3 | Opt-in draft-00 datagram SETTINGS for WARP | None | Propose the default-off client builder switch to hyperium/h3 |
 | h2 | Ignore DATA and HEADERS on forgotten client streams | None as of 0.4.20 | Issue and PR to hyperium/h2 with the delayed-DATA-after-reset transport test |
 | mio | High-resolution timed waits on Windows | None | PR to tokio-rs/mio, citing Go's default poller path |
 | quinn | `MAX_TRANSMIT_DATAGRAMS` 80 (`MAX_TRANSMIT_SEGMENTS` back to upstream's 10) | n0-computer/noq#636 (noq) | The segment cap is upstream's again; propose only the datagram limit to quinn-rs/quinn |
 | quinn | Stamp each received batch with its own read time | None; quinn `main` `8fe66c3` passes one `now` | PR with `crates/proxy/tests/quinn_recv_time.rs` as the regression |
+| quinn | Lease receive scratch for a socket poll instead of an endpoint lifetime | None | Propose to quinn-rs/quinn with the endpoint sharing regression and receive-buffer lease contracts |
 | quinn-proto | `send_quantum`, `on_packet_lost`, `min_pacing_delay` and explicit-rate pacing | quinn-rs/quinn#2481; merged as noq#611 | Follow #2481. `min_pacing_delay` is Concord's own addition and needs its own proposal; the pacer changes cannot move into `proxy/src/quic/congestion.rs` while the controller API lacks these hooks |
 | quinn-proto | Requeue unacknowledged STREAM data on a PTO; withdraw acknowledged copies | None; quinn `main` `765abecf` requeues only control frames | PR with the recovery contracts of `crates/proxy/tests/quinn_pto.rs` |
 | quinn-proto | A DATAGRAM-only packet does not bundle a pending ACK | None | PR citing quic-go's default path and the `quinn_pto.rs` ACK contracts |
@@ -100,6 +103,14 @@ The package archive checksum is `7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c
 
 ## quinn 0.11.12
 
+- `src/endpoint.rs`, `src/endpoint/recv_buffer.rs`: receive scratch is leased from a thread-local cache only
+  during `poll_socket`. Packets are already copied into owned `BytesMut`s before dispatch, so no scratch must
+  survive the poll. Keeping the full batch/GRO scratch on each endpoint multiplies it by all live and closing
+  endpoints, and the allocator can retain the freed pages after connection churn. One cached allocation per
+  polling thread keeps the original payload, GRO and batch capacities without tying storage to endpoint count.
+  The lease holds no cache borrow while a custom socket is called, supports reentrant polls, and frees normally
+  if thread-local destruction has started. Contracts: `quic::receive_scratch_tests` and
+  `crates/proxy/tests/quinn_recv_buffer.rs`.
 - `src/connection.rs`: `MAX_TRANSMIT_DATAGRAMS` 20 → 80, the value proposed in n0-computer/noq#636. A bulk sender
   yields, and wakes another tokio worker, a quarter as often (`8452ddc`). `MAX_TRANSMIT_SEGMENTS` stays at upstream's
   10: `8452ddc` raised it to 40 with #645, and a 40-datagram GSO packet cost the receiving Go server 30% more CPU per
@@ -228,3 +239,33 @@ Upgrade `quinn`, `quinn-proto` and `quinn-udp` together; replay these changes an
 
 - `src/async_device/unix/mod.rs`: `AsyncDevice::into_sync` returns the existing owned device after reactor deregistration, preserving its FD, queued packets and VNET/offload state. TUN queue owners use it with `AsyncDevice::new` to register on their runtime; raw-fd adoption rejects VNET descriptors.
 
+
+## h3 0.0.8
+
+The package archive checksum is `10872b55cfb02a821b69dc7cf8dc6a71d6af25eb9a79662bec4a9d016056b3be`.
+
+- `src/frame.rs`: backport the decode-before-read ordering from upstream
+  [PR #344](https://github.com/hyperium/h3/pull/344), commit
+  [`c916ed5af1c6818c74fb86cc05a18e51ecc1fcb1`](https://github.com/hyperium/h3/commit/c916ed5af1c6818c74fb86cc05a18e51ecc1fcb1).
+  Extend the same backpressure to DATA bodies: drain buffered bytes before polling QUIC again, preventing
+  accumulating read-ahead and quadratic cursor walks. Upstream's changelog still ends at 0.0.8; master contains
+  #344 but still polls QUIC first in `poll_data`. The broader [PR #328](https://github.com/hyperium/h3/pull/328)
+  reworks buffering; [issue #386](https://github.com/hyperium/h3/issues/386) tracks truncated DATA. Propose the
+  DATA-body extension upstream; it has not been submitted. Drop the frame-header backport when upgrading past
+  #344, and recheck the DATA extension separately. Truncated finite DATA returns `H3_FRAME_ERROR` rather than
+  clean EOF (RFC 9114 section 7.1); an explicit unframed marker preserves WebTransport EOF. Public-API regressions
+  are in `crates/proxy/tests/h3_read_ahead.rs`; xhttp's lifecycle test checks error propagation without a panic.
+
+- `src/config.rs`, `src/client/builder.rs`: a default-off legacy HTTP datagram switch advertises `0x276: 1`
+  for MASQUE peers, alongside the standard setting. The default encoding is unchanged. The byte-level QUIC
+  contracts are in `crates/proxy/tests/h3_settings.rs`; the off-switch golden was captured from unpatched 0.0.8.
+- `src/ext.rs`: the fixed `CF_CONNECT_IP` protocol token sends and decodes Cloudflare WARP extended CONNECT
+  requests. Existing protocol values and defaults are unchanged; there is no dynamic protocol API.
+- `src/proto/headers.rs`: ordinary CONNECT omits `:scheme`/`:path` as RFC 9114 section 4.4 requires;
+  extended CONNECT and other methods keep their original bytes. Consider reporting this fix upstream.
+- `src/config.rs`, `src/client/builder.rs`: default-off omission of disabled extension settings, used only by
+  MASQUE to match quic-go's IP and L4 SETTINGS profiles. Other H3 clients retain their original bytes.
+- `src/config.rs`, `src/proto/frame.rs`: peer datagram support also recognizes and retains WARP's draft-00
+  setting as a receive-side alias.
+- `src/shared_state.rs`, `src/client/connection.rs`: a read-only poll for received peer datagram SETTINGS lets
+  CONNECT-IP wait for and validate peer support without enabling h3's internal API feature.

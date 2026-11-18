@@ -6,16 +6,13 @@ use serde_json::Value;
 use crate::Map;
 use crate::dns::DnsConfig;
 use crate::error::{ConfigError, Result};
-use crate::filter::CompiledFilter;
 use crate::general::General;
 use crate::geox::GeoConfig;
 use crate::group::{GroupDef, GroupKind, find_group_cycle, parse_group};
 use crate::hosts::{HostsConfig, parse_hosts};
-use crate::lenient::Fields;
-use crate::net::IpCidr;
 use crate::ntp::NtpConfig;
 use crate::provider::{
-    ProxyProviderDef, ProxySource, RuleProviderDef, parse_proxy_provider, parse_rule_provider,
+    ProxyProviderDef, ProxySource, RuleProviderDef, parse_proxy_provider, parse_rule_providers,
 };
 use crate::proxy::{Capabilities, ProxyDef, ProxyParse, Quarantined, parse_proxy, proxy_warnings};
 use crate::raw::{RawConfig, parse_raw_with_key};
@@ -34,7 +31,7 @@ const BUILTIN_TARGETS: [&str; 7] = [
     "COMPATIBLE",
     "GLOBAL",
 ];
-const RESERVED_PROVIDER: &str = "COMPATIBLE";
+const RESERVED_PROVIDER: &str = "default";
 const DEFAULT_TEST_URL: &str = "https://www.gstatic.com/generate_204";
 
 #[derive(Clone, Debug, Default)]
@@ -64,12 +61,10 @@ pub struct Profile {
     /// of them at once cost several times the text.
     pub rules: RuleLines,
     pub sub_rules: IndexMap<String, Vec<RuleDef>>,
-    pub store_selected: bool,
     pub store_fake_ip: bool,
     pub dialer_ip4p_convert: bool,
-    pub lan_listener_refused: bool,
     pub refuse_all: bool,
-    pub mitm: Map,
+    pub mitm: crate::mitm::MitmDef,
     pub tls: TlsConfig,
     pub report: LoadReport,
 }
@@ -90,13 +85,10 @@ impl Profile {
             tun: TunConfig::default(),
             sniffer: SnifferConfig::default(),
             hosts: HostsConfig::default(),
-            geo: GeoConfig::from_maps(&General::default(), &Map::new()).unwrap_or(GeoConfig {
+            geo: GeoConfig::from_map(&Map::new()).unwrap_or(GeoConfig {
                 mmdb_url: String::new(),
                 asn_url: String::new(),
                 geosite_url: String::new(),
-                auto_update: false,
-                update_interval_hours: 24,
-                loader: crate::general::GeodataLoader::MemConservative,
             }),
             ntp: NtpConfig {
                 enable: false,
@@ -115,12 +107,10 @@ impl Profile {
             rule_providers: Vec::new(),
             rules: RuleLines::default(),
             sub_rules: IndexMap::new(),
-            store_selected: false,
             store_fake_ip: false,
             dialer_ip4p_convert: false,
-            lan_listener_refused: false,
             refuse_all: true,
-            mitm: Map::new(),
+            mitm: crate::mitm::MitmDef::default(),
             tls: TlsConfig::default(),
             report: LoadReport::default(),
         }
@@ -138,34 +128,6 @@ pub fn load(bytes: &[u8], options: &LoadOptions) -> Result<Profile> {
 
 pub fn load_str(text: &str, options: &LoadOptions) -> Result<Profile> {
     load(text.as_bytes(), options)
-}
-
-fn lan_is_restricted(general: &Map) -> Result<bool> {
-    let mut f = Fields::new(general, "", false);
-    let bind = f.string("bind-address")?;
-    if !matches!(bind.as_str(), "" | "*" | "0.0.0.0" | "::" | "[::]") {
-        return Ok(true);
-    }
-    if !f.strings("lan-disallowed-ips")?.is_empty() {
-        return Ok(true);
-    }
-    let allowed = f.strings("lan-allowed-ips")?;
-    if allowed.is_empty() {
-        return Ok(false);
-    }
-    let (mut all_v4, mut all_v6) = (false, false);
-    for entry in &allowed {
-        if let Some(cidr) = IpCidr::parse(entry)
-            && cidr.covers_everything()
-        {
-            if cidr.is_ipv4() {
-                all_v4 = true;
-            } else {
-                all_v6 = true;
-            }
-        }
-    }
-    Ok(!(all_v4 && all_v6))
 }
 
 struct Names {
@@ -187,10 +149,17 @@ fn parse_provider_proxies(
     report: &mut LoadReport,
 ) -> Result<()> {
     for provider in providers {
-        let ProxySource::Inline { payload } = &provider.source else {
-            continue;
+        let payload = match &provider.source {
+            ProxySource::Inline { payload } => payload,
+            _ => &provider.fallback,
         };
-        for (index, mapping) in payload.iter().enumerate() {
+        if provider.override_.expr || payload.is_empty() {
+            continue;
+        }
+        let selected = provider.select_proxies(payload.clone()).map_err(|err| {
+            err.prefixed(&format!("parse proxy provider {} error: ", provider.name))
+        })?;
+        for (index, mapping) in selected.iter().enumerate() {
             let prefix = format!(
                 "parse proxy provider {} error: proxy {index}: ",
                 provider.name
@@ -321,6 +290,8 @@ fn resolve_groups(
             ))
             .with_line(line));
         }
+        let prefix = format!("proxy-groups.{}.", group.name);
+        report.warn_ignored(&prefix, &group.ignored);
         names.groups.insert(group.name.clone());
         groups.push(group);
     }
@@ -358,21 +329,11 @@ fn resolve_groups(
         if group.include_all_providers {
             group.use_providers = sorted_providers.iter().map(|s| (*s).to_string()).collect();
         }
+        let mut dropped = Vec::new();
         if group.include_all_proxies {
-            if group.filter.is_empty() {
-                group
-                    .proxies
-                    .extend(sorted_proxies.iter().map(|s| (*s).to_string()));
-            } else {
-                let filter =
-                    CompiledFilter::compile(&group.filter).map_err(|err| fail(err.message))?;
-                group.proxies.extend(
-                    sorted_proxies
-                        .iter()
-                        .filter(|name| filter.is_match(name))
-                        .map(|s| (*s).to_string()),
-                );
-            }
+            dropped = group
+                .take_all_proxies(&sorted_proxies, &names.quarantined)
+                .map_err(|err| fail(err.message))?;
             if group.proxies.is_empty() && group.use_providers.is_empty() {
                 group.proxies = vec![fallback.clone()];
             }
@@ -381,20 +342,21 @@ fn resolve_groups(
             return Err(fail(format!("{}: `use` or `proxies` missing", group.name)));
         }
         for provider in &group.use_providers {
-            if provider == RESERVED_PROVIDER {
+            let defined = provider_defs.iter().any(|p| &p.name == provider);
+            if provider == RESERVED_PROVIDER || (!defined && names.groups.contains(provider)) {
                 return Err(fail(format!(
                     "proxy group {provider} can't contains in `use`"
                 )));
             }
-            if !provider_defs.iter().any(|p| &p.name == provider) {
+            if !defined {
                 return Err(fail(format!("{}: '{provider}' not found", group.name)));
             }
         }
         let had_proxies = !group.proxies.is_empty();
         let mut kept = Vec::with_capacity(group.proxies.len());
-        let mut dropped = Vec::new();
         for proxy in std::mem::take(&mut group.proxies) {
-            if names.known.contains(&proxy) || BUILTIN_TARGETS.contains(&proxy.as_str()) {
+            let builtin = BUILTIN_TARGETS.contains(&proxy.as_str()) && proxy != "GLOBAL";
+            if names.known.contains(&proxy) || builtin {
                 kept.push(proxy);
             } else if names.quarantined.contains(&proxy) {
                 quarantined_refs.insert(proxy.clone());
@@ -444,40 +406,6 @@ fn resolve_groups(
         }
     }
     Ok((groups, refused))
-}
-
-fn global_group(proxies: &[ProxyDef], groups: &[GroupDef]) -> GroupDef {
-    let mut members = vec!["DIRECT".to_string(), "REJECT".to_string()];
-    members.extend(proxies.iter().map(|p| p.name.clone()));
-    members.extend(groups.iter().map(|g| g.name.clone()));
-    GroupDef {
-        name: "GLOBAL".to_string(),
-        kind: GroupKind::Select,
-        proxies: members,
-        use_providers: Vec::new(),
-        use_position: IndexMap::new(),
-        url: DEFAULT_TEST_URL.to_string(),
-        interval: 0,
-        timeout: 0,
-        max_failed_times: 0,
-        empty_fallback: "COMPATIBLE".to_string(),
-        lazy: true,
-        disable_udp: false,
-        filter: String::new(),
-        exclude_filter: String::new(),
-        exclude_type: String::new(),
-        expected_status: "*".to_string(),
-        include_all: false,
-        include_all_proxies: false,
-        include_all_providers: false,
-        hidden: false,
-        icon: String::new(),
-        tolerance: 0,
-        default_selected: String::new(),
-        strategy: Default::default(),
-        hash_key: String::new(),
-        raw: Map::new(),
-    }
 }
 
 fn cond_types(cond: &Cond, out: &mut Vec<&'static str>) {
@@ -562,14 +490,21 @@ fn each_checked_rule<'a>(
                 "rule type {unsupported} is not supported by this core"
             )));
         }
-        if matches!(rule.cond, Cond::SubRule(_)) {
-            if !ctx.sub_rules.contains_key(&rule.target) {
+        let proxy =
+            BUILTIN_TARGETS.contains(&rule.target.as_str()) || ctx.names.resolves(&rule.target);
+        if !matches!(rule.cond, Cond::SubRule(_)) {
+            if !proxy {
+                return Err(fail(&format!("proxy [{}] not found", rule.target)));
+            }
+        } else if !ctx.sub_rules.contains_key(&rule.target) {
+            if !proxy || format != "rules" {
                 return Err(fail(&format!("sub-rule [{}] not found", rule.target)));
             }
-        } else if !BUILTIN_TARGETS.contains(&rule.target.as_str())
-            && !ctx.names.resolves(&rule.target)
-        {
-            return Err(fail(&format!("proxy [{}] not found", rule.target)));
+            let message = format!(
+                "SUB-RULE target {} is not a sub-rule, so the rule never matches",
+                rule.target
+            );
+            report.info("rule_never_matches", format!("rules[{index}]"), message);
         }
         let mut sets = Vec::new();
         rule.cond.rule_sets(&mut sets);
@@ -653,9 +588,6 @@ fn warn_tun_settings(tun: &TunConfig, report: &mut LoadReport) {
         ),
         _ => {}
     }
-    if tun.gso {
-        report.warn("not_applied", "tun.gso", "gso is not applied by this core");
-    }
 }
 
 fn warn_ignored_sections(raw: &RawConfig, report: &mut LoadReport) {
@@ -696,12 +628,15 @@ fn warn_ignored_sections(raw: &RawConfig, report: &mut LoadReport) {
 
 pub fn load_raw(mut raw: RawConfig, options: &LoadOptions) -> Result<Profile> {
     let mut report = std::mem::take(&mut raw.report);
-    let general = General::from_map(&raw.general)?;
-    let dns = DnsConfig::from_map(&raw.dns).map_err(|err| err.prefixed("dns: "))?;
-    let tun = TunConfig::from_map(&raw.tun).map_err(|err| err.prefixed("tun: "))?;
-    let sniffer = SnifferConfig::from_map(&raw.sniffer).map_err(|err| err.prefixed("sniffer: "))?;
-    let ntp = NtpConfig::from_map(&raw.ntp)?;
-    let geo = GeoConfig::from_maps(&general, &raw.geox_url)?;
+    let (general, general_notes) = General::read(&raw.general)?;
+    let (dns, dns_notes) =
+        DnsConfig::read(&raw.dns, general.ipv6).map_err(|err| err.within("dns"))?;
+    let tun = TunConfig::from_map(&raw.tun).map_err(|err| err.within("tun"))?;
+    let sniffer = SnifferConfig::from_map(&raw.sniffer).map_err(|err| err.within("sniffer"))?;
+    let (ntp, ntp_notes) = NtpConfig::read(&raw.ntp)?;
+    let notes = [general_notes, dns_notes, ntp_notes].concat();
+    report.warn_ignored("", &notes);
+    let geo = GeoConfig::from_map(&raw.geox_url)?;
     let hosts = parse_hosts(&raw.hosts, &mut report)?;
 
     if !options.android {
@@ -719,15 +654,6 @@ pub fn load_raw(mut raw: RawConfig, options: &LoadOptions) -> Result<Profile> {
                 ),
             );
         }
-    }
-
-    let mut lan_listener_refused = false;
-    if general.allow_lan && lan_is_restricted(&raw.extra)? {
-        lan_listener_refused = true;
-        report.warn("lan_listener_refused", 
-            "allow-lan",
-            "lan-allowed-ips, lan-disallowed-ips or bind-address restrict the LAN listener, which is not supported, so it is not opened",
-        );
     }
 
     let mut names = Names {
@@ -811,13 +737,7 @@ pub fn load_raw(mut raw: RawConfig, options: &LoadOptions) -> Result<Profile> {
         proxy_providers.push(provider);
     }
     parse_provider_proxies(&proxy_providers, options, &mut quarantined, &mut report)?;
-    let mut rule_providers = Vec::with_capacity(raw.rule_providers.len());
-    for (name, map) in &raw.rule_providers {
-        rule_providers.push(
-            parse_rule_provider(name, map)
-                .map_err(|err| err.prefixed(&format!("parse rule provider {name} error: ")))?,
-        );
-    }
+    let rule_providers = parse_rule_providers(&raw.rule_providers, &mut report)?;
 
     let proxy_names: Vec<String> = proxies.iter().map(|p| p.name.clone()).collect();
     let mut referenced_quarantined = HashSet::new();
@@ -831,7 +751,7 @@ pub fn load_raw(mut raw: RawConfig, options: &LoadOptions) -> Result<Profile> {
     )?;
     validate_dialers(&proxies, &names)?;
     if !names.groups.contains("GLOBAL") {
-        let global = global_group(&proxies, &groups);
+        let global = GroupDef::global(&proxies, &groups, DEFAULT_TEST_URL);
         groups.push(global);
     }
 
@@ -901,13 +821,11 @@ pub fn load_raw(mut raw: RawConfig, options: &LoadOptions) -> Result<Profile> {
         proxy_providers,
         rule_providers,
         sub_rules,
-        store_selected: flag(&raw.profile, "store-selected"),
         store_fake_ip: flag(&raw.profile, "store-fake-ip"),
         dialer_ip4p_convert: flag(&raw.experimental, "dialer-ip4p-convert"),
-        lan_listener_refused,
         refuse_all: false,
         rules: std::mem::take(&mut raw.rules),
-        mitm: raw.mitm,
+        mitm: crate::mitm::load(&raw.mitm, &raw.lines.mitm, &mut report),
         tls: TlsConfig::from_map(&raw.tls),
         report,
     })
@@ -998,12 +916,122 @@ rules:
             message.contains("sub-rule [nothing] not found"),
             "{message}"
         );
+        let message = error("sub-rules:\n  s:\n    - SUB-RULE,(DOMAIN,a.com),DIRECT\n");
+        assert!(message.contains("sub-rule [DIRECT] not found"), "{message}");
         assert!(error("proxies:\n  - {type: direct}\n").contains("proxy 0"));
     }
 
     #[test]
+    fn a_group_in_use_or_global_as_a_member_is_refused_when_loading() {
+        let message = error(
+            "proxy-groups:\n  - {name: a, type: select, proxies: [DIRECT]}\n  - {name: b, type: select, use: [a]}\n",
+        );
+        assert!(
+            message.ends_with("proxy group a can't contains in `use`"),
+            "{message}"
+        );
+        let message = error("proxy-groups:\n  - {name: g, type: select, proxies: [GLOBAL]}\n");
+        assert!(message.ends_with("g: 'GLOBAL' not found"), "{message}");
+        assert!(
+            load_text(
+                "proxy-groups:\n  - {name: GLOBAL, type: select, proxies: [DIRECT]}\n  - {name: g, type: select, proxies: [GLOBAL]}\n"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_value_that_is_refused_names_its_key() {
+        let cases = [
+            (
+                "mode: sideways\n",
+                "yaml: unmarshal errors: mode: invalid mode \"sideways\"",
+            ),
+            (
+                "dns: {enhanced-mode: odd}\n",
+                "dns.enhanced-mode: invalid mode \"odd\"",
+            ),
+            (
+                "dns: {fake-ip-filter-mode: odd}\n",
+                "dns.fake-ip-filter-mode: invalid mode \"odd\"",
+            ),
+            (
+                "dns: {default-nameserver: [1.1.1.1, dns.google]}\n",
+                "dns.default-nameserver[1]: default nameserver should be pure IP: dns.google",
+            ),
+            ("dns: {fake-ip-range: x}\n", "dns.fake-ip-range: "),
+            (
+                "dns: {nameserver-policy: {'+.a.test': 'gopher://node'}}\n",
+                "dns.nameserver-policy[+.a.test]: DNS NameServer[0] format error: unsupport scheme: gopher",
+            ),
+            ("dns: {enable: x}\n", "'dns.enable' expected type"),
+            ("tun: {route-address: [x]}\n", "tun.route-address[0]: "),
+            ("hosts: {a.com: [1.1.1.1, x]}\n", "hosts[a.com]: "),
+            (
+                "sniffer: {sniff: {HTTP: {ports: [abc]}}}\n",
+                "sniffer.sniff.HTTP.ports: intRanges error",
+            ),
+        ];
+        for (text, expected) in cases {
+            let message = error(text);
+            assert!(message.starts_with(expected), "{text}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_tailscale_dns_server_is_skipped_and_a_list_of_only_those_answers_refused() {
+        let profile = load_text(
+            "dns:\n  nameserver: ['ts://node', 8.8.8.8]\n  nameserver-policy: {'+.ts.net': 'tailscale://node'}\n",
+        )
+        .unwrap();
+        let texts: Vec<&str> = profile
+            .dns
+            .nameserver
+            .iter()
+            .map(|ns| ns.text.as_str())
+            .collect();
+        assert_eq!(texts, ["8.8.8.8"]);
+        let policy = &profile.dns.nameserver_policy[0].servers;
+        assert_eq!(policy.len(), 1);
+        assert_eq!(
+            policy[0].scheme,
+            crate::dns::UpstreamScheme::Rcode(crate::dns::Rcode::Refused)
+        );
+        let warned: Vec<(&str, &str)> = profile
+            .report
+            .warnings
+            .iter()
+            .map(|w| (w.code, w.path.as_str()))
+            .collect();
+        assert_eq!(
+            warned,
+            [
+                ("not_applied", "dns.nameserver[0]"),
+                ("not_applied", "dns.nameserver-policy[+.ts.net][0]"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_sub_rule_aimed_at_a_proxy_loads_and_never_matches() {
+        let profile =
+            load_text("rules:\n  - SUB-RULE,(DOMAIN,a.com),DIRECT\n  - MATCH,DIRECT\n").unwrap();
+        let noted = profile
+            .report
+            .warnings
+            .iter()
+            .find(|w| w.path == "rules[0]")
+            .unwrap();
+        assert_eq!(noted.code, "rule_never_matches");
+        assert_eq!(
+            noted.message,
+            "SUB-RULE target DIRECT is not a sub-rule, so the rule never matches"
+        );
+    }
+
+    #[test]
     fn unknown_and_malformed_rules_are_hard_errors() {
-        assert!(error("rules:\n  - REMATCH-NAME,x,DIRECT\n").contains("rules[0]"));
+        assert!(error("rules:\n  - UNKNOWN-RULE,x,DIRECT\n").contains("rules[0]"));
         assert!(error("rules:\n  - DOMAIN,only\n").contains("format invalid"));
     }
 
@@ -1072,9 +1100,150 @@ proxy-groups:
         }
         assert!(warned_paths("tun:\n  enable: true\n  stack: mips\n", false).is_empty());
         assert!(warned_paths("tun:\n  enable: false\n  stack: system\n", false).is_empty());
+        assert!(warned_paths("tun:\n  enable: true\n  gso: true\n", false).is_empty());
+    }
+
+    #[test]
+    fn a_rule_provider_path_in_bundle_is_warned_and_the_provider_kept() {
+        let text = "rule-providers:\n  cn: {type: http, behavior: domain, format: mrs, url: \"https://a.test/cn.mrs\", path: ./cn.mrs, path-in-bundle: geo/geosite/cn.mrs}\n  \
+                    own: {type: inline, behavior: domain, payload: [a.test], path-in-bundle: x}\n\
+                    rules:\n  - RULE-SET,cn,DIRECT\n  - RULE-SET,own,DIRECT\n  - MATCH,DIRECT\n";
+        let profile = load_text(text).unwrap();
+        assert_eq!(profile.rule_providers.len(), 2);
+        let warned: Vec<_> = profile
+            .report
+            .warnings
+            .iter()
+            .map(|w| (w.code, w.path.as_str()))
+            .collect();
         assert_eq!(
-            warned_paths("tun:\n  enable: true\n  gso: true\n", false),
-            ["tun.gso"]
+            warned,
+            [("not_applied", "rule-providers.cn.path-in-bundle")]
+        );
+    }
+
+    #[test]
+    fn a_key_written_with_no_value_reads_as_mihomo_reads_it() {
+        let text = "tun:\n  enable: true\n  auto-route:\n  route-exclude-address:\n\
+                    dns:\n  enable: true\n  nameserver: [8.8.8.8]\n  enhanced-mode: fake-ip\n  fake-ip-range:\n\
+                    proxies:\n  - {name: n, type: ss, server: s.test, port: 8388, cipher: none, password: }\n";
+        let profile = load_text(text).unwrap();
+        assert!(profile.tun.auto_route);
+        assert!(profile.tun.route_exclude_address.is_empty());
+        assert_eq!(
+            profile
+                .dns
+                .fake_ip_range
+                .map(|range| range.to_string())
+                .as_deref(),
+            Some("198.18.0.1/16")
+        );
+        assert_eq!(profile.proxies.len(), 1);
+    }
+
+    #[test]
+    fn a_number_out_of_range_falls_back_with_a_warning() {
+        let text = "mixed-port: 70000\nport: -1\nkeep-alive-idle: -1\ngeo-update-interval: -1\n\
+                    ntp: {enable: true, port: 70000, interval: -5}\n\
+                    dns: {fake-ip-ttl: -1, cache-max-size: 3000000000, listen-routing-mark: -1, ipv6-timeout: 5000000000}\n";
+        let profile = load_text(text).unwrap();
+        let general = &profile.general;
+        assert_eq!((general.mixed_port, general.port), (0, 0));
+        assert_eq!(
+            (general.keep_alive_idle, general.geo_update_interval),
+            (0, 24)
+        );
+        assert_eq!((profile.ntp.port, profile.ntp.interval), (123, 30));
+        let dns = &profile.dns;
+        assert_eq!(
+            (dns.fake_ip_ttl, dns.ipv6_timeout, dns.cache_max_size),
+            (1, 100, 0)
+        );
+        assert_eq!(dns.listen_routing_mark, u32::MAX);
+        let warned: Vec<(&str, &str)> = profile
+            .report
+            .warnings
+            .iter()
+            .map(|warning| (warning.code, warning.path.as_str()))
+            .collect();
+        for path in [
+            "port",
+            "mixed-port",
+            "keep-alive-idle",
+            "geo-update-interval",
+            "dns.ipv6-timeout",
+            "dns.fake-ip-ttl",
+            "dns.cache-max-size",
+            "ntp.port",
+            "ntp.interval",
+        ] {
+            assert!(
+                warned.contains(&("out_of_range", path)),
+                "{path}: {warned:?}"
+            );
+        }
+        let message = &profile
+            .report
+            .warnings
+            .iter()
+            .find(|w| w.path == "mixed-port")
+            .unwrap()
+            .message;
+        assert_eq!(message, "mixed-port is ignored: 70000 is out of range");
+    }
+
+    #[test]
+    fn an_include_all_group_names_the_set_aside_nodes_it_lost() {
+        let profile = load_text(
+            "proxies:\n  - {name: hk-a, type: socks5, server: 127.0.0.1, port: 1}\n  - {name: hk-b, type: tailscale}\n\
+             proxy-groups:\n  - {name: HK, type: select, include-all-proxies: true, filter: hk}\n  \
+             - {name: TS, type: select, include-all-proxies: true, filter: hk-b, empty-fallback: DIRECT}\n",
+        )
+        .unwrap();
+        let dropped: Vec<(&str, &str)> = profile
+            .report
+            .warnings
+            .iter()
+            .filter(|w| w.code == "group_members_dropped")
+            .map(|w| (w.path.as_str(), w.message.as_str()))
+            .collect();
+        assert_eq!(
+            dropped,
+            [
+                ("proxy-groups.HK", "dropped quarantined members: hk-b"),
+                ("proxy-groups.TS", "dropped quarantined members: hk-b"),
+            ]
+        );
+        let ts = profile.groups.iter().find(|g| g.name == "TS").unwrap();
+        assert_eq!(ts.proxies, ["DIRECT"]);
+    }
+
+    #[test]
+    fn a_dialing_key_on_a_group_is_ignored_with_a_warning() {
+        let profile = load_text(
+            "proxy-groups:\n  - {name: g, type: select, proxies: [DIRECT], routing-mark: 7, dialer-proxy: x, interface-name: ''}\n",
+        )
+        .unwrap();
+        let warned: Vec<(&str, &str, &str)> = profile
+            .report
+            .warnings
+            .iter()
+            .map(|w| (w.code, w.path.as_str(), w.message.as_str()))
+            .collect();
+        assert_eq!(
+            warned,
+            [
+                (
+                    "not_applied",
+                    "proxy-groups.g.routing-mark",
+                    "routing-mark is ignored: a group does not dial, so set it on the nodes"
+                ),
+                (
+                    "not_applied",
+                    "proxy-groups.g.dialer-proxy",
+                    "dialer-proxy is ignored: a group does not dial, so set it on the nodes"
+                ),
+            ]
         );
     }
 
@@ -1183,6 +1352,18 @@ proxy-groups:
     }
 
     #[test]
+    fn an_inline_provider_is_read_after_its_filters_and_overrides() {
+        let text = "proxy-providers:\n  p:\n    type: inline\n    exclude-type: ssh\n    \
+                    override: {up: 50 Mbps, down: 200 Mbps}\n    payload:\n      \
+                    - {name: h, type: hysteria, server: s.test, port: 443}\n      \
+                    - {name: bad, type: ssh, server: s.test}\n      \
+                    - {type: ss, server: s.test}\n\
+                    proxy-groups:\n  - {name: G, type: select, use: [p]}\nrules:\n  - MATCH,G\n";
+        let profile = load_text(text).unwrap();
+        assert!(profile.report.warnings.is_empty(), "{:?}", profile.report);
+    }
+
+    #[test]
     fn a_provider_with_override_expr_is_emptied_and_the_profile_still_loads() {
         let profile = load_text(
             "proxy-providers:\n  sub:\n    type: http\n    url: https://example.com/s\n    path: s.yaml\n    override:\n      override-expr:\n        - '.udp = true'\nproxy-groups:\n  - {name: G, type: select, use: [sub]}\nrules:\n  - MATCH,G\n",
@@ -1204,10 +1385,10 @@ proxy-groups:
     }
 
     #[test]
-    fn restricted_lan() {
-        let profile = load_text("allow-lan: true\nlan-allowed-ips: [192.168.0.0/16]\n").unwrap();
-        assert!(profile.lan_listener_refused);
-        assert!(!load_text("allow-lan: true\n").unwrap().lan_listener_refused);
+    fn a_restricted_lan_loads_without_a_warning() {
+        let text = "allow-lan: true\nbind-address: 192.168.1.2\nlan-allowed-ips: [192.168.0.0/16]\nlan-disallowed-ips: [192.168.1.1/32]\n";
+        assert!(warned_paths(text, false).is_empty());
+        assert_eq!(load_text(text).unwrap().general.lan_allowed_ips.len(), 1);
     }
 
     #[test]
@@ -1261,12 +1442,28 @@ proxy-groups:
         assert_eq!(profile.proxy_providers.len(), 2);
         assert_eq!(profile.quarantined[0].provider.as_deref(), Some("inline"));
         assert!(
-            error("proxy-providers:\n  COMPATIBLE: {type: file, path: a}\n").contains("COMPATIBLE")
-        );
-        assert!(
             error("proxy-groups:\n  - {name: g, type: select, use: [none]}\n")
                 .contains("'none' not found")
         );
+    }
+
+    #[test]
+    fn default_is_the_reserved_provider_name_as_in_mihomo() {
+        assert!(
+            error("proxy-providers:\n  default: {type: file, path: a}\n")
+                .contains("can not defined a provider called `default`")
+        );
+        assert!(
+            error("proxy-groups:\n  - {name: g, type: select, use: [default]}\n")
+                .contains("proxy group default can't contains in `use`")
+        );
+        let profile = load_text(
+            "proxy-providers:\n  COMPATIBLE:\n    type: inline\n    payload:\n      \
+             - {name: c, type: socks5, server: 127.0.0.3, port: 1080}\n\
+             proxy-groups:\n  - {name: g, type: select, use: [COMPATIBLE]}\n",
+        )
+        .unwrap();
+        assert_eq!(profile.proxy_providers[0].name, "COMPATIBLE");
     }
 
     #[test]

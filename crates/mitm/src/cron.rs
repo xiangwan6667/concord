@@ -1,6 +1,6 @@
+use concord_config::mitm::LineError;
+use concord_config::mitm::text::quote;
 use time::{Date, Month, OffsetDateTime};
-
-use crate::text::quote;
 
 /// A 29 February schedule waits eight years across a skipped century leap year.
 const SEARCH_HORIZON: i64 = 8 * 366 * 86_400;
@@ -18,6 +18,16 @@ pub struct UtcClock;
 impl LocalClock for UtcClock {
     fn offset_at(&self, _unix: i64) -> i32 {
         0
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct CronError(String);
+
+impl From<CronError> for LineError {
+    fn from(err: CronError) -> LineError {
+        LineError::invalid(err.0)
     }
 }
 
@@ -98,16 +108,16 @@ const WEEKDAYS: Field = Field {
 };
 
 impl CronSchedule {
-    pub fn parse(text: &str) -> Result<CronSchedule, String> {
+    pub fn parse(text: &str) -> Result<CronSchedule, CronError> {
         let mut fields: Vec<&str> = text.split_whitespace().collect();
         match fields.len() {
             5 => fields.insert(0, "0"),
             6 => {}
             count => {
-                return Err(format!(
+                return Err(CronError(format!(
                     "cron expression {} has {count} fields, not 5 or 6",
                     quote(text)
-                ));
+                )));
             }
         }
         let at = |i: usize| fields.get(i).copied().unwrap_or_default();
@@ -183,7 +193,7 @@ fn local_midnight(date: Date, clock: &dyn LocalClock) -> i64 {
 }
 
 impl Field {
-    fn parse(&self, text: &str) -> Result<(u64, bool), String> {
+    fn parse(&self, text: &str) -> Result<(u64, bool), CronError> {
         if text == "*" || text == "?" {
             return Ok((self.span(self.min, self.max, 1), true));
         }
@@ -198,7 +208,7 @@ impl Field {
                     .parse::<u32>()
                     .ok()
                     .filter(|n| *n > 0)
-                    .ok_or_else(|| format!("invalid step in {}", quote(part)))?,
+                    .ok_or_else(|| CronError(format!("invalid step in {}", quote(part))))?,
                 None => 1,
             };
             let (mut low, mut high) = (self.min, self.max);
@@ -215,14 +225,14 @@ impl Field {
                 };
             }
             if low > high {
-                return Err(format!("invalid range {}", quote(part)));
+                return Err(CronError(format!("invalid range {}", quote(part))));
             }
             set |= self.span(low, high, step);
         }
         Ok((set, false))
     }
 
-    fn value(&self, text: &str) -> Result<u32, String> {
+    fn value(&self, text: &str) -> Result<u32, CronError> {
         let lower = text.to_ascii_lowercase();
         if let Some((_, value)) = self.names.iter().find(|(name, _)| *name == lower) {
             return Ok(*value);
@@ -231,12 +241,12 @@ impl Field {
             .ok()
             .filter(|value| (self.min..=self.max).contains(value))
             .ok_or_else(|| {
-                format!(
+                CronError(format!(
                     "{} is not between {} and {}",
                     quote(text),
                     self.min,
                     self.max
-                )
+                ))
             })
     }
 

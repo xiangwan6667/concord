@@ -67,6 +67,8 @@ pub struct SplicePipe {
 }
 
 impl SplicePipe {
+    pub const AVAILABLE: bool = true;
+
     pub fn new() -> io::Result<Self> {
         if let Some(pipe) = pooled() {
             return Ok(SplicePipe::from(pipe));

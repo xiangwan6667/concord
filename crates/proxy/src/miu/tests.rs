@@ -12,7 +12,11 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn pool() -> Arc<Pool> {
-    Pool::new(30, Padding::parse(b"stop=0").unwrap())
+    Pool::new(
+        30,
+        Padding::parse(b"stop=0").unwrap(),
+        concord_common::Tasks::default(),
+    )
 }
 
 #[test]

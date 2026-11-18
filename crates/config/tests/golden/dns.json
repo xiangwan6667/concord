@@ -7,6 +7,12 @@
   "authentication": [],
   "skip-auth-prefixes": null,
   "allow-lan": false,
+  "bind-address": "*",
+  "lan-allowed-ips": [
+    "0.0.0.0/0",
+    "::/0"
+  ],
+  "lan-disallowed-ips": null,
   "mode": "rule",
   "unified-delay": false,
   "log-level": "info",

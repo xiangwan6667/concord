@@ -13,6 +13,7 @@ mod watch;
 pub use bus::EventBus;
 pub use concord_common::Origin;
 pub use concord_common::sync;
+pub use concord_engine::ControllerCors;
 pub use concord_engine::local_utc_offset;
 pub use control::{Control, ControlOptions, ControllerSettings, Reload, valid_status_ranges};
 #[cfg(unix)]

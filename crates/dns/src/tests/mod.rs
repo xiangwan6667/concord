@@ -1,11 +1,12 @@
 mod alloc;
-mod support;
+mod shared_dial;
+pub(super) mod support;
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use concord_common::{HostResolver, Initiator, IpVersion};
+use concord_common::{Address, HostResolver, Initiator, IpVersion};
 use concord_config::dns::{EnhancedMode, FakeIpFilterMode, PolicyEntry, PolicyKey};
 use concord_config::hosts::{HostEntry, HostValue as ConfigHostValue, HostsConfig};
 use concord_config::net::IpCidr;
@@ -127,6 +128,83 @@ async fn prefer_h3_uses_http3_when_it_answers_first_and_h2_otherwise() {
         vec![ip("10.0.0.9")]
     );
     assert_eq!(server.hits(), 1);
+}
+
+async fn over_outbound(url: String, via: &str) -> (Vec<IpAddr>, Vec<(String, Address)>) {
+    let dialer = UdpDialer::new(&["DIRECT", "node"]);
+    let mut cfg = config(&[url]);
+    cfg.prefer_h3 = true;
+    let resolver = build_over(&cfg, &dialer);
+    let mut answers = Vec::new();
+    for host in ["a.over.test", "b.over.test"] {
+        answers = lookup_v4(&resolver, host)
+            .await
+            .unwrap_or_else(|err| panic!("{via}: {err}"));
+    }
+    (answers, dialer.asked())
+}
+
+#[tokio::test]
+async fn doh3_and_doq_go_through_the_outbound_they_name_direct_included() {
+    for via in ["DIRECT", "node"] {
+        let h3 = serve_h3(answer_with(Ipv4Addr::new(10, 0, 1, 1))).await;
+        let quic = serve_quic(answer_with(Ipv4Addr::new(10, 0, 1, 2))).await;
+        let cases = [
+            (
+                format!(
+                    "https://127.0.0.1:{}/dns-query#{via}&skip-cert-verify=true&h3=true",
+                    h3.addr.port()
+                ),
+                h3.addr,
+                "10.0.1.1",
+            ),
+            (
+                format!(
+                    "https://127.0.0.1:{}/dns-query#skip-cert-verify=true&{via}",
+                    h3.addr.port()
+                ),
+                h3.addr,
+                "10.0.1.1",
+            ),
+            (
+                format!(
+                    "quic://127.0.0.1:{}#{via}&skip-cert-verify=true",
+                    quic.addr.port()
+                ),
+                quic.addr,
+                "10.0.1.2",
+            ),
+        ];
+        for (url, server, answer) in cases {
+            let (got, asked) = over_outbound(url.clone(), via).await;
+            assert_eq!(got, vec![ip(answer)], "{url}");
+            assert_eq!(
+                asked,
+                vec![(via.to_string(), Address::Socket(server))],
+                "{url}"
+            );
+        }
+        assert_eq!(h3.hits(), 4, "{via}");
+        assert_eq!(quic.hits(), 2, "{via}");
+    }
+}
+
+#[tokio::test]
+async fn doq_through_an_outbound_without_udp_fails_with_its_error() {
+    let quic = serve_quic(answer_with(Ipv4Addr::new(10, 0, 1, 3))).await;
+    let dialer = Arc::new(NodeDialer {
+        server: quic.addr,
+        own_server: None,
+        resolver: std::sync::OnceLock::new(),
+    });
+    let url = format!(
+        "quic://127.0.0.1:{}#node&skip-cert-verify=true",
+        quic.addr.port()
+    );
+    let resolver = build_through(&config(&[url]), &dialer);
+    let err = lookup_v4(&resolver, "c.over.test").await.unwrap_err();
+    assert!(err.to_string().contains("no udp through the node"), "{err}");
+    assert_eq!(quic.hits(), 0);
 }
 
 /// `CONCORD_DOH3_PEER` is the UDP port of a quic-go HTTP/3 server answering every A query

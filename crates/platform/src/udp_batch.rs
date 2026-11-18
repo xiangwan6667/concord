@@ -119,9 +119,6 @@ mod sys {
         }
     }
 
-    /// Sends from the front of `batch`, at most [`UDP_BATCH`] datagrams, and returns how
-    /// many left; an error means none did. `WouldBlock` clears the socket's write
-    /// readiness, so the caller polls it again.
     pub fn send_udp_batch(
         socket: &UdpSocket,
         batch: &[Datagram<'_>],
@@ -133,12 +130,10 @@ mod sys {
         })
     }
 
-    /// [`send_udp_batch`] for a socket whose readiness the caller tracks itself.
     pub fn send_udp_batch_fd(fd: RawFd, batch: &[Datagram<'_>], gso: &UdpGso) -> io::Result<usize> {
         send(batch, gso, |headers| sendmmsg(fd, headers))
     }
 
-    /// [`recv_udp_batch`] for a socket whose readiness the caller tracks itself.
     pub fn recv_udp_batch_fd(fd: RawFd, batch: &mut RecvBatch) -> io::Result<()> {
         recv(batch, |headers| recvmmsg(fd, headers))
     }
@@ -162,9 +157,6 @@ mod sys {
         }
     }
 
-    /// Receives as many datagrams as `batch` asks for that are already queued, in one
-    /// `recvmmsg`. `WouldBlock` clears the socket's read readiness, so the caller polls it
-    /// again.
     pub fn recv_udp_batch(socket: &UdpSocket, batch: &mut RecvBatch) -> io::Result<()> {
         let fd = socket.as_raw_fd();
         socket.try_io(Interest::READABLE, || {
@@ -581,8 +573,98 @@ mod sys {
     }
 }
 
+/// One socket's batched datagram I/O. Linux and Android send with `sendmmsg`, coalescing
+/// runs to one destination with `UDP_SEGMENT`, and receive with `recvmmsg`; other platforms
+/// have neither call, so [`SENDS`](Self::SENDS) and [`RECEIVES`](Self::RECEIVES) are false
+/// there and every call returns `Unsupported`.
+#[derive(Debug, Default)]
+pub struct UdpBatch {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    gso: sys::UdpGso,
+}
+
+impl UdpBatch {
+    /// Whether [`send`](Self::send) costs one call for several datagrams.
+    pub const SENDS: bool = cfg!(any(target_os = "linux", target_os = "android"));
+    /// Whether [`recv`](Self::recv) takes several datagrams in one call.
+    pub const RECEIVES: bool = cfg!(any(target_os = "linux", target_os = "android"));
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub use sys::{UdpGso, recv_udp_batch, recv_udp_batch_fd, send_udp_batch, send_udp_batch_fd};
+impl UdpBatch {
+    /// Sends from the front of `batch`, at most [`UDP_BATCH`] datagrams, and returns how
+    /// many left; an error means none did. `WouldBlock` clears the socket's write
+    /// readiness, so the caller polls it again. A kernel that refuses `UDP_SEGMENT` is not
+    /// asked again for this socket.
+    pub fn send(
+        &self,
+        socket: &tokio::net::UdpSocket,
+        batch: &[Datagram<'_>],
+    ) -> std::io::Result<usize> {
+        sys::send_udp_batch(socket, batch, &self.gso)
+    }
+
+    /// [`send`](Self::send) for a socket whose readiness the caller tracks itself.
+    pub fn send_std(
+        &self,
+        socket: &std::net::UdpSocket,
+        batch: &[Datagram<'_>],
+    ) -> std::io::Result<usize> {
+        let fd = std::os::fd::AsRawFd::as_raw_fd(socket);
+        sys::send_udp_batch_fd(fd, batch, &self.gso)
+    }
+
+    /// Receives as many datagrams as `batch` asks for that are already queued, replacing
+    /// what it held. `WouldBlock` clears the socket's read readiness, so the caller polls it
+    /// again.
+    pub fn recv(
+        socket: &tokio::net::UdpSocket,
+        batch: &mut concord_common::RecvBatch,
+    ) -> std::io::Result<()> {
+        sys::recv_udp_batch(socket, batch)
+    }
+
+    /// [`recv`](Self::recv) for a socket whose readiness the caller tracks itself.
+    pub fn recv_std(
+        socket: &std::net::UdpSocket,
+        batch: &mut concord_common::RecvBatch,
+    ) -> std::io::Result<()> {
+        sys::recv_udp_batch_fd(std::os::fd::AsRawFd::as_raw_fd(socket), batch)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+impl UdpBatch {
+    pub fn send(
+        &self,
+        _socket: &tokio::net::UdpSocket,
+        _batch: &[Datagram<'_>],
+    ) -> std::io::Result<usize> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+
+    pub fn send_std(
+        &self,
+        _socket: &std::net::UdpSocket,
+        _batch: &[Datagram<'_>],
+    ) -> std::io::Result<usize> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+
+    pub fn recv(
+        _socket: &tokio::net::UdpSocket,
+        _batch: &mut concord_common::RecvBatch,
+    ) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+
+    pub fn recv_std(
+        _socket: &std::net::UdpSocket,
+        _batch: &mut concord_common::RecvBatch,
+    ) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
 
 #[cfg(test)]
 mod tests {

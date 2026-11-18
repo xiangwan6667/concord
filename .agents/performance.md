@@ -190,10 +190,9 @@ before it starts, not more rounds on the same run.
 
 **Builds.**
 
-- Two Concord checkouts sharing a target directory reuse each other's artifacts: cargo hashes path dependencies
-  relative to the workspace root, and the tree with older mtimes takes the other's build. The "baseline" is then your
-  change. Keep one target per checkout; confirm with a symbol or test count when in doubt. A tree extracted from an
-  archive keeps old mtimes: extract with `tar -m`.
+- Two Concord checkouts that build into one target without distinct cfgs link each other's artifacts, and the
+  "baseline" is then your change; Target Directory And Disk in `commands.md` gives the cause and the rule. Confirm
+  with a symbol or test count when in doubt. A tree extracted from an archive keeps old mtimes: extract with `tar -m`.
 - In build scripts, `cargo build | tail` hides failures; use `set -o pipefail`.
 - Stale metadata in a shared target produces "missing symbol" errors; see `commands.md`. Results taken in that state
   are rerun.

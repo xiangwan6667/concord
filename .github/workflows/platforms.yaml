@@ -1,0 +1,149 @@
+name: platforms
+
+# Targets `ci` does not cover on every change: the Windows tests, clippy for Windows on Arm and Intel macOS, the
+# tests on Linux arm64 (the local gate runs there; `ci` runs x86_64), and the release size of the two Android ABIs
+# `ci` only lints.
+on:
+  schedule:
+    - cron: "17 8 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-test:
+    name: Windows tests
+    if: ${{ !github.event.repository.fork }}
+    runs-on: windows-latest
+    timeout-minutes: 150
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      # BoringSSL's x86_64 assembly needs NASM; CMake, MSVC and LLVM come with the image.
+      - name: Install NASM
+        shell: bash
+        run: |
+          choco install nasm --no-progress -y > /dev/null
+          printf '%s\n' 'C:\Program Files\NASM' >> "$GITHUB_PATH"
+          printf '%s\n' 'LIBCLANG_PATH=C:\Program Files\LLVM\bin' >> "$GITHUB_ENV"
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+      # A hosted Windows runner is an administrator, which creating a Wintun adapter needs.
+      - name: Create a Wintun adapter
+        run: cargo test --locked -p concord-tun --test wintun -- --ignored
+
+  windows-arm64-clippy:
+    name: Windows arm64 clippy
+    if: ${{ !github.event.repository.fork }}
+    runs-on: windows-11-arm
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      # `.cargo/config.toml` builds BoringSSL here with Ninja, `cl` and `clang-cl` (its assembly is `.S`); the image
+      # has Ninja and LLVM, and this loads the arm64 MSVC environment.
+      - name: Load the arm64 MSVC environment
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvarsall.bat`" arm64 && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') { "$($Matches[1])=$($Matches[2])" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV }
+          }
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "C:\Program Files\LLVM\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  macos-x86_64-clippy:
+    name: macOS x86_64 clippy
+    if: ${{ !github.event.repository.fork }}
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked --target x86_64-apple-darwin -- -D warnings
+
+  linux-arm64-test:
+    name: Linux arm64 tests
+    if: ${{ !github.event.repository.fork }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+  android-size:
+    name: Android release size (${{ matrix.target }})
+    if: ${{ !github.event.repository.fork }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      # Budgets in bytes, about 20% above each library's size when they were set; `ci.yaml` holds arm64-v8a's.
+      matrix:
+        include:
+          - target: armv7-linux-androideabi
+            clang: armv7a-linux-androideabi
+            abi: armeabi-v7a
+            budget: 21000000
+          - target: x86_64-linux-android
+            clang: x86_64-linux-android
+            abi: x86_64
+            budget: 36000000
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Set up the NDK
+        uses: ./.github/actions/android-ndk
+        with:
+          target: ${{ matrix.target }}
+          clang: ${{ matrix.clang }}
+          abi: ${{ matrix.abi }}
+
+      - name: Install CA certificates
+        uses: ./.github/actions/ca-bundle
+
+      - name: Build release libconcord.so
+        run: cargo build --release --locked --target ${{ matrix.target }} -p concord-android
+
+      - name: Check library size
+        run: >-
+          cargo run --locked -p xtask --
+          check-size target/${{ matrix.target }}/release/libconcord.so ${{ matrix.budget }}

@@ -1,14 +1,14 @@
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use concord_common::sync::lock;
 use concord_tls::TlsOptions;
 use hickory_proto::op::Message;
 use quinn::crypto::rustls::QuicClientConfig;
 
 use crate::client::{Client, Params, checked, decode, encode, with_random_id, with_timeout};
 use crate::dialer::{Connector, Cx};
+use crate::shared_dial::SharedDial;
 
 const ALPN: &str = "doq";
 const MAX_RESPONSE: usize = 65_535;
@@ -16,13 +16,12 @@ const MAX_RESPONSE: usize = 65_535;
 type Session = (quinn::Endpoint, quinn::Connection);
 
 /// `quic://`: one QUIC connection kept between queries, a stream per query.
-/// The socket comes from the `SocketFactory`; a tunnel route is not supported.
 pub(crate) struct DoqClient {
     host: String,
     port: u16,
     connector: Arc<Connector>,
     config: quinn::ClientConfig,
-    session: Mutex<Option<Session>>,
+    session: SharedDial<Session>,
 }
 
 impl DoqClient {
@@ -49,28 +48,19 @@ impl DoqClient {
             port,
             connector,
             config: quinn::ClientConfig::new(Arc::new(crypto)),
-            session: Mutex::new(None),
+            session: SharedDial::new(),
         })
     }
 
-    fn cached(&self) -> Option<quinn::Connection> {
-        let slot = lock(&self.session);
-        let (_, conn) = slot.as_ref()?;
-        conn.close_reason().is_none().then(|| conn.clone())
-    }
-
-    async fn dial(&self, cx: Cx) -> io::Result<quinn::Connection> {
-        let Some((sock, peer)) = self
+    async fn dial(&self, cx: Cx) -> io::Result<Session> {
+        let (socket, peer) = self
             .connector
             .quic_socket(&self.host, self.port, cx)
-            .await?
-        else {
-            return Err(io::Error::other("DNS over QUIC cannot go through a proxy"));
-        };
-        let mut endpoint = quinn::Endpoint::new(
+            .await?;
+        let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
             quinn::EndpointConfig::default(),
             None,
-            sock.into_std()?,
+            socket,
             Arc::new(quinn::TokioRuntime),
         )?;
         endpoint.set_default_client_config(self.config.clone());
@@ -79,11 +69,7 @@ impl DoqClient {
             .map_err(io::Error::other)?
             .await
             .map_err(io::Error::other)?;
-        {
-            let mut slot = lock(&self.session);
-            *slot = Some((endpoint, conn.clone()));
-        }
-        Ok(conn)
+        Ok((endpoint, conn))
     }
 
     async fn round_trip(conn: &quinn::Connection, query: &[u8]) -> io::Result<Message> {
@@ -116,13 +102,12 @@ impl Client for DoqClient {
         with_timeout(async {
             let mut reused = true;
             loop {
-                let conn = match self.cached() {
-                    Some(conn) => conn,
-                    None => {
-                        reused = false;
-                        self.dial(cx).await?
-                    }
-                };
+                let session = self
+                    .session
+                    .get(|(_, conn)| conn.close_reason().is_none(), self.dial(cx))
+                    .await?;
+                reused &= session.reused;
+                let (_, conn) = session.value;
                 let answer = Self::round_trip(&conn, &bytes)
                     .await
                     .and_then(|resp| checked(&query, resp));
@@ -132,7 +117,7 @@ impl Client for DoqClient {
                         return Ok(resp);
                     }
                     Err(err) => {
-                        self.reset();
+                        close(self.session.take());
                         if !reused {
                             return Err(err);
                         }
@@ -149,9 +134,12 @@ impl Client for DoqClient {
     }
 
     fn reset(&self) {
-        let taken = lock(&self.session).take();
-        if let Some((_, conn)) = taken {
-            conn.close(0u32.into(), b"");
-        }
+        close(self.session.reset());
+    }
+}
+
+fn close(session: Option<Session>) {
+    if let Some((_, conn)) = session {
+        conn.close(0u32.into(), b"");
     }
 }

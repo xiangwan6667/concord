@@ -51,12 +51,43 @@ struct Far {
     origin: Child,
     server: Option<Child>,
     singbox: Option<Child>,
+    xray: Option<Child>,
+    gost: Vec<(String, Child)>,
+    masque: Option<Child>,
     cases: Vec<Case>,
     /// Cases whose listener the server refused, with its reason.
     refused: Vec<(String, String)>,
 }
 
 impl Rig {
+    fn start_masque_peer(&self, built: &[Case]) -> Result<Option<Child>, String> {
+        let child = if let Some(case) = built.iter().find(|case| case.name() == "masque-l4") {
+            let proxy = case.proxy.as_ref().ok_or("MASQUE case has no proxy")?;
+            let host = proxy["server"].as_str().ok_or("MASQUE server is missing")?;
+            let port = proxy["port"].as_u64().ok_or("MASQUE port is missing")?;
+            let placement = self.placement(Role::Server);
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            let log = std::fs::File::create(self.dir.join("logs/masque.log"))
+                .map_err(|e| e.to_string())?;
+            let mut command = isolate::command(&exe, &placement);
+            let ip: IpAddr = host.parse().map_err(|e| format!("MASQUE server IP: {e}"))?;
+            let port = u16::try_from(port).map_err(|e| e.to_string())?;
+            let address = std::net::SocketAddr::new(ip, port);
+            command
+                .args(["masque-server", "--listen", &address.to_string()])
+                .stdin(Stdio::null())
+                .stdout(log.try_clone().map_err(|e| e.to_string())?)
+                .stderr(log);
+            Some(
+                isolate::spawn(&mut command, &placement)
+                    .map_err(|e| format!("spawn MASQUE peer: {e}"))?,
+            )
+        } else {
+            None
+        };
+        Ok(child)
+    }
+
     fn placement(&self, role: Role) -> Placement {
         Placement {
             cpus: self
@@ -93,12 +124,13 @@ impl Rig {
             } else {
                 ip.to_string()
             };
-            built.push(cases::build(
-                *spec,
-                &host,
-                free_port_from(&mut port, ip),
-                &certs,
-            ));
+            let main = free_port_from(&mut port, ip);
+            let decoy = if cases::needs_decoy(*spec) {
+                free_port_from(&mut port, ip)
+            } else {
+                0
+            };
+            built.push(cases::build(*spec, &host, main, decoy, &certs));
         }
         let server = if built.iter().any(|c| c.listener.is_some()) {
             let home = self.dir.join("server");
@@ -149,6 +181,31 @@ impl Rig {
         } else {
             None
         };
+        let xray = if built.iter().any(|case| case.xray_listener.is_some()) {
+            let binary =
+                std::env::var_os("CONCORD_XRAY").ok_or("xhttp HTTP/3 needs CONCORD_XRAY")?;
+            let config = self.dir.join("server/xray.json");
+            std::fs::write(&config, cases::xray_config(&built).to_string())
+                .map_err(|err| err.to_string())?;
+            let log = std::fs::File::create(self.dir.join("logs/xray.log"))
+                .map_err(|err| err.to_string())?;
+            let placement = self.placement(Role::Server);
+            let mut command = isolate::command(Path::new(&binary), &placement);
+            command
+                .args(["run", "-config"])
+                .arg(config)
+                .stdin(Stdio::null())
+                .stdout(log.try_clone().map_err(|err| err.to_string())?)
+                .stderr(log);
+            Some(
+                isolate::spawn(&mut command, &placement)
+                    .map_err(|err| format!("spawn Xray server: {err}"))?,
+            )
+        } else {
+            None
+        };
+        let gost = crate::gost::start(&built, &self.dir, &self.placement(Role::Server))?;
+        let masque = self.start_masque_peer(&built)?;
         tokio::time::sleep(Duration::from_millis(800)).await;
         let log = std::fs::read_to_string(self.dir.join("logs/server.log")).unwrap_or_default();
         let refused = built
@@ -171,6 +228,9 @@ impl Rig {
             origin,
             server,
             singbox,
+            xray,
+            gost,
+            masque,
             cases: built,
             refused,
         })
@@ -344,6 +404,7 @@ impl Rig {
                 cases::find("direct").ok_or("direct case")?,
                 "127.0.0.1",
                 0,
+                0,
                 &self.dir,
             );
             self.fresh_phase(&far, &direct, Workload::Large, None, results, out)
@@ -351,6 +412,9 @@ impl Rig {
         }
         drop(far.server.take());
         drop(far.singbox.take());
+        drop(far.xray.take());
+        drop(std::mem::take(&mut far.gost));
+        drop(far.masque.take());
         drop(far.origin);
         Ok(())
     }
@@ -370,7 +434,16 @@ impl Rig {
     fn ctx(&self, far: &Far, case: &Case, entry: Entry, core: u32) -> Ctx {
         let pids = Pids {
             core,
-            server: if case.singbox_listener.is_some() {
+            server: if case.xray_listener.is_some() {
+                far.xray.as_ref().and_then(Child::id)
+            } else if case.gost.is_some() {
+                far.gost
+                    .iter()
+                    .find(|(name, _)| name == case.name())
+                    .and_then(|(_, child)| child.id())
+            } else if case.name() == "masque-l4" {
+                far.masque.as_ref().and_then(Child::id)
+            } else if case.singbox_listener.is_some() {
                 far.singbox.as_ref().and_then(Child::id)
             } else if case.listener.is_some() {
                 far.server.as_ref().and_then(Child::id)
@@ -649,8 +722,29 @@ fn rotation(n: usize, round: usize) -> impl Iterator<Item = usize> {
 }
 
 fn check_far(far: &mut Far) -> Result<(), String> {
+    for (name, child) in &mut far.gost {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!(
+                "the gost server for {name} exited: {status}; see logs/{name}-gost.log"
+            ));
+        }
+    }
     if let Ok(Some(status)) = far.origin.try_wait() {
         return Err(format!("the origin exited: {status}"));
+    }
+    if let Some(server) = far.xray.as_mut()
+        && let Some(status) = server.try_wait().map_err(|err| err.to_string())?
+    {
+        return Err(format!(
+            "the Xray server exited: {status}; see logs/xray.log"
+        ));
+    }
+    if let Some(server) = far.masque.as_mut()
+        && let Ok(Some(status)) = server.try_wait()
+    {
+        return Err(format!(
+            "the MASQUE peer exited: {status}; see logs/masque.log"
+        ));
     }
     if let Some(server) = far.singbox.as_mut()
         && let Ok(Some(status)) = server.try_wait()

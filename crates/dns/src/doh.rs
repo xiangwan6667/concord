@@ -17,6 +17,8 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use crate::client::{BoxIo, Client, Params, checked, decode, encode, with_random_id, with_timeout};
 use crate::dialer::{Connector, Cx};
 use crate::dot::{server_name, tls_connector};
+use crate::resets::{Resets, Ticket, overtaken};
+use crate::shared_dial::Got;
 
 const MAX_BODY: usize = 65_535;
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -85,6 +87,7 @@ pub(crate) struct DohClient {
     tls: Option<tokio_rustls::TlsConnector>,
     h2: Mutex<Option<http2::SendRequest<Body>>>,
     h1: Mutex<Vec<http1::SendRequest<Body>>>,
+    resets: Resets,
 }
 
 enum Sender {
@@ -109,25 +112,51 @@ impl DohClient {
             tls,
             h2: Mutex::new(None),
             h1: Mutex::new(Vec::new()),
+            resets: Resets::new(),
         })
     }
 
-    fn cached(&self) -> Option<Sender> {
+    async fn sender(&self, cx: Cx, ticket: Ticket) -> io::Result<Got<Sender>> {
+        if let Some(idle) = self.idle_h1().await {
+            return Ok(idle);
+        }
         {
-            let mut slot = lock(&self.h2);
-            match slot.as_ref() {
-                Some(sender) if !sender.is_closed() => return Some(Sender::H2(sender.clone())),
-                Some(_) => *slot = None,
-                None => {}
+            let mut cached = lock(&self.h2);
+            cached.take_if(|sender| sender.is_closed());
+            if let Some(sender) = &*cached {
+                return Ok(Got {
+                    value: Sender::H2(sender.clone()),
+                    reused: true,
+                });
             }
         }
-        let mut idle = lock(&self.h1);
-        while let Some(sender) = idle.pop() {
-            if !sender.is_closed() {
-                return Some(Sender::H1(sender));
+        let mut sender = self.resets.dial(ticket, self.dial(cx)).await?;
+        if let Sender::H2(connected) = &mut sender {
+            let mut cached = lock(&self.h2);
+            if !self.resets.none_since(ticket) {
+                return Err(overtaken());
+            }
+            match cached.as_ref().filter(|sender| !sender.is_closed()) {
+                Some(current) => *connected = current.clone(),
+                None => *cached = Some(connected.clone()),
             }
         }
-        None
+        Ok(Got {
+            value: sender,
+            reused: false,
+        })
+    }
+
+    async fn idle_h1(&self) -> Option<Got<Sender>> {
+        loop {
+            let mut sender = lock(&self.h1).pop()?;
+            if sender.ready().await.is_ok() {
+                return Some(Got {
+                    value: Sender::H1(sender),
+                    reused: true,
+                });
+            }
+        }
     }
 
     async fn dial(&self, cx: Cx) -> io::Result<Sender> {
@@ -157,10 +186,6 @@ impl DohClient {
             tokio::spawn(async move {
                 let _ = conn.await;
             });
-            {
-                let mut slot = lock(&self.h2);
-                *slot = Some(sender.clone());
-            }
             Ok(Sender::H2(sender))
         } else {
             let (sender, conn) = http1::handshake(TokioIo::new(io))
@@ -173,11 +198,24 @@ impl DohClient {
         }
     }
 
+    fn drop_connections(&self) {
+        lock(&self.h2).take();
+        {
+            let mut idle = lock(&self.h1);
+            idle.clear();
+        }
+    }
+
     fn request(&self, query: &[u8], h2: bool) -> io::Result<Request<Body>> {
         self.target.request(query, h2)
     }
 
-    async fn round_trip(&self, sender: Sender, query: &[u8]) -> io::Result<Message> {
+    async fn round_trip(
+        &self,
+        sender: Sender,
+        query: &[u8],
+        ticket: Ticket,
+    ) -> io::Result<Message> {
         let (response, keep) = match sender {
             Sender::H2(mut sender) => {
                 let response = sender
@@ -197,7 +235,7 @@ impl DohClient {
         let message = self.read(response).await?;
         if let Some(sender) = keep {
             let mut idle = lock(&self.h1);
-            if !sender.is_closed() && idle.len() < MAX_IDLE {
+            if !sender.is_closed() && idle.len() < MAX_IDLE && self.resets.none_since(ticket) {
                 idle.push(sender);
             }
         }
@@ -232,15 +270,13 @@ impl Client for DohClient {
         query.metadata.id = 0;
         let bytes = encode(&query)?;
         with_timeout(async {
-            let mut sender = self.cached();
-            let mut attempts = 0;
+            let mut reused = true;
             loop {
-                let (current, reused) = match sender.take() {
-                    Some(current) => (current, true),
-                    None => (self.dial(cx).await?, false),
-                };
+                let ticket = self.resets.ticket();
+                let sender = self.sender(cx, ticket).await?;
+                reused &= sender.reused;
                 let answer = self
-                    .round_trip(current, &bytes)
+                    .round_trip(sender.value, &bytes, ticket)
                     .await
                     .and_then(|resp| checked(&query, resp));
                 match answer {
@@ -248,14 +284,13 @@ impl Client for DohClient {
                         resp.metadata.id = original;
                         return Ok(resp);
                     }
-                    Err(err) if reused && attempts < 2 => {
-                        attempts += 1;
-                        self.reset();
-                        tracing::debug!("re-creating the DoH connection after {err}");
-                    }
                     Err(err) => {
-                        self.reset();
-                        return Err(err);
+                        self.drop_connections();
+                        if !reused {
+                            return Err(err);
+                        }
+                        reused = false;
+                        tracing::debug!("re-creating the DoH connection after {err}");
                     }
                 }
             }
@@ -273,13 +308,10 @@ impl Client for DohClient {
     }
 
     fn reset(&self) {
-        {
-            let mut slot = lock(&self.h2);
-            *slot = None;
-        }
-        {
-            let mut idle = lock(&self.h1);
-            idle.clear();
-        }
+        self.resets.bump();
+        self.drop_connections();
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -9,6 +9,7 @@ mod connector;
 mod ech;
 mod error;
 pub mod fingerprints;
+mod jls;
 mod options;
 mod policy;
 mod reality;
@@ -28,6 +29,7 @@ pub use connector::{Backend, DecoyHandshake, TlsConnector};
 pub use ech::EchLookup;
 pub use error::TlsError;
 pub use fingerprints::{ClientFingerprint, FingerprintSpec};
+pub use jls::JlsAuth;
 pub use options::{REALITY_SHORT_ID_LEN, RealityOptions, TlsOptions};
 pub use policy::CertPolicy;
 pub use reality::{RealityStream, SessionIdSealer};
@@ -36,6 +38,20 @@ pub use record_io::RecordIo;
 pub use trust::{SystemRoots, TrustStore, parse_certificates};
 
 pub use rustls::ClientConfig;
+
+/// Connects a caller-configured rustls client through the native record engine.
+/// The config must enable secret extraction for the record-layer handoff.
+pub async fn connect_config(
+    config: &Arc<ClientConfig>,
+    server_name: &str,
+    io: concord_common::BoxStream,
+) -> io::Result<TlsConn> {
+    let name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    Ok(TlsConn::Record(Box::new(
+        rustls_backend::connect(config, name, io, false).await?,
+    )))
+}
 
 pub fn quic_client_config(
     options: &TlsOptions,

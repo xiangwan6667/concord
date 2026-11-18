@@ -5,7 +5,6 @@ use std::task::{Context, Poll, ready};
 
 use concord_common::sync::lock;
 use concord_common::{BoxStream, Stream};
-use hmac::Mac;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -166,7 +165,7 @@ impl V3Tap {
                         frame.get(SERVER_RANDOM_INDEX..SERVER_RANDOM_INDEX + RANDOM_SIZE)
                     && let Ok(random) = <[u8; RANDOM_SIZE]>::try_from(random)
                 {
-                    let mut mac = new_hmac(&self.password)?;
+                    let mut mac = new_hmac(&self.password);
                     mac.update(&random);
                     self.key = kdf(&self.password, &random);
                     state.read_mac = Some(mac);
@@ -182,7 +181,7 @@ impl V3Tap {
                 {
                     let payload = frame.get(HMAC_HEADER..).unwrap_or_default();
                     mac.update(payload);
-                    let expected = super::conn::sum(mac);
+                    let expected = mac.sum();
                     let wire = frame.get(HEADER..HMAC_HEADER).unwrap_or_default();
                     if expected.get(..wire.len()) != Some(wire) {
                         return Err(invalid(

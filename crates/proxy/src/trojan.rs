@@ -17,15 +17,24 @@ use crate::lazy::{HeadFirst, Kick};
 use crate::link::{Flavor, LinkSpec, build_link};
 use crate::node::{Link, info_for};
 use crate::ss::crypto::{CryptoIo, SsKey, new_context};
+use crate::ssr::{SsrCipher, stream_cipher};
 
 const CMD_TCP: u8 = 1;
 const CMD_UDP: u8 = 3;
 const MAX_PACKET: usize = 8192;
 const CRLF: &[u8; 2] = b"\r\n";
 
-struct SsLayer {
-    key: SsKey,
-    context: SharedContext,
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one per connection; boxing the existing cipher would add an allocation to existing protocols"
+)]
+enum SsLayer {
+    Crate {
+        key: SsKey,
+        context: SharedContext,
+    },
+    /// djb ChaCha20 and XChaCha20, which the `shadowsocks` crate lacks.
+    Stream(SsrCipher),
 }
 
 struct Trojan {
@@ -56,7 +65,10 @@ impl Trojan {
     async fn open(&self, cx: &DialCx<'_>) -> io::Result<BoxStream> {
         let stream = self.link.open(cx).await?;
         Ok(match &self.ss {
-            Some(ss) => Box::new(CryptoIo::new(stream, &ss.key, ss.context.clone())),
+            Some(SsLayer::Crate { key, context }) => {
+                Box::new(CryptoIo::new(stream, key, context.clone()))
+            }
+            Some(SsLayer::Stream(cipher)) => stream_cipher(stream, cipher)?,
             None => stream,
         })
     }
@@ -86,6 +98,7 @@ impl Outbound for Trojan {
             TrojanFrames,
             TrojanFrames,
             hint.clone(),
+            self.link.tasks(),
         )))
     }
 }
@@ -191,7 +204,10 @@ fn ss_layer(opts: &TrojanOpts) -> Result<Option<SsLayer>, BuildError> {
         ss.method.as_str()
     };
     // go-shadowsocks2's PickCipher table, which mihomo's trojan uses, less the
-    // 192-bit AES AEADs, the chacha8 AEADs and djb chacha20 the crypto crate lacks.
+    // 192-bit AES AEADs and the chacha8 AEADs the crypto crate lacks.
+    if let Some(cipher) = SsrCipher::chacha(method, &ss.password) {
+        return Ok(Some(SsLayer::Stream(cipher)));
+    }
     let kind = match method.to_ascii_uppercase().as_str() {
         "DUMMY" => CipherKind::NONE,
         "AES-128-GCM" => CipherKind::AES_128_GCM,
@@ -214,7 +230,7 @@ fn ss_layer(opts: &TrojanOpts) -> Result<Option<SsLayer>, BuildError> {
             )));
         }
     };
-    Ok(Some(SsLayer {
+    Ok(Some(SsLayer::Crate {
         key: SsKey::new(kind, &ss.password)?,
         context: new_context(),
     }))
@@ -299,7 +315,13 @@ mod tests {
 
         let (near, mut far) = tokio::io::duplex(1 << 16);
         let dst = Address::new("1.2.3.4", 53);
-        let session = StreamSession::new(Box::new(near), TrojanFrames, TrojanFrames, dst.clone());
+        let session = StreamSession::new(
+            Box::new(near),
+            TrojanFrames,
+            TrojanFrames,
+            dst.clone(),
+            &Default::default(),
+        );
         let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
         let mut pkt = PacketBuf::with_headroom(session.headroom());
         pkt.extend_from_slice(&data);
