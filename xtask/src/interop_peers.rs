@@ -212,8 +212,8 @@ fn ignored_tests(root: &Path, package: &str, target: &str) -> Result<Vec<Test>, 
         let shown = path
             .strip_prefix(root)
             .unwrap_or(&path)
-            .display()
-            .to_string();
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
         tests.extend(file_tests(&text, &prefix, &shown));
     }
     Ok(tests)
