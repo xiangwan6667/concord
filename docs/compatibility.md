@@ -125,11 +125,12 @@ paths, fields, status codes, `Authorization: Bearer` secret and CORS. The differ
 
 ## Partial Support
 
-- Miu supports TCP and UDP-over-TCP v2 over TLS 1.3 and REALITY, with PSK-derived padding, first-payload coalescing,
-  sequential lane reuse, cancellation recovery and background prewarming during bursts. The client negotiates
-  `raw=1` and carries inner TLS 1.3 application data as raw segments after the handshake. UDP stays in DATA frames.
+- Miu supports TCP and UDP-over-TCP v2 over TLS 1.3 and REALITY. The client follows Miu `769886f` for per-lane
+  padding, coalescing authentication with the first write, and silent prewarming during bursts. It negotiates
+  `raw=1` and sends whole inner TLS 1.3 records in RAW segments. UDP stays in DATA frames.
   A dead pooled lane is replaced once while no downstream payload has arrived and at most 64 KiB has been sent.
-  `min-idle-session` defaults to two warm lanes and accepts values up to 32.
+  `min-idle-session` defaults to one prewarmed lane and accepts values up to 32. Up to eight recently used lanes
+  qualify for the longer idle timeout.
 - VLESS Encryption supports `mlkem768x25519plus` with `native`, `xorpub` and `random`, both `1rtt` and `0rtt`,
   X25519 and ML-KEM-768 relay keys, padding and session tickets. It carries TCP, packet-address UDP and XUDP and
   works with Vision's direct handoff.

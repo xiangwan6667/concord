@@ -1,4 +1,4 @@
-use crate::anytls::padding::{Padding, Size};
+use crate::anytls::padding::Padding;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
@@ -14,8 +14,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use super::pool::{IdleLane, Pool};
 use super::scan::RecordScan;
-use super::transport::LaneIo;
 use crate::node::Link;
+
+#[path = "write.rs"]
+mod write;
 
 struct Replay {
     link: Arc<Link>,
@@ -53,24 +55,24 @@ pub(super) fn frame(out: &mut Vec<u8>, kind: u8, data: &[u8]) -> io::Result<()> 
 }
 
 pub(super) struct MiuStream {
-    inner: Option<LaneIo>,
+    inner: Option<IdleLane>,
     pool: Arc<Pool>,
     generation: u64,
     incoming: BytesMut,
     outgoing: Vec<u8>,
     sent: usize,
     record_ends: VecDeque<usize>,
-    packet: u32,
     current: Option<(u8, usize)>,
     read_end: bool,
     write_end: bool,
     failed: bool,
-    peer_idle: Option<Duration>,
-    peer_raw: bool,
     raw_remaining: usize,
     raw_outgoing: Vec<u8>,
     raw_sent: usize,
     raw_write: bool,
+    raw_hold: Vec<u8>,
+    raw_wait: Option<Pin<Box<tokio::time::Sleep>>>,
+    raw_flushing: bool,
     inner_tls13: bool,
     up_scan: RecordScan,
     down_scan: RecordScan,
@@ -86,24 +88,24 @@ pub(super) struct MiuStream {
 impl MiuStream {
     pub(super) fn new(lane: IdleLane, pool: Arc<Pool>, generation: u64) -> Self {
         Self {
-            inner: Some(lane.io),
+            inner: Some(lane),
             pool,
             generation,
             incoming: BytesMut::new(),
             outgoing: Vec::new(),
             sent: 0,
             record_ends: VecDeque::new(),
-            packet: 1,
             current: None,
             read_end: false,
             write_end: false,
             failed: false,
-            peer_idle: lane.peer_idle,
-            peer_raw: lane.peer_raw,
             raw_remaining: 0,
             raw_outgoing: Vec::new(),
             raw_sent: 0,
             raw_write: false,
+            raw_hold: Vec::new(),
+            raw_wait: None,
+            raw_flushing: false,
             inner_tls13: false,
             up_scan: RecordScan::default(),
             down_scan: RecordScan::default(),
@@ -163,15 +165,15 @@ impl MiuStream {
         self.sent = 0;
         self.current = None;
         self.failed = false;
-        self.peer_raw = false;
-        self.peer_idle = None;
-        self.packet = 2;
         self.up_scan = RecordScan::default();
         self.down_scan = RecordScan::default();
         self.inner_tls13 = false;
         self.raw_write = false;
         self.raw_outgoing.clear();
         self.raw_sent = 0;
+        self.raw_hold.clear();
+        self.raw_wait = None;
+        self.raw_flushing = false;
         let pool = self.pool.clone();
         let generation = self.generation;
         let end = self.write_end;
@@ -183,8 +185,14 @@ impl MiuStream {
                     Initiator::Proxy,
                     Some(tokio::time::Instant::now() + timeout),
                 );
-                let padding = pool.padding.load_full();
-                let lane = super::dial_lane(&replay.link, &replay.token, &padding, &cx).await?;
+                let lane = super::dial_lane(
+                    &replay.link,
+                    &replay.token,
+                    &pool.padding,
+                    pool.pushed_padding.load_full(),
+                    &cx,
+                )
+                .await?;
                 let mut stream = Self::new(lane, pool, generation);
                 stream.recycling = true;
                 stream.outgoing = replay.open;
@@ -193,14 +201,13 @@ impl MiuStream {
                 }
                 stream.shape()?;
                 if end {
-                    frame(&mut stream.outgoing, 7, &[])?;
+                    stream.queue_control(7)?;
                 }
                 stream.flush().await?;
-                let io = stream
+                stream
                     .inner
                     .take()
-                    .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?;
-                Ok(IdleLane::reused(io, None, false))
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))
             })
             .await
             .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
@@ -218,7 +225,7 @@ impl MiuStream {
         self.wakers.wake_by_ref();
         match result {
             Ok(lane) => {
-                self.inner = Some(lane.io);
+                self.inner = Some(lane);
                 Poll::Ready(Ok(()))
             }
             Err(error) => {
@@ -243,6 +250,7 @@ impl MiuStream {
             let io = self
                 .inner
                 .as_mut()
+                .map(|lane| &mut lane.io)
                 .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?;
             let written = ready!(
                 Pin::new(io).poll_write(
@@ -281,6 +289,7 @@ impl MiuStream {
             let io = self
                 .inner
                 .as_mut()
+                .map(|lane| &mut lane.io)
                 .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?;
             if let Err(error) = ready!(Pin::new(&mut *io).poll_flush(cx)) {
                 self.failed = true;
@@ -315,6 +324,7 @@ impl MiuStream {
         let io = self
             .inner
             .as_mut()
+            .map(|lane| &mut lane.io)
             .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?;
         if let Err(error) = ready!(Pin::new(io.raw()?).poll_read(cx, &mut read)) {
             self.failed = true;
@@ -330,44 +340,13 @@ impl MiuStream {
         Poll::Ready(Ok(()))
     }
 
-    fn shape(&mut self) -> io::Result<()> {
-        let padding = self.pool.padding.load();
-        let packet = self.packet;
-        self.packet = self.packet.saturating_add(1);
-        if packet >= padding.stop {
-            return Ok(());
-        }
-        let data = std::mem::take(&mut self.outgoing);
-        let mut position = 0;
-        for item in padding.sizes(packet) {
-            let target = match item {
-                Size::Check if position == data.len() => break,
-                Size::Check => continue,
-                Size::Bytes(size) if size > 3 && size < 8192 => size,
-                Size::Bytes(_) => break,
-            };
-            let count = (data.len() - position).min(target);
-            self.outgoing
-                .extend_from_slice(data.get(position..position + count).unwrap_or_default());
-            position += count;
-            if target >= count + 3 {
-                frame(&mut self.outgoing, 0, &vec![0; target - count - 3])?;
-            }
-            if self.record_ends.back() != Some(&self.outgoing.len()) && !self.outgoing.is_empty() {
-                self.record_ends.push_back(self.outgoing.len());
-            }
-        }
-        self.outgoing
-            .extend_from_slice(data.get(position..).unwrap_or_default());
-        Ok(())
-    }
-
     fn fill(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut storage = [0; 16 * 1024];
         let mut buf = ReadBuf::new(&mut storage);
         let io = self
             .inner
             .as_mut()
+            .map(|lane| &mut lane.io)
             .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?;
         if let Err(err) = ready!(Pin::new(io).poll_read(cx, &mut buf)) {
             self.failed = true;
@@ -387,7 +366,11 @@ impl MiuStream {
             0 => Ok(()),
             3 => {
                 if let Some(padding) = Padding::parse(&body) {
-                    self.pool.padding.store(Arc::new(padding));
+                    let padding = Arc::new(padding);
+                    if let Some(lane) = &mut self.inner {
+                        lane.shape = Some(padding.clone());
+                    }
+                    self.pool.pushed_padding.store(Some(padding));
                 }
                 Ok(())
             }
@@ -397,18 +380,23 @@ impl MiuStream {
                 if version != Some("2") {
                     return Err(io::Error::other("unsupported miu version"));
                 }
-                self.peer_raw = settings.lines().any(|line| line.trim() == "raw=1");
-                self.peer_idle = settings.lines().find_map(|line| {
-                    line.strip_prefix("idle=")
-                        .and_then(|value| value.parse::<u64>().ok())
-                        .map(Duration::from_secs)
-                });
+                if let Some(lane) = &mut self.inner {
+                    lane.peer_raw = settings.lines().any(|line| line.trim() == "raw=1");
+                    lane.peer_idle = settings.lines().find_map(|line| {
+                        line.strip_prefix("idle=")
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .map(Duration::from_secs)
+                    });
+                }
                 Ok(())
             }
             6 if size == 4 => {
                 if !self.allow_raw
                     || !self.incoming.is_empty()
-                    || !self.inner.as_mut().is_some_and(LaneIo::at_raw_boundary)
+                    || !self
+                        .inner
+                        .as_mut()
+                        .is_some_and(|lane| lane.io.at_raw_boundary())
                 {
                     return Err(io::Error::other(
                         "miu: RAW is not at an outer TLS record boundary",
@@ -463,7 +451,7 @@ impl MiuStream {
                 }
                 let count = size.min(this.incoming.len()).min(output.remaining());
                 let data = this.incoming.split_to(count);
-                if this.allow_raw {
+                if this.allow_raw && !this.inner_tls13 {
                     this.down_scan.feed(&data, &mut this.inner_tls13);
                 }
                 output.put_slice(&data);
@@ -499,6 +487,9 @@ impl AsyncRead for MiuStream {
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         this.wakers.read.register(cx.waker());
+        if let Poll::Ready(Err(error)) = this.poll_hold(false) {
+            return Poll::Ready(Err(error));
+        }
         if this.open_pending {
             if let Some(wait) = &mut this.open_wait {
                 ready!(wait.as_mut().poll(cx));
@@ -536,13 +527,19 @@ impl AsyncWrite for MiuStream {
             this.wakers.write.register(cx.waker());
         }
         if !this.open_pending {
+            if let Poll::Ready(Err(error)) = this.poll_hold(false) {
+                return Poll::Ready(Err(error));
+            }
             ready!(this.drain(cx))?;
         }
         if data.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        let raw = this.raw_write && data.len() >= 4096;
-        let count = data.len().min(if raw { 1 << 20 } else { 32000 });
+        let count = data.len().min(if this.raw_write {
+            (1 << 20) - this.raw_hold.len()
+        } else {
+            32000
+        });
         let data = data.get(..count).unwrap_or_default();
         if let Some(replay) = &mut this.replay {
             if replay.history.len() + count <= 64 << 10 {
@@ -551,19 +548,16 @@ impl AsyncWrite for MiuStream {
                 this.replay = None;
             }
         }
-        if raw {
-            frame(&mut this.outgoing, 6, &(count as u32).to_be_bytes())?;
-            this.raw_outgoing.extend_from_slice(data);
+        if this.raw_write {
+            this.queue_batch(data)?;
         } else {
             for chunk in data.chunks(16000) {
                 frame(&mut this.outgoing, 5, chunk)?;
             }
-            if !this.raw_write {
-                this.shape()?;
-                this.raw_write = this.allow_raw
-                    && this.up_scan.feed(data, &mut this.inner_tls13)
-                    && this.peer_raw;
-            }
+            this.shape()?;
+            this.raw_write = this.allow_raw
+                && this.up_scan.feed(data, &mut this.inner_tls13)
+                && this.inner.as_ref().is_some_and(|lane| lane.peer_raw);
         }
         this.finish_open();
         this.wakers.write.register(cx.waker());
@@ -576,6 +570,7 @@ impl AsyncWrite for MiuStream {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         this.wakers.write.register(cx.waker());
+        ready!(this.poll_hold(true))?;
         if this.open_pending {
             if this.open_wait.take().is_some() {
                 this.shape()?;
@@ -589,6 +584,7 @@ impl AsyncWrite for MiuStream {
             let io = this
                 .inner
                 .as_mut()
+                .map(|lane| &mut lane.io)
                 .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?;
             match ready!(Pin::new(io).poll_flush(cx)) {
                 Err(_) if this.begin_replay() => {}
@@ -601,11 +597,15 @@ impl AsyncWrite for MiuStream {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.open_wait.is_some() {
+            self.shape()?;
+        }
         self.finish_open();
         self.wakers.write.register(cx.waker());
+        ready!(self.poll_hold(true))?;
         ready!(self.drain(cx))?;
         if !self.write_end {
-            frame(&mut self.outgoing, 7, &[])?;
+            self.queue_control(7)?;
             self.write_end = true;
         }
         self.poll_flush(cx)
@@ -630,12 +630,9 @@ impl Drop for MiuStream {
         }
         if self.open_pending
             && self.open_wait.is_some()
-            && let Some(io) = self.inner.take()
+            && let Some(lane) = self.inner.take()
         {
-            self.pool.put(
-                self.generation,
-                IdleLane::reused(io, self.peer_idle, self.peer_raw),
-            );
+            self.pool.put(self.generation, lane);
             return;
         }
         if self.read_end
@@ -645,22 +642,15 @@ impl Drop for MiuStream {
             && self.incoming.is_empty()
             && self.raw_remaining == 0
             && self.raw_outgoing.is_empty()
-            && let Some(io) = self.inner.take()
+            && let Some(lane) = self.inner.take()
         {
-            self.pool.put(
-                self.generation,
-                IdleLane::reused(io, self.peer_idle, self.peer_raw),
-            );
+            self.pool.put(self.generation, lane);
             return;
         }
-        let Some(io) = self.inner.take().filter(|_| !self.failed) else {
+        let Some(lane) = self.inner.take().filter(|_| !self.failed) else {
             return;
         };
-        let mut cleanup = Self::new(
-            IdleLane::reused(io, self.peer_idle, self.peer_raw),
-            self.pool.clone(),
-            self.generation,
-        );
+        let mut cleanup = Self::new(lane, self.pool.clone(), self.generation);
         cleanup.recycling = true;
         cleanup.incoming = std::mem::take(&mut self.incoming);
         cleanup.current = self.current.take();
@@ -670,6 +660,10 @@ impl Drop for MiuStream {
         cleanup.record_ends = std::mem::take(&mut self.record_ends);
         cleanup.raw_outgoing = std::mem::take(&mut self.raw_outgoing);
         cleanup.raw_sent = self.raw_sent;
+        if self.read_end {
+            cleanup.raw_hold = std::mem::take(&mut self.raw_hold);
+            cleanup.raw_wait = self.raw_wait.take();
+        }
         cleanup.read_end = self.read_end;
         cleanup.allow_raw = self.allow_raw;
         let write_end = self.write_end;
@@ -678,7 +672,7 @@ impl Drop for MiuStream {
                 cleanup.flush().await?;
                 if !cleanup.read_end || !write_end {
                     let kind = if cleanup.read_end { 7 } else { 8 };
-                    frame(&mut cleanup.outgoing, kind, &[])?;
+                    cleanup.queue_control(kind)?;
                     cleanup.flush().await?;
                 }
                 let mut discard = [0; 32 * 1024];
@@ -688,12 +682,9 @@ impl Drop for MiuStream {
             .await;
             if matches!(clean, Ok(Ok(())))
                 && cleanup.incoming.is_empty()
-                && let Some(io) = cleanup.inner.take()
+                && let Some(lane) = cleanup.inner.take()
             {
-                cleanup.pool.put(
-                    cleanup.generation,
-                    IdleLane::reused(io, cleanup.peer_idle, cleanup.peer_raw),
-                );
+                cleanup.pool.put(cleanup.generation, lane);
             }
         });
     }

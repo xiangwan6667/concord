@@ -1,12 +1,13 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
+use arc_swap::ArcSwapOption;
 #[cfg(test)]
 use concord_common::BoxStream;
 use concord_common::sync::lock;
 use concord_common::{DialCx, DialEnv, Initiator, Tasks};
 use concord_tls::TlsConn;
+use rand::Rng;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -21,24 +22,37 @@ pub(super) struct IdleLane {
     pub(super) io: LaneIo,
     pub(super) peer_idle: Option<Duration>,
     pub(super) peer_raw: bool,
+    pub(super) prefix: Vec<u8>,
+    pub(super) shape: Option<Arc<Padding>>,
+    pub(super) packet: u32,
+    idle_scale: f64,
     since: Instant,
 }
 
 impl IdleLane {
     #[cfg(test)]
     pub(super) fn new(io: BoxStream, peer_idle: Option<Duration>) -> Self {
-        Self::reused(LaneIo::Plain(io), peer_idle, false)
-    }
-
-    pub(super) fn tls(io: TlsConn) -> Self {
-        Self::reused(LaneIo::Tls(Box::new(io)), None, false)
-    }
-
-    pub(super) fn reused(io: LaneIo, peer_idle: Option<Duration>, peer_raw: bool) -> Self {
         Self {
-            io,
+            io: LaneIo::Plain(io),
             peer_idle,
-            peer_raw,
+            peer_raw: false,
+            prefix: Vec::new(),
+            shape: None,
+            packet: 0,
+            idle_scale: 1.0,
+            since: Instant::now(),
+        }
+    }
+
+    pub(super) fn tls(io: TlsConn, prefix: Vec<u8>, shape: Option<Arc<Padding>>) -> Self {
+        Self {
+            io: LaneIo::Tls(Box::new(io)),
+            peer_idle: None,
+            peer_raw: false,
+            prefix,
+            shape,
+            packet: 0,
+            idle_scale: rand::rng().random_range(0.8..1.0),
             since: Instant::now(),
         }
     }
@@ -53,9 +67,12 @@ struct State {
 }
 
 impl State {
-    fn push(&mut self, lane: IdleLane) {
+    fn push(&mut self, mut lane: IdleLane) {
         if self.idle.len() == 32 {
             self.idle.remove(0);
+        }
+        if lane.prefix.is_empty() {
+            lane.since = Instant::now();
         }
         self.idle.push(lane);
     }
@@ -67,7 +84,8 @@ pub(super) struct Pool {
     cleaner: Mutex<Option<JoinHandle<()>>>,
     warmers: Mutex<Vec<JoinHandle<()>>>,
     changed: Arc<Notify>,
-    pub(super) padding: ArcSwap<Padding>,
+    pub(super) padding: Arc<Padding>,
+    pub(super) pushed_padding: ArcSwapOption<Padding>,
     pub(super) tasks: Tasks,
 }
 
@@ -79,13 +97,17 @@ impl Pool {
             cleaner: Mutex::new(None),
             warmers: Mutex::new(Vec::new()),
             changed: Arc::new(Notify::new()),
-            padding: ArcSwap::from_pointee(padding),
+            padding: Arc::new(padding),
+            pushed_padding: ArcSwapOption::empty(),
             tasks,
         })
     }
 
     fn ttl(&self, lane: &IdleLane, rank: usize) -> Duration {
-        let ttl = if rank < 4 {
+        if !lane.prefix.is_empty() {
+            return Duration::from_secs(55).mul_f64(lane.idle_scale);
+        }
+        let ttl = if rank < 8 {
             self.timeout.max(Duration::from_secs(120))
         } else {
             self.timeout
@@ -97,12 +119,15 @@ impl Pool {
             Some(peer) => ttl.min(peer - Duration::from_secs(5)),
             None => ttl,
         }
+        .mul_f64(lane.idle_scale)
     }
 
     pub(super) fn take(&self) -> (u64, Option<IdleLane>) {
         let mut state = lock(&self.idle);
-        while let Some(lane) = state.idle.pop() {
-            if lane.since.elapsed() < self.ttl(&lane, 0) {
+        while let Some(mut lane) = state.idle.pop() {
+            if lane.since.elapsed() < self.ttl(&lane, 0)
+                && lane.io.available(!lane.prefix.is_empty())
+            {
                 return (state.generation, Some(lane));
             }
         }
@@ -196,14 +221,16 @@ impl Pool {
             let weak = Arc::downgrade(self);
             let link = link.clone();
             let env = env.clone();
-            let padding = self.padding.load_full();
+            let padding = self.padding.clone();
+            let pushed = self.pushed_padding.load_full();
             warmers.push(self.tasks.spawn(async move {
                 let timeout = Duration::from_secs(10);
                 let cx = DialCx::new(&env, Initiator::Proxy, Some(Instant::now() + timeout));
-                let lane = tokio::time::timeout(timeout, dial_lane(&link, &token, &padding, &cx))
-                    .await
-                    .ok()
-                    .and_then(Result::ok);
+                let lane =
+                    tokio::time::timeout(timeout, dial_lane(&link, &token, &padding, pushed, &cx))
+                        .await
+                        .ok()
+                        .and_then(Result::ok);
                 if let Some(pool) = weak.upgrade() {
                     pool.finish_warm(generation, lane);
                 }

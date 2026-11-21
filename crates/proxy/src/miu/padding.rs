@@ -1,6 +1,7 @@
 use std::io;
 
 use hmac::{Hmac, Mac};
+use rand::Rng;
 use sha2::Sha256;
 
 use crate::anytls::padding::Padding;
@@ -10,6 +11,7 @@ struct Reader {
     block: Vec<u8>,
     position: usize,
     counter: u32,
+    info: String,
 }
 
 fn authenticate(key: &[u8], parts: &[&[u8]]) -> io::Result<Vec<u8>> {
@@ -31,14 +33,15 @@ fn expand(key: &[u8], info: &[u8]) -> io::Result<Vec<u8>> {
 }
 
 impl Reader {
-    fn new(token: &[u8; 32]) -> io::Result<Self> {
+    fn new(token: &[u8; 32], info: String) -> io::Result<Self> {
         let key = authenticate(b"miu/v2/padding-profile/salt", &[token])?;
-        let block = expand(&key, b"miu/v2/padding-profile/v1/psk-only")?;
+        let block = expand(&key, info.as_bytes())?;
         Ok(Self {
             key,
             block,
             position: 0,
             counter: 0,
+            info,
         })
     }
 
@@ -53,11 +56,7 @@ impl Reader {
                 self.counter += 1;
                 self.block = expand(
                     &self.key,
-                    format!(
-                        "miu/v2/padding-profile/v1/psk-only/counter/{}",
-                        self.counter
-                    )
-                    .as_bytes(),
+                    format!("{}/counter/{}", self.info, self.counter).as_bytes(),
                 )?;
                 self.position = 0;
             }
@@ -81,7 +80,24 @@ impl Reader {
 }
 
 pub(super) fn derive(token: &[u8; 32]) -> io::Result<Padding> {
-    let mut reader = Reader::new(token)?;
+    generate(Reader::new(
+        token,
+        "miu/v2/padding-profile/v1/psk-only".into(),
+    )?)
+}
+
+pub(super) fn derive_lane(token: &[u8; 32]) -> io::Result<Padding> {
+    let nonce = rand::rng().random::<[u8; 16]>();
+    generate(Reader::new(
+        token,
+        format!(
+            "miu/v2/padding-profile/v1/psk-only/lane/{}",
+            hex::encode(nonce)
+        ),
+    )?)
+}
+
+fn generate(mut reader: Reader) -> io::Result<Padding> {
     let count = reader.sample(4, 10)?;
     let low = reader.sample(24, 41)?;
     let high = reader.sample(low + 16, 65)?;

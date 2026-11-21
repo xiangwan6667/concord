@@ -11,15 +11,33 @@ pub(super) struct RecordScan {
 }
 
 impl RecordScan {
-    pub(super) fn feed(&mut self, mut data: &[u8], tls13: &mut bool) -> bool {
-        if self.ready || self.dead {
+    pub(super) fn feed(&mut self, data: &[u8], tls13: &mut bool) -> bool {
+        if self.dead {
             return self.ready;
         }
-        self.seen = self.seen.saturating_add(data.len());
-        if self.seen > 64 << 10 {
-            self.dead = true;
-            return false;
+        if !self.ready {
+            self.seen = self.seen.saturating_add(data.len());
+            if self.seen > 64 << 10 {
+                self.dead = true;
+                return false;
+            }
         }
+        self.walk(data, tls13);
+        self.ready && !self.dead
+    }
+
+    pub(super) fn at_boundary(&self) -> bool {
+        self.have == 0 && self.remaining == 0
+    }
+
+    pub(super) fn lost(&self) -> bool {
+        self.dead
+    }
+
+    pub(super) fn walk(&mut self, mut data: &[u8], tls13: &mut bool) -> (Option<usize>, usize) {
+        let length = data.len();
+        let mut first = None;
+        let mut last = 0;
         while !data.is_empty() {
             if self.remaining > 0 {
                 let count = self.remaining.min(data.len());
@@ -29,10 +47,14 @@ impl RecordScan {
                 }
                 self.remaining -= count;
                 data = data.get(count..).unwrap_or_default();
-                if self.remaining == 0 && self.gathering {
-                    *tls13 |= is_tls13_server_hello(&self.handshake);
-                    self.handshake.clear();
-                    self.gathering = false;
+                if self.remaining == 0 {
+                    last = length - data.len();
+                    first.get_or_insert(last);
+                    if self.gathering {
+                        *tls13 |= is_tls13_server_hello(&self.handshake);
+                        self.handshake.clear();
+                        self.gathering = false;
+                    }
                 }
                 continue;
             }
@@ -51,17 +73,20 @@ impl RecordScan {
             let [kind, major, _, hi, lo] = self.header;
             if major != 3 || !(20..=23).contains(&kind) {
                 self.dead = true;
-                return false;
+                break;
             }
             if kind == 23 && *tls13 {
                 self.ready = true;
-                return true;
             }
             self.remaining = usize::from(u16::from_be_bytes([hi, lo]));
             self.gathering = kind == 22 && !*tls13;
             self.have = 0;
+            if self.remaining == 0 {
+                last = length - data.len();
+                first.get_or_insert(last);
+            }
         }
-        false
+        (first, last)
     }
 }
 

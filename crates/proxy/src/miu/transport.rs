@@ -1,6 +1,6 @@
 use std::io;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 use concord_common::{BoxStream, Stream};
 use concord_tls::TlsConn;
@@ -13,6 +13,28 @@ pub(super) enum LaneIo {
 }
 
 impl LaneIo {
+    pub(super) fn is_tls(&self) -> bool {
+        matches!(self, Self::Tls(_))
+    }
+
+    pub(super) fn available(&mut self, unused: bool) -> bool {
+        let Ok(io) = self.raw() else {
+            return true;
+        };
+        let Some(tcp) = io.tcp() else {
+            return true;
+        };
+        let mut byte = [0];
+        match tcp.poll_peek(
+            &mut Context::from_waker(Waker::noop()),
+            &mut ReadBuf::new(&mut byte),
+        ) {
+            Poll::Pending => true,
+            Poll::Ready(Ok(count)) => count > 0 && unused,
+            Poll::Ready(Err(_)) => false,
+        }
+    }
+
     fn framed(&mut self) -> &mut dyn Stream {
         match self {
             Self::Tls(io) => &mut **io,

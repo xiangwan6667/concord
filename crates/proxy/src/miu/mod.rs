@@ -5,6 +5,7 @@ mod raw_tests;
 #[cfg(test)]
 mod recovery_tests;
 mod scan;
+mod small_record;
 mod stream;
 #[cfg(test)]
 mod tests;
@@ -20,7 +21,6 @@ use concord_common::{
 };
 use concord_config::proxy::{MiuOpts, ProxyDef};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
 
 use self::pool::{IdleLane, Pool};
 use self::stream::{MiuStream, frame};
@@ -42,15 +42,22 @@ async fn dial_lane(
     link: &Link,
     token: &[u8; 32],
     padding: &Padding,
+    pushed: Option<Arc<Padding>>,
     cx: &DialCx<'_>,
 ) -> io::Result<IdleLane> {
     let tls = link.open_tls(cx).await?;
     if !tls.is_tls13() {
         return Err(io::Error::other("miu requires TLS 1.3"));
     }
-    let mut lane = IdleLane::tls(tls);
+    let base = pushed.as_deref().unwrap_or(padding);
+    let lane_shape = if pushed.is_none() {
+        padding::derive_lane(token).ok().map(Arc::new)
+    } else {
+        None
+    };
+    let shape = lane_shape.as_deref().unwrap_or(base);
     let mut hello = token.to_vec();
-    let pad = match padding.sizes(0).first() {
+    let pad = match shape.sizes(0).first() {
         Some(Size::Bytes(size)) => *size,
         _ => 30,
     };
@@ -60,10 +67,9 @@ async fn dial_lane(
     frame(
         &mut hello,
         1,
-        format!("v=2\nraw=1\npadding-md5={}", padding.md5).as_bytes(),
+        format!("v=2\nraw=1\npadding-md5={}", base.md5).as_bytes(),
     )?;
-    lane.io.write_all(&hello).await?;
-    Ok(lane)
+    Ok(IdleLane::tls(tls, hello, lane_shape.or(pushed)))
 }
 
 impl Miu {
@@ -82,8 +88,14 @@ impl Miu {
                     .replay_pooled(self.link.clone(), self.token, cx.env.clone(), open),
             ));
         }
-        let padding = self.pool.padding.load_full();
-        let lane = dial_lane(&self.link, &self.token, &padding, cx).await?;
+        let lane = dial_lane(
+            &self.link,
+            &self.token,
+            &self.pool.padding,
+            self.pool.pushed_padding.load_full(),
+            cx,
+        )
+        .await?;
         Ok(Box::new(
             MiuStream::new(lane, self.pool.clone(), generation).with_open(open, udp),
         ))
@@ -134,7 +146,7 @@ pub(crate) fn build(
         token,
         pool: Pool::new(opts.idle_session_timeout, padding, ctx.tasks.clone()),
         min_idle: if opts.min_idle_session == 0 {
-            2
+            1
         } else {
             opts.min_idle_session as usize
         },

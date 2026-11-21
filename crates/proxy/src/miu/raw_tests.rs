@@ -61,7 +61,7 @@ async fn raw_header_must_end_its_outer_tls_record() {
         padding::derive(&[7; 32]).unwrap(),
         concord_common::Tasks::default(),
     );
-    let mut stream = MiuStream::new(IdleLane::tls(tls), pool.clone(), 0);
+    let mut stream = MiuStream::new(IdleLane::tls(tls, Vec::new(), None), pool.clone(), 0);
     let error = stream.read_to_end(&mut Vec::new()).await.unwrap_err();
     assert!(error.to_string().contains("record boundary"));
     drop(stream);
