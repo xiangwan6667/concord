@@ -28,7 +28,7 @@ crate's directory, its `[patch.crates-io]` entry and its lines in `UPSTREAM.sha2
 | Crate | Change | Upstream | Route |
 |---|---|---|---|
 | blake3 | Byte-string key-derivation contexts | None | Propose the byte-slice counterpart of `hash_derive_key_context` to BLAKE3-team/BLAKE3 |
-| boring | Read-only `SslRef` record-layer accessors | None | None planned: the change stays in the vendored copy |
+| boring | Read-only `SslRef` record-layer accessors and typed ECH rejection detection | None | None planned: the change stays in the vendored copy |
 | h3 | Bound frame and DATA read-ahead | hyperium/h3#344, `c916ed5a` (frame headers); #328 and #386 are related | Backport #344; propose the DATA-body extension to hyperium/h3 |
 | h3 | Opt-in draft-00 datagram SETTINGS for WARP | None | Propose the default-off client builder switch to hyperium/h3 |
 | h2 | Ignore DATA and HEADERS on forgotten client streams | None as of 0.4.20 | Issue and PR to hyperium/h2 with the delayed-DATA-after-reset transport test |
@@ -60,6 +60,9 @@ The package archive checksum is `7227623e47342428b893b9401d85cae09c4656aecaae524
   connection, when a finished BoringSSL handshake hands its keys and sequence numbers to the directional record layer
   (`crates/tls/src/boring_backend.rs` `record_state`). The release wraps none of them on `SslRef` (`get_shutdown` is
   on `SslStream` and takes `&mut self`), so tls otherwise needs `boring-sys` and `unsafe`. No upstream PR is planned.
+- `src/ssl/error.rs`: expose `is_ech_rejected` on the handshake error source. The TLS backend checks the SSL
+  library and reason codes before reading the retry list, which BoringSSL permits only after an authenticated ECH
+  rejection.
 
 ## h2 0.4.20
 

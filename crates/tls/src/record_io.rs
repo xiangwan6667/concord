@@ -1,6 +1,6 @@
-use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
+use std::{fmt, io};
 
 use concord_common::{BoxRead, BoxStream, BoxWrite, Stream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -22,6 +22,16 @@ pub struct RecordIo<S> {
     header: [u8; RECORD_HEADER_LEN],
     state: State,
     aligned: bool,
+}
+
+impl<S> fmt::Debug for RecordIo<S> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecordIo")
+            .field("state", &self.state)
+            .field("aligned", &self.aligned)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<S> RecordIo<S> {

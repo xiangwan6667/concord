@@ -19,6 +19,7 @@ use crate::fingerprints::ClientFingerprint;
 use crate::policy::CertPolicy;
 use crate::{TlsConn, TlsConnector, TlsOptions};
 
+#[derive(Debug)]
 struct Tap {
     inner: DuplexStream,
     read: Arc<AtomicUsize>,

@@ -1,3 +1,5 @@
+use std::error::Error as _;
+use std::fmt::Debug;
 use std::io::{self, Read, Write};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -321,7 +323,7 @@ impl BoringConnector {
         io: S,
     ) -> io::Result<tokio_boring::SslStream<S>>
     where
-        S: AsyncRead + tokio::io::AsyncWrite + Unpin,
+        S: AsyncRead + tokio::io::AsyncWrite + Unpin + Debug,
     {
         self.handshake(name, io, None).await
     }
@@ -333,7 +335,7 @@ impl BoringConnector {
         log: Option<LogSlot>,
     ) -> io::Result<tokio_boring::SslStream<S>>
     where
-        S: AsyncRead + tokio::io::AsyncWrite + Unpin,
+        S: AsyncRead + tokio::io::AsyncWrite + Unpin + Debug,
     {
         let mut ssl = Ssl::new(&self.ctx).map_err(io::Error::other)?;
         let cx = Arc::new(VerifyCx {
@@ -357,6 +359,10 @@ impl BoringConnector {
             Err(err) => {
                 let failure = lock(&cx.failure).take();
                 if failure.is_none()
+                    && err
+                        .source()
+                        .and_then(|source| source.downcast_ref::<boring::ssl::Error>())
+                        .is_some_and(boring::ssl::Error::is_ech_rejected)
                     && let Some(retry) = err
                         .ssl()
                         .and_then(SslRef::get_ech_retry_configs)

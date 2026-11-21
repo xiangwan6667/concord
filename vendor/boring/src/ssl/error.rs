@@ -148,6 +148,17 @@ impl Error {
     }
 
     #[must_use]
+    pub fn is_ech_rejected(&self) -> bool {
+        self.code == ErrorCode::SSL
+            && self.ssl_error().is_some_and(|stack| {
+                stack.errors().iter().any(|error| {
+                    error.library_code() == ffi::ERR_LIB_SSL.0 as c_int
+                        && error.reason_code() == ffi::SSL_R_ECH_REJECTED
+                })
+            })
+    }
+
+    #[must_use]
     pub fn would_block(&self) -> bool {
         matches!(
             self.code,
